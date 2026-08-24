@@ -19,15 +19,15 @@ public partial class MainWindow : Window
     {
         InitializeComponent(); DataContext = viewModel; _viewModel = viewModel; _repository = repository; _monitor = monitor; _transfer = transfer; _startup = startup; _runId = runId;
         viewModel.OpenDeviceRequested += async (_, device) => await OpenDeviceAsync(device);
-        _tray = new Forms.NotifyIcon { Icon = LoadTrayIcon(), Text = "CloudLight Presence", Visible = true };
-        var menu = new Forms.ContextMenuStrip(); menu.Items.Add("打开 CloudLight Presence", null, (_, _) => ShowFromTray()); menu.Items.Add(new Forms.ToolStripSeparator());
+        _tray = new Forms.NotifyIcon { Icon = LoadTrayIcon(), Text = "CloudLight XiaoMi", Visible = true };
+        var menu = new Forms.ContextMenuStrip(); menu.Items.Add("打开 CloudLight XiaoMi", null, (_, _) => ShowFromTray()); menu.Items.Add(new Forms.ToolStripSeparator());
         _monitorItem = new Forms.ToolStripMenuItem("暂停监控", null, async (_, _) => await ToggleMonitoringAsync()); menu.Items.Add(_monitorItem); menu.Items.Add(new Forms.ToolStripSeparator());
         _startupItem = new Forms.ToolStripMenuItem("开机自启") { CheckOnClick = true }; _startupItem.Click += async (_, _) => await TraySettingChangedAsync(); menu.Items.Add(_startupItem);
         _minimizedItem = new Forms.ToolStripMenuItem("启动后最小化") { CheckOnClick = true }; _minimizedItem.Click += async (_, _) => await TraySettingChangedAsync(); menu.Items.Add(_minimizedItem); menu.Items.Add(new Forms.ToolStripSeparator());
         menu.Items.Add("退出", null, async (_, _) => await ExitAsync()); menu.Opening += (_, _) => RefreshTrayMenu(); _tray.ContextMenuStrip = menu; _tray.DoubleClick += (_, _) => ShowFromTray();
     }
 
-    protected override void OnClosing(CancelEventArgs e) { if (!_exiting) { e.Cancel = true; Hide(); _tray.ShowBalloonTip(1200, "CloudLight Presence", "监控仍在后台运行。", Forms.ToolTipIcon.Info); } base.OnClosing(e); }
+    protected override void OnClosing(CancelEventArgs e) { if (!_exiting) { e.Cancel = true; Hide(); _tray.ShowBalloonTip(1200, "CloudLight XiaoMi", "监控仍在后台运行。", Forms.ToolTipIcon.Info); } base.OnClosing(e); }
     private void ShowFromTray() { if (!IsVisible) Show(); if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal; Activate(); Topmost = true; Topmost = false; Focus(); }
     private async Task OpenDeviceAsync(NetworkDevice device) { var vm = new DeviceDetailViewModel(_repository, new PresenceStatisticsService(_repository), device); await vm.LoadAsync(); var window = new DeviceDetailWindow(vm) { Owner = this }; window.Show(); }
     private void SettingsClicked(object sender, RoutedEventArgs e) { if (_settingsWindow is { IsLoaded: true }) { _settingsWindow.Activate(); return; } _settingsWindow = new SettingsWindow(_viewModel, _transfer, _startup) { Owner = this }; _settingsWindow.Show(); }

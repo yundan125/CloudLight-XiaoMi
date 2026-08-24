@@ -94,7 +94,7 @@ public sealed class PresenceDataTransferService(AppPaths paths)
 
     private static void Validate(ExportDocument document)
     {
-        if (document.Manifest.Format != Format || document.Manifest.Version != 1 || document.Manifest.ContainsAuthentication) throw new InvalidDataException("不支持或不安全的 CloudLight Presence 备份格式。 ");
+        if (document.Manifest.Format != Format || document.Manifest.Version != 1 || document.Manifest.ContainsAuthentication) throw new InvalidDataException("不支持或不安全的 CloudLight XiaoMi 备份格式。 ");
         if (document.Routers.Any(value => string.IsNullOrWhiteSpace(value.MiotDid) || string.IsNullOrWhiteSpace(value.PartnerId))) throw new InvalidDataException("路由器数据不完整。 ");
         var routerIds = document.Routers.Select(value => value.MiotDid).ToHashSet(StringComparer.OrdinalIgnoreCase);
         if (document.Devices.Any(value => !routerIds.Contains(value.RouterMiotDid))) throw new InvalidDataException("设备引用了不存在的路由器。 ");

@@ -9,7 +9,7 @@ if (!XiaomiEndpoints.SupportedRegions.Contains(region, StringComparer.Ordinal))
     return 2;
 }
 
-Console.WriteLine("CloudLight Presence - Xiaomi Cloud Phase 1 probe");
+Console.WriteLine("CloudLight XiaoMi - Xiaomi Cloud Phase 1 probe");
 Console.WriteLine("This tool opens Xiaomi's OAuth page and never asks for your password.");
 Console.WriteLine("Tokens stay in process memory and are not written to disk.");
 Console.WriteLine();

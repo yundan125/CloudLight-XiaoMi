@@ -336,8 +336,8 @@ internal sealed class LoopbackCallbackReceiver(int port) : IAsyncDisposable
         }
 
         var responseBody = hasCode
-            ? "CloudLight Presence received the authorization response. You can close this tab."
-            : "CloudLight Presence is waiting for a valid Xiaomi authorization response.";
+            ? "CloudLight XiaoMi received the authorization response. You can close this tab."
+            : "CloudLight XiaoMi is waiting for a valid Xiaomi authorization response.";
         var responseBytes = Encoding.UTF8.GetBytes(responseBody);
         var headers = Encoding.ASCII.GetBytes(
             $"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {responseBytes.Length}\r\nConnection: close\r\n\r\n");

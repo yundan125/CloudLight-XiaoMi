@@ -2,7 +2,7 @@ using System.Net;
 using CloudLight.Presence.RouterCloud.Probe;
 
 Console.OutputEncoding = System.Text.Encoding.UTF8;
-Console.WriteLine("CloudLight Presence - Xiaomi Router Cloud Phase 1B probe");
+Console.WriteLine("CloudLight XiaoMi - Xiaomi Router Cloud Phase 1B probe");
 Console.WriteLine("Login reuses MiForge/migate QR and arbitrary-sid service acquisition.");
 Console.WriteLine("Secrets are transferred in memory and protected at rest with Windows DPAPI.");
 Console.WriteLine();

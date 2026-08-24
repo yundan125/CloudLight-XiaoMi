@@ -1,10 +1,10 @@
 <Window x:Class="CloudLight.Presence.App.Views.SettingsWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="设置 · CloudLight Presence" Icon="/CloudLight.Presence.App;component/Assets/CloudLightPresence.ico" Width="620" Height="650" MinHeight="560" Background="#F5F7FB" WindowStartupLocation="CenterOwner">
+        Title="设置 · CloudLight XiaoMi" Icon="/CloudLight.XiaoMi;component/Assets/CloudLightPresence.ico" Width="620" Height="650" MinHeight="560" Background="#F5F7FB" WindowStartupLocation="CenterOwner">
   <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel Margin="28">
     <TextBlock Text="设置" FontSize="28" FontWeight="SemiBold" Foreground="#172033"/>
     <TextBlock Text="常规" Style="{StaticResource SectionTitle}" Margin="0,24,0,10"/>
     <Border Style="{StaticResource SurfaceCard}"><StackPanel>
-      <CheckBox x:Name="StartWithWindowsBox" Content="开机自动启动 CloudLight Presence" Checked="GeneralSettingChanged" Unchecked="GeneralSettingChanged"/>
+      <CheckBox x:Name="StartWithWindowsBox" Content="开机自动启动 CloudLight XiaoMi" Checked="GeneralSettingChanged" Unchecked="GeneralSettingChanged"/>
       <CheckBox x:Name="StartMinimizedBox" Content="启动后最小化到托盘" Margin="0,14,0,0" Checked="GeneralSettingChanged" Unchecked="GeneralSettingChanged"/>
       <TextBlock x:Name="GeneralStatus" Foreground="#64748B" Margin="0,12,0,0" TextWrapping="Wrap"/>
     </StackPanel></Border>

@@ -1,6 +1,6 @@
-#define AppName "CloudLight Presence"
+#define AppName "CloudLight XiaoMi"
 #define AppVersion "1.0.0"
-#define AppExeName "CloudLight.Presence.App.exe"
+#define AppExeName "CloudLight.XiaoMi.exe"
 #define PublishDir "..\artifacts\win-x64-1.0.0"
 
 [Setup]
@@ -8,14 +8,14 @@ AppId={{8E701BE1-0F30-4C52-89FA-AB72D2E5E126}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher=CloudLight
-DefaultDirName={localappdata}\Programs\CloudLight Presence
-DefaultGroupName=CloudLight Presence
+DefaultDirName={localappdata}\Programs\CloudLight XiaoMi
+DefaultGroupName=CloudLight XiaoMi
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\artifacts
-OutputBaseFilename=CloudLight-Presence-Setup-1.0.0
+OutputBaseFilename=CloudLight-XiaoMi-Setup-1.0.0
 SetupIconFile=..\src\CloudLight.Presence.App\Assets\CloudLightPresence.ico
 UninstallDisplayIcon={app}\{#AppExeName}
 Compression=lzma2/ultra64
@@ -38,8 +38,8 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 Source: "{#PublishDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\CloudLight Presence"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"
-Name: "{autodesktop}\CloudLight Presence"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{group}\CloudLight XiaoMi"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"
+Name: "{autodesktop}\CloudLight XiaoMi"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#AppExeName}"; Description: "启动 CloudLight Presence"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#AppExeName}"; Description: "启动 CloudLight XiaoMi"; Flags: nowait postinstall skipifsilent

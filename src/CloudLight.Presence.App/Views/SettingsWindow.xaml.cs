@@ -24,7 +24,7 @@ public partial class SettingsWindow : Window
 
     private async void ExportClicked(object sender, RoutedEventArgs e)
     {
-        var dialog = new Microsoft.Win32.SaveFileDialog { Filter = "CloudLight Presence 数据 (*.clpresence)|*.clpresence", DefaultExt = ".clpresence", AddExtension = true, FileName = $"CloudLight-Presence-{DateTime.Now:yyyyMMdd-HHmm}.clpresence" };
+        var dialog = new Microsoft.Win32.SaveFileDialog { Filter = "CloudLight XiaoMi 数据 (*.clpresence)|*.clpresence", DefaultExt = ".clpresence", AddExtension = true, FileName = $"CloudLight-XiaoMi-{DateTime.Now:yyyyMMdd-HHmm}.clpresence" };
         if (dialog.ShowDialog(this) != true) return;
         try { DataStatus.Text = "正在导出…"; await _transfer.ExportAsync(dialog.FileName, CancellationToken.None); DataStatus.Text = $"导出完成：{dialog.FileName}\n备份不包含 Xiaomi 认证信息。"; }
         catch (Exception exception) { DataStatus.Text = $"导出失败：{exception.Message}"; }
@@ -32,7 +32,7 @@ public partial class SettingsWindow : Window
 
     private async void ImportClicked(object sender, RoutedEventArgs e)
     {
-        var dialog = new Microsoft.Win32.OpenFileDialog { Filter = "CloudLight Presence 数据 (*.clpresence)|*.clpresence", CheckFileExists = true };
+        var dialog = new Microsoft.Win32.OpenFileDialog { Filter = "CloudLight XiaoMi 数据 (*.clpresence)|*.clpresence", CheckFileExists = true };
         if (dialog.ShowDialog(this) != true) return;
         var wasRunning = _main.IsMonitoring;
         try

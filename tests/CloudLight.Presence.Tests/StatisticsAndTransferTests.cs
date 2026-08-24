@@ -12,15 +12,15 @@ public sealed class StatisticsAndTransferTests
     [Fact]
     public void StartupRegistrationQuotesExecutableAndCanBeRemoved()
     {
-        const string runKey = @"Software\Microsoft\Windows\CurrentVersion\Run"; const string valueName = "CloudLight Presence";
+        const string runKey = @"Software\Microsoft\Windows\CurrentVersion\Run"; const string valueName = "CloudLight XiaoMi"; const string legacyValueName = "CloudLight Presence";
         using var root = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, RegistryView.Registry64); using var key = root.OpenSubKey(runKey, true) ?? root.CreateSubKey(runKey, true);
-        var previous = key.GetValue(valueName); var service = new StartupRegistrationService();
+        var previous = key.GetValue(valueName); var legacyPrevious = key.GetValue(legacyValueName); var service = new StartupRegistrationService();
         try
         {
-            service.Apply(true); Assert.Equal($"\"{Environment.ProcessPath}\" --startup", key.GetValue(valueName));
+            key.SetValue(legacyValueName, "legacy.exe", RegistryValueKind.String); service.Apply(true); Assert.Equal($"\"{Environment.ProcessPath}\" --startup", key.GetValue(valueName)); Assert.Null(key.GetValue(legacyValueName));
             service.Apply(false); Assert.Null(key.GetValue(valueName));
         }
-        finally { if (previous is null) key.DeleteValue(valueName, false); else key.SetValue(valueName, previous, RegistryValueKind.String); }
+        finally { if (previous is null) key.DeleteValue(valueName, false); else key.SetValue(valueName, previous, RegistryValueKind.String); if (legacyPrevious is null) key.DeleteValue(legacyValueName, false); else key.SetValue(legacyValueName, legacyPrevious, RegistryValueKind.String); }
     }
 
     [Fact]
