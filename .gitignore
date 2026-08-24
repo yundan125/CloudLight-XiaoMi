@@ -1,0 +1,40 @@
+bin/
+obj/
+.vs/
+.idea/
+*.user
+*.suo
+.research/
+
+# Never commit authentication, live databases, or live-account captures.
+auth.dat
+presence.db
+*.db-shm
+*.db-wal
+*.token
+
+# Logs and local runtime state.
+logs/
+*.log
+.venv/
+
+# Temporary Xiaomi research material and unpacked payloads.
+*.apk
+*.apks
+*.xapk
+apk-unpacked/
+plugin-unpacked/
+oauth-debug/
+router-cloud-debug/
+temp/
+tmp/
+
+# Build/publish/installer outputs. The installer source remains tracked.
+artifacts/
+publish/
+installer/output/
+installer/temp/
+
+# OS/editor leftovers.
+.DS_Store
+Thumbs.db

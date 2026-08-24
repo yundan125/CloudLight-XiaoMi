@@ -1,0 +1,22 @@
+<Window x:Class="CloudLight.Presence.App.Views.SettingsWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="设置 · CloudLight Presence" Width="620" Height="650" MinHeight="560" Background="#F5F7FB" WindowStartupLocation="CenterOwner">
+  <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel Margin="28">
+    <TextBlock Text="设置" FontSize="28" FontWeight="SemiBold" Foreground="#172033"/>
+    <TextBlock Text="常规" Style="{StaticResource SectionTitle}" Margin="0,24,0,10"/>
+    <Border Style="{StaticResource SurfaceCard}"><StackPanel>
+      <CheckBox x:Name="StartWithWindowsBox" Content="开机自动启动 CloudLight Presence" Checked="GeneralSettingChanged" Unchecked="GeneralSettingChanged"/>
+      <CheckBox x:Name="StartMinimizedBox" Content="启动后最小化到托盘" Margin="0,14,0,0" Checked="GeneralSettingChanged" Unchecked="GeneralSettingChanged"/>
+      <TextBlock x:Name="GeneralStatus" Foreground="#64748B" Margin="0,12,0,0" TextWrapping="Wrap"/>
+    </StackPanel></Border>
+    <TextBlock Text="监控" Style="{StaticResource SectionTitle}" Margin="0,24,0,10"/>
+    <Border Style="{StaticResource SurfaceCard}"><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition/></Grid.ColumnDefinitions><Grid.RowDefinitions><RowDefinition/><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
+      <TextBlock Text="当前路由器" Foreground="#64748B"/><TextBlock Grid.Column="1" Text="{Binding RouterSummary}"/>
+      <TextBlock Grid.Row="1" Text="Polling" Foreground="#64748B" Margin="0,10,0,0"/><TextBlock Grid.Row="1" Grid.Column="1" Text="10 秒（固定）" Margin="0,10,0,0"/>
+      <TextBlock Grid.Row="2" Text="Xiaomi Account" Foreground="#64748B" Margin="0,10,0,0"/><TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding CloudStatus}" Margin="0,10,0,0"/>
+    </Grid></Border>
+    <TextBlock Text="数据" Style="{StaticResource SectionTitle}" Margin="0,24,0,10"/>
+    <Border Style="{StaticResource SurfaceCard}"><StackPanel><StackPanel Orientation="Horizontal"><Button Content="导出数据" Click="ExportClicked"/><Button Content="导入数据" Style="{StaticResource SecondaryButton}" Click="ImportClicked"/></StackPanel><TextBlock x:Name="DataStatus" Foreground="#64748B" Margin="0,12,0,0" TextWrapping="Wrap"/></StackPanel></Border>
+    <TextBlock Text="诊断" Style="{StaticResource SectionTitle}" Margin="0,24,0,10"/>
+    <Border Style="{StaticResource SurfaceCard}"><TextBlock Text="{Binding Diagnostics}" FontFamily="Consolas" Foreground="#475569" TextWrapping="Wrap"/></Border>
+  </StackPanel></ScrollViewer>
+</Window>

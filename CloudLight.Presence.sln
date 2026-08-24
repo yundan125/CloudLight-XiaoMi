@@ -1,0 +1,55 @@
+
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CloudLight.Presence.Xiaomi.Probe", "tools\CloudLight.Presence.Xiaomi.Probe\CloudLight.Presence.Xiaomi.Probe.csproj", "{BA582E6B-4CEB-4ED7-A15E-38AD177397B4}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CloudLight.Presence.RouterCloud.Probe", "tools\CloudLight.Presence.RouterCloud.Probe\CloudLight.Presence.RouterCloud.Probe.csproj", "{11D51253-C15D-44C8-B399-96667F8E9148}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CloudLight.Presence.Core", "src\CloudLight.Presence.Core\CloudLight.Presence.Core.csproj", "{A102E6B1-5D77-44E8-AE11-64FC4E694201}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CloudLight.Presence.Infrastructure", "src\CloudLight.Presence.Infrastructure\CloudLight.Presence.Infrastructure.csproj", "{B203F7C2-6E88-45F9-BF22-75AD5F7A5302}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CloudLight.Presence.Xiaomi", "src\CloudLight.Presence.Xiaomi\CloudLight.Presence.Xiaomi.csproj", "{C30408D3-7F99-460A-C033-86BE608B6403}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CloudLight.Presence.App", "src\CloudLight.Presence.App\CloudLight.Presence.App.csproj", "{D40519E4-80AA-471B-D144-97CF719C7504}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CloudLight.Presence.Tests", "tests\CloudLight.Presence.Tests\CloudLight.Presence.Tests.csproj", "{E5062AF5-91BB-482C-E255-A8D082AD8605}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{BA582E6B-4CEB-4ED7-A15E-38AD177397B4}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{BA582E6B-4CEB-4ED7-A15E-38AD177397B4}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{BA582E6B-4CEB-4ED7-A15E-38AD177397B4}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{BA582E6B-4CEB-4ED7-A15E-38AD177397B4}.Release|Any CPU.Build.0 = Release|Any CPU
+		{11D51253-C15D-44C8-B399-96667F8E9148}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{11D51253-C15D-44C8-B399-96667F8E9148}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{11D51253-C15D-44C8-B399-96667F8E9148}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{11D51253-C15D-44C8-B399-96667F8E9148}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A102E6B1-5D77-44E8-AE11-64FC4E694201}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A102E6B1-5D77-44E8-AE11-64FC4E694201}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A102E6B1-5D77-44E8-AE11-64FC4E694201}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A102E6B1-5D77-44E8-AE11-64FC4E694201}.Release|Any CPU.Build.0 = Release|Any CPU
+		{B203F7C2-6E88-45F9-BF22-75AD5F7A5302}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B203F7C2-6E88-45F9-BF22-75AD5F7A5302}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B203F7C2-6E88-45F9-BF22-75AD5F7A5302}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B203F7C2-6E88-45F9-BF22-75AD5F7A5302}.Release|Any CPU.Build.0 = Release|Any CPU
+		{C30408D3-7F99-460A-C033-86BE608B6403}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C30408D3-7F99-460A-C033-86BE608B6403}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C30408D3-7F99-460A-C033-86BE608B6403}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C30408D3-7F99-460A-C033-86BE608B6403}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D40519E4-80AA-471B-D144-97CF719C7504}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D40519E4-80AA-471B-D144-97CF719C7504}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D40519E4-80AA-471B-D144-97CF719C7504}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D40519E4-80AA-471B-D144-97CF719C7504}.Release|Any CPU.Build.0 = Release|Any CPU
+		{E5062AF5-91BB-482C-E255-A8D082AD8605}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{E5062AF5-91BB-482C-E255-A8D082AD8605}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{E5062AF5-91BB-482C-E255-A8D082AD8605}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{E5062AF5-91BB-482C-E255-A8D082AD8605}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

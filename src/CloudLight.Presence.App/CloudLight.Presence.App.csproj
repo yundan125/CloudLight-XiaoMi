@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\CloudLight.Presence.Core\CloudLight.Presence.Core.csproj" />
+    <ProjectReference Include="..\CloudLight.Presence.Infrastructure\CloudLight.Presence.Infrastructure.csproj" />
+    <ProjectReference Include="..\CloudLight.Presence.Xiaomi\CloudLight.Presence.Xiaomi.csproj" />
+  </ItemGroup>
+</Project>

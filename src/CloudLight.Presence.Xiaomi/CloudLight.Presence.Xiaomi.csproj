@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\CloudLight.Presence.Core\CloudLight.Presence.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Authentication\migate_bridge.py" CopyToOutputDirectory="PreserveNewest" Link="migate_bridge.py" />
+  </ItemGroup>
+</Project>
