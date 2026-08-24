@@ -58,6 +58,12 @@ public sealed record MonitoringGap(
     DateTimeOffset? EndedAt,
     string Reason);
 
+public sealed record ApplicationRun(
+    long Id,
+    DateTimeOffset StartedAt,
+    DateTimeOffset? EndedAt,
+    DateTimeOffset? LastSuccessfulCloudUpdateAt);
+
 public sealed record PresenceStatistics(
     DateTimeOffset From,
     DateTimeOffset To,

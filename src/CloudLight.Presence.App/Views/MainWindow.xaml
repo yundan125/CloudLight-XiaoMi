@@ -1,5 +1,5 @@
 <Window x:Class="CloudLight.Presence.App.Views.MainWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="CloudLight Presence" Width="1080" Height="740" MinWidth="700" MinHeight="520" Background="#F5F7FB" WindowStartupLocation="CenterScreen">
+        Title="CloudLight Presence" Icon="/CloudLight.Presence.App;component/Assets/CloudLightPresence.ico" Width="1080" Height="740" MinWidth="700" MinHeight="520" Background="#F5F7FB" WindowStartupLocation="CenterScreen">
   <Grid Margin="32"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
     <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
       <StackPanel><TextBlock Text="CloudLight Presence" FontSize="30" FontWeight="SemiBold" Foreground="#172033"/><StackPanel Orientation="Horizontal" Margin="0,8,0,0"><TextBlock Text="{Binding RouterSummary}" Foreground="#64748B"/><ComboBox Width="210" Height="30" ItemsSource="{Binding Routers}" SelectedItem="{Binding SelectedRouter}" DisplayMemberPath="Name" Margin="12,0,0,0" Visibility="{Binding HasMultipleRouters, Converter={StaticResource BooleanToVisibility}}"/></StackPanel></StackPanel>

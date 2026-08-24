@@ -17,13 +17,25 @@ public partial class App : System.Windows.Application
         base.OnStartup(e);
         if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("windir")))
             Environment.SetEnvironmentVariable("windir", Environment.GetFolderPath(Environment.SpecialFolder.Windows));
-        var paths = new AppPaths(); var repository = new SqlitePresenceRepository(paths); var settings = new JsonSettingsStore(paths);
+        var paths = new AppPaths(); var repository = new SqlitePresenceRepository(paths); var settings = new JsonSettingsStore(paths); var startup = new StartupRegistrationService();
+        await repository.InitializeAsync(CancellationToken.None);
+        var runId = await repository.StartApplicationRunAsync(DateTimeOffset.UtcNow, CancellationToken.None);
+        var initialSettings = await settings.LoadAsync(CancellationToken.None);
+        if (initialSettings.StartWithWindows) startup.Apply(true);
         var source = new XiaomiPresenceSource(new DpapiSessionStore(paths), paths.MigatePython);
         var monitor = new PresenceMonitor(source, repository, new PresenceStateMachine(repository));
+        monitor.StatusChanged += async (_, status) =>
+        {
+            try
+            {
+                if (status.LastUpdate is { } updatedAt)
+                    await repository.UpdateApplicationRunCloudUpdateAsync(runId, updatedAt, CancellationToken.None);
+            }
+            catch { }
+        };
         var viewModel = new MainViewModel(repository, source, monitor, settings);
-        var window = new MainWindow(viewModel, repository, monitor, new PresenceDataTransferService(paths), new StartupRegistrationService()); MainWindow = window;
+        var window = new MainWindow(viewModel, repository, monitor, new PresenceDataTransferService(paths), startup, runId); MainWindow = window;
         var startupLaunch = e.Args.Any(value => string.Equals(value, "--startup", StringComparison.OrdinalIgnoreCase));
-        var initialSettings = await settings.LoadAsync(CancellationToken.None);
         if (!startupLaunch || !initialSettings.StartMinimized) window.Show();
         await viewModel.InitializeAsync(CancellationToken.None);
     }

@@ -43,6 +43,25 @@ public sealed class StatisticsAndTransferTests
     }
 
     [Fact]
+    public async Task UnexpectedApplicationRunUsesLastSuccessfulCloudUpdateForGap()
+    {
+        var root = TemporaryRoot();
+        try
+        {
+            var repository = new SqlitePresenceRepository(new AppPaths(root)); await repository.InitializeAsync(CancellationToken.None);
+            var started = new DateTimeOffset(2026, 8, 24, 10, 0, 0, TimeSpan.Zero); var lastUpdate = started.AddMinutes(5); var restarted = started.AddMinutes(12);
+            var firstRun = await repository.StartApplicationRunAsync(started, CancellationToken.None); await repository.UpdateApplicationRunCloudUpdateAsync(firstRun, lastUpdate, CancellationToken.None);
+            var secondRun = await repository.StartApplicationRunAsync(restarted, CancellationToken.None);
+            var gap = Assert.Single(await repository.GetMonitoringGapsAsync(started, restarted.AddMinutes(1), CancellationToken.None));
+            Assert.Equal(lastUpdate, gap.StartedAt); Assert.Equal(restarted, gap.EndedAt); Assert.Equal("UnexpectedTermination", gap.Reason);
+            await repository.EndApplicationRunAsync(secondRun, restarted.AddMinutes(1), CancellationToken.None);
+            _ = await repository.StartApplicationRunAsync(restarted.AddMinutes(2), CancellationToken.None);
+            Assert.Single(await repository.GetMonitoringGapsAsync(started, restarted.AddMinutes(3), CancellationToken.None));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
     public async Task ImportIsIdempotentAndExportContainsNoAuthentication()
     {
         var sourceRoot = TemporaryRoot(); var targetRoot = TemporaryRoot(); var backup = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.clpresence");

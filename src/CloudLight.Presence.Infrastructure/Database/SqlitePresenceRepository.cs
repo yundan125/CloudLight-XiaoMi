@@ -43,6 +43,9 @@ public sealed class SqlitePresenceRepository(AppPaths paths) : IPresenceReposito
               EndedAt TEXT NULL, Reason TEXT NOT NULL);
             CREATE UNIQUE INDEX IF NOT EXISTS UX_PresenceSession_Stable ON PresenceSession(DeviceId, StartedAt);
             CREATE UNIQUE INDEX IF NOT EXISTS UX_MonitoringGap_Stable ON MonitoringGap(StartedAt, Reason);
+            CREATE TABLE IF NOT EXISTS ApplicationRun (
+              Id INTEGER PRIMARY KEY AUTOINCREMENT, StartedAt TEXT NOT NULL,
+              EndedAt TEXT NULL, LastSuccessfulCloudUpdateAt TEXT NULL);
             """;
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
@@ -195,6 +198,40 @@ public sealed class SqlitePresenceRepository(AppPaths paths) : IPresenceReposito
     public async Task CloseOpenMonitoringGapsAsync(DateTimeOffset endedAt, CancellationToken cancellationToken) =>
         await ExecuteAsync("UPDATE MonitoringGap SET EndedAt=$end WHERE EndedAt IS NULL", [("$end", Time(endedAt))], cancellationToken);
 
+    public async Task<long> StartApplicationRunAsync(DateTimeOffset startedAt, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken); await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        DateTimeOffset? previousStarted = null; DateTimeOffset? previousUpdate = null; long? previousId = null;
+        await using (var previous = connection.CreateCommand())
+        {
+            previous.Transaction = (SqliteTransaction)transaction;
+            previous.CommandText = "SELECT Id,StartedAt,LastSuccessfulCloudUpdateAt FROM ApplicationRun WHERE EndedAt IS NULL ORDER BY StartedAt DESC LIMIT 1";
+            await using var reader = await previous.ExecuteReaderAsync(cancellationToken);
+            if (await reader.ReadAsync(cancellationToken)) { previousId = reader.GetInt64(0); previousStarted = ParseTime(reader.GetString(1)); previousUpdate = reader.IsDBNull(2) ? null : ParseTime(reader.GetString(2)); }
+        }
+        if (previousId is not null && previousStarted is not null)
+        {
+            var gapStart = previousUpdate ?? await GetLatestDeviceObservationAsync(connection, (SqliteTransaction)transaction, previousStarted.Value, cancellationToken) ?? previousStarted.Value;
+            if (gapStart < startedAt)
+            {
+                await using var gap = connection.CreateCommand(); gap.Transaction = (SqliteTransaction)transaction;
+                gap.CommandText = "INSERT OR IGNORE INTO MonitoringGap(StartedAt,EndedAt,Reason) VALUES($start,$end,'UnexpectedTermination')";
+                Add(gap, "$start", Time(gapStart)); Add(gap, "$end", Time(startedAt)); await gap.ExecuteNonQueryAsync(cancellationToken);
+            }
+            await using var close = connection.CreateCommand(); close.Transaction = (SqliteTransaction)transaction;
+            close.CommandText = "UPDATE ApplicationRun SET EndedAt=$end WHERE Id=$id"; Add(close, "$end", Time(startedAt)); Add(close, "$id", previousId.Value); await close.ExecuteNonQueryAsync(cancellationToken);
+        }
+        await using var insert = connection.CreateCommand(); insert.Transaction = (SqliteTransaction)transaction;
+        insert.CommandText = "INSERT INTO ApplicationRun(StartedAt) VALUES($start); SELECT last_insert_rowid();"; Add(insert, "$start", Time(startedAt));
+        var id = (long)(await insert.ExecuteScalarAsync(cancellationToken) ?? 0L); await transaction.CommitAsync(cancellationToken); return id;
+    }
+
+    public async Task UpdateApplicationRunCloudUpdateAsync(long runId, DateTimeOffset updatedAt, CancellationToken cancellationToken) =>
+        await ExecuteAsync("UPDATE ApplicationRun SET LastSuccessfulCloudUpdateAt=$at WHERE Id=$id AND EndedAt IS NULL", [("$id", runId), ("$at", Time(updatedAt))], cancellationToken);
+
+    public async Task EndApplicationRunAsync(long runId, DateTimeOffset endedAt, CancellationToken cancellationToken) =>
+        await ExecuteAsync("UPDATE ApplicationRun SET EndedAt=$end WHERE Id=$id AND EndedAt IS NULL", [("$id", runId), ("$end", Time(endedAt))], cancellationToken);
+
     private async Task ExecuteAsync(string sql, (string Name, object? Value)[] parameters, CancellationToken cancellationToken)
     {
         await using var connection = await OpenAsync(cancellationToken); await using var command = connection.CreateCommand(); command.CommandText = sql;
@@ -207,6 +244,13 @@ public sealed class SqlitePresenceRepository(AppPaths paths) : IPresenceReposito
         var connection = new SqliteConnection(ConnectionString); await connection.OpenAsync(cancellationToken);
         await using var command = connection.CreateCommand(); command.CommandText = "PRAGMA foreign_keys=ON;"; await command.ExecuteNonQueryAsync(cancellationToken);
         return connection;
+    }
+
+    private static async Task<DateTimeOffset?> GetLatestDeviceObservationAsync(SqliteConnection connection, SqliteTransaction transaction, DateTimeOffset notBefore, CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand(); command.Transaction = transaction;
+        command.CommandText = "SELECT MAX(LastSeenAt) FROM NetworkDevice WHERE LastSeenAt >= $start"; Add(command, "$start", Time(notBefore));
+        var value = await command.ExecuteScalarAsync(cancellationToken); return value is string text ? ParseTime(text) : null;
     }
 
     private static void AddDeviceParameters(SqliteCommand command, NetworkDevice value)

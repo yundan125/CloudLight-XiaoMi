@@ -7,7 +7,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <ApplicationIcon>Assets\CloudLightPresence.ico</ApplicationIcon>
   </PropertyGroup>
+  <ItemGroup>
+    <Resource Include="Assets\CloudLightPresence.ico" />
+  </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\CloudLight.Presence.Core\CloudLight.Presence.Core.csproj" />
     <ProjectReference Include="..\CloudLight.Presence.Infrastructure\CloudLight.Presence.Infrastructure.csproj" />

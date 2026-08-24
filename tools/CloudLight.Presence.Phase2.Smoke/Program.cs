@@ -5,6 +5,12 @@ using CloudLight.Presence.Infrastructure.SecureStorage;
 using CloudLight.Presence.Infrastructure.Settings;
 using CloudLight.Presence.Xiaomi;
 
+if (args.Contains("--verify-transfer", StringComparer.OrdinalIgnoreCase))
+{
+    await VerifyTransferAsync();
+    return;
+}
+
 var paths = new AppPaths();
 var repository = new SqlitePresenceRepository(paths);
 var source = new XiaomiPresenceSource(new DpapiSessionStore(paths), paths.MigatePython);
@@ -43,3 +49,39 @@ var eventsAfter = 0;
 foreach (var device in await repository.GetDevicesAsync(router.Id, CancellationToken.None)) eventsAfter += (await repository.GetEventsAsync(device.Id, CancellationToken.None)).Count;
 Console.WriteLine($"second_poll_seconds={(DateTimeOffset.UtcNow - waitStarted).TotalSeconds:F1};event_delta={eventsAfter - eventsBefore}");
 Console.WriteLine($"database={paths.Database}");
+
+static async Task VerifyTransferAsync()
+{
+    var sourcePaths = new AppPaths(); var source = new SqlitePresenceRepository(sourcePaths); await source.InitializeAsync(CancellationToken.None);
+    var validationRoot = Path.Combine(Path.GetTempPath(), "CloudLight-Presence-ReleaseValidation", Guid.NewGuid().ToString("N")); Directory.CreateDirectory(validationRoot);
+    var backup = Path.Combine(validationRoot, "backup.clpresence"); var targetPaths = new AppPaths(Path.Combine(validationRoot, "database"));
+    try
+    {
+        await new PresenceDataTransferService(sourcePaths).ExportAsync(backup, CancellationToken.None);
+        var contents = await File.ReadAllTextAsync(backup); var forbidden = new[] { "passToken", "serviceToken", "ssecurity", "auth.dat", "Cookie" };
+        foreach (var value in forbidden) if (contents.Contains(value, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException($"Export contains forbidden authentication marker: {value}");
+
+        var target = new SqlitePresenceRepository(targetPaths); await target.InitializeAsync(CancellationToken.None); var transfer = new PresenceDataTransferService(targetPaths);
+        var first = await transfer.ImportAsync(backup, CancellationToken.None); var firstCounts = await CountHistoryAsync(target);
+        var second = await transfer.ImportAsync(backup, CancellationToken.None); var secondCounts = await CountHistoryAsync(target);
+        if (firstCounts != secondCounts) throw new InvalidDataException("Repeated import changed Event or Session totals.");
+        var routers = await target.GetRoutersAsync(CancellationToken.None); var devices = new List<NetworkDevice>(); foreach (var router in routers) devices.AddRange(await target.GetDevicesAsync(router.Id, CancellationToken.None));
+        Console.WriteLine($"backup_created={File.Exists(backup)};bytes={new FileInfo(backup).Length};authentication_markers=0");
+        Console.WriteLine($"routers={routers.Count};devices={devices.Count};custom_names={devices.Count(value => !string.IsNullOrWhiteSpace(value.CustomName))};notes={devices.Count(value => !string.IsNullOrWhiteSpace(value.Note))}");
+        Console.WriteLine($"first_added_events={first.AddedEvents};events={firstCounts.Events};sessions={firstCounts.Sessions}");
+        Console.WriteLine($"second_added_events={second.AddedEvents};second_events={secondCounts.Events};second_sessions={secondCounts.Sessions};skipped_duplicates={second.SkippedDuplicates}");
+    }
+    finally { if (Directory.Exists(validationRoot)) Directory.Delete(validationRoot, true); }
+}
+
+static async Task<(int Events, int Sessions)> CountHistoryAsync(SqlitePresenceRepository repository)
+{
+    var events = 0; var sessions = 0;
+    foreach (var router in await repository.GetRoutersAsync(CancellationToken.None))
+    foreach (var device in await repository.GetDevicesAsync(router.Id, CancellationToken.None))
+    {
+        events += (await repository.GetEventsAsync(device.Id, CancellationToken.None)).Count;
+        sessions += (await repository.GetSessionsAsync(device.Id, CancellationToken.None)).Count;
+    }
+    return (events, sessions);
+}

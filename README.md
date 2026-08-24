@@ -1,26 +1,55 @@
-# CloudLight Presence
+# CloudLight Presence 1.0.0
 
-Phase 2 contains the Windows `.NET 8` WPF MVP under `src/`. Its production data path is
-Xiaomi official browser/QR login through MiForge/migate 1.1.10, DPAPI session recovery,
-`sid=xiaomiio`, dynamic router discovery, and Xiaomi AppGateway
-`/app/appgateway/third/miwifi/app/s/api/device_list` using the router device's `partner_id`.
-Presence observations are stored in `%LocalAppData%\CloudLight Presence\presence.db`.
+CloudLight Presence is a Windows desktop application that records the observed
+online/offline presence of devices connected to a Xiaomi router owned by the signed-in
+user. It uses Xiaomi's official browser/QR login, Xiaomi AppGateway polling, Windows
+DPAPI for authentication storage, and SQLite for local history.
 
-Phase 1B AX3000T Router Gateway findings are recorded in
-[`docs/phase-1b-router-remote.md`](docs/phase-1b-router-remote.md).
+## Windows application
 
-CloudLight Presence is intended to be a Windows desktop application that records
-the observed online/offline state of client devices connected to a router owned
-by the signed-in user. Xiaomi Router is the first planned provider.
+- Modern WPF device-card dashboard and device notes
+- 10-second cloud polling with tray/background operation
+- 24-hour, 3-day, 7-day, and 30-day statistics and presence timelines
+- Explicit Unknown periods for monitoring gaps
+- Versioned `.clpresence` export/import without Xiaomi credentials
+- Per-user startup registration and per-user installation
 
-Phase 1 live-account validation is complete. OAuth, homes, devices, router
-discovery, MIoT properties, and MIPS subscription were tested against the owner's
-real AX3000T, but Xiaomi Cloud did not expose a usable router client list through
-the tested paths. No mock device data, Presence history, database, or desktop UI
-has been implemented. The repository currently contains only the Phase 1 probe. See
-[`docs/phase-1-xiaomi-cloud.md`](docs/phase-1-xiaomi-cloud.md) for confirmed facts,
-the live test result, the OAuth product constraint, and the command to retry.
+User data stays under `%LocalAppData%\CloudLight Presence` and is not removed by the
+installer or uninstaller. The 1.0.0 installer contains a private Python 3.14 runtime and
+MiForge/migate 1.1.10; it does not install or modify system Python.
 
-The probe uses Xiaomi's OAuth page and never asks for a Xiaomi account password.
-It does not persist access or refresh tokens. Live output can contain private
-device identifiers and must not be published.
+## Build
+
+```powershell
+dotnet build -c Release
+dotnet test -c Release
+dotnet publish .\src\CloudLight.Presence.App\CloudLight.Presence.App.csproj `
+  -c Release -r win-x64 --self-contained true `
+  -o .\artifacts\win-x64-1.0.0
+
+.\installer\Prepare-MigateRuntime.ps1 `
+  -PublishDirectory .\artifacts\win-x64-1.0.0
+
+& 'C:\Program Files\Inno Setup 7\ISCC.exe' `
+  .\installer\CloudLightPresence.iss
+```
+
+The generated installer is
+`artifacts\CloudLight-Presence-Setup-1.0.0.exe`.
+
+## Architecture notes
+
+The confirmed Xiaomi path is:
+
+```text
+MiForge/migate official login
+→ DPAPI-protected passToken
+→ sid=xiaomiio
+→ Xiaomi AppGateway
+→ /s/api/device_list
+→ Presence state machine
+→ SQLite
+```
+
+Protocol validation and historical probes remain in `docs/` and `tools/`. They are not
+required by the installed desktop application.

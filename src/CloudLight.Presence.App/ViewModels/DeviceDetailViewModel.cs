@@ -39,7 +39,7 @@ public sealed class DeviceDetailViewModel : ObservableObject
         foreach (var (days, label) in new[] { (1, "最近24小时"), (3, "最近3天"), (7, "最近7天"), (30, "最近30天") })
         {
             var value = await _statistics.GetStatisticsAsync(Device.Id, now.AddDays(-days), now, CancellationToken.None);
-            Statistics.Add(new StatisticCardViewModel(label, Format(value.KnownOnlineDuration), $"已知数据中 {value.OnlinePercentageOfKnownTime:P1}", $"覆盖率 {value.Coverage:P0}", value.Coverage < .9));
+            Statistics.Add(new StatisticCardViewModel(label, Format(value.KnownOnlineDuration), $"数据覆盖 {Format(value.KnownDuration)} / {Format(value.WindowDuration)}", $"已知数据在线率 {value.OnlinePercentageOfKnownTime:P1}", value.Coverage < .9));
         }
         var events = await _repository.GetEventsAsync(Device.Id, CancellationToken.None); var sessions = await _repository.GetSessionsAsync(Device.Id, CancellationToken.None); History.Clear();
         foreach (var value in events.Take(30))
@@ -55,5 +55,5 @@ public sealed class DeviceDetailViewModel : ObservableObject
     private static string Format(TimeSpan value) { var hours = (int)value.TotalHours; return hours > 0 ? $"{hours}h {value.Minutes:00}m" : $"{value.Minutes}m"; }
 }
 
-public sealed record StatisticCardViewModel(string Label, string OnlineDuration, string OnlinePercentage, string Coverage, bool HasGap);
+public sealed record StatisticCardViewModel(string Label, string OnlineDuration, string Coverage, string OnlinePercentage, bool HasGap);
 public sealed record HistoryItemViewModel(DateTimeOffset ObservedAt, string Event) { public string Day => ObservedAt.ToString("MM-dd"); public string Time => ObservedAt.ToString("HH:mm:ss"); }

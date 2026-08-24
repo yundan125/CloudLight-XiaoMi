@@ -22,6 +22,9 @@ public interface IPresenceRepository
     Task<long> StartMonitoringGapAsync(DateTimeOffset startedAt, string reason, CancellationToken cancellationToken);
     Task EndMonitoringGapAsync(long gapId, DateTimeOffset endedAt, CancellationToken cancellationToken);
     Task CloseOpenMonitoringGapsAsync(DateTimeOffset endedAt, CancellationToken cancellationToken);
+    Task<long> StartApplicationRunAsync(DateTimeOffset startedAt, CancellationToken cancellationToken);
+    Task UpdateApplicationRunCloudUpdateAsync(long runId, DateTimeOffset updatedAt, CancellationToken cancellationToken);
+    Task EndApplicationRunAsync(long runId, DateTimeOffset endedAt, CancellationToken cancellationToken);
 }
 
 public interface IPresenceStatisticsService
