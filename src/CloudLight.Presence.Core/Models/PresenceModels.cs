@@ -3,6 +3,7 @@ namespace CloudLight.Presence.Core.Models;
 public enum PresenceState { Unknown = 0, Online = 1, Offline = 2 }
 public enum PresenceEventType { Online = 1, Offline = 2, InitialObservation = 3 }
 public enum PresenceSource { Polling = 1 }
+public enum SubjectActivityType { Online = 1, Offline = 2, UnknownPeriod = 3 }
 
 public sealed record Router(
     long Id,
@@ -58,6 +59,26 @@ public sealed record MonitoringGap(
     DateTimeOffset? EndedAt,
     string Reason);
 
+public sealed record PresenceSubject(
+    long Id,
+    Guid ExportId,
+    string DisplayName,
+    string? Note,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset UpdatedAt);
+
+public sealed record SubjectDeviceMembership(
+    long SubjectId,
+    long NetworkDeviceId,
+    DateTimeOffset CreatedAt);
+
+public sealed record SubjectPresenceSnapshot(
+    PresenceSubject Subject,
+    IReadOnlyList<NetworkDevice> Members,
+    PresenceState CurrentState,
+    DateTimeOffset? LastStateChangedAt,
+    NetworkDevice? ActiveDevice);
+
 public sealed record ApplicationRun(
     long Id,
     DateTimeOffset StartedAt,
@@ -78,6 +99,8 @@ public sealed record PresenceStatistics(
 }
 
 public sealed record PresenceTimelineSegment(DateTimeOffset Start, DateTimeOffset End, PresenceState State);
+
+public sealed record SubjectActivityItem(DateTimeOffset OccurredAtUtc, SubjectActivityType Type);
 
 public sealed record ObservedNetworkDevice(
     string MacAddress,

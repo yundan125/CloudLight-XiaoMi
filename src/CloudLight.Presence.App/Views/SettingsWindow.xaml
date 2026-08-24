@@ -9,13 +9,15 @@
       <TextBlock x:Name="GeneralStatus" Foreground="#64748B" Margin="0,12,0,0" TextWrapping="Wrap"/>
     </StackPanel></Border>
     <TextBlock Text="监控" Style="{StaticResource SectionTitle}" Margin="0,24,0,10"/>
-    <Border Style="{StaticResource SurfaceCard}"><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition/></Grid.ColumnDefinitions><Grid.RowDefinitions><RowDefinition/><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
+    <Border Style="{StaticResource SurfaceCard}"><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition/></Grid.ColumnDefinitions><Grid.RowDefinitions><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
       <TextBlock Text="当前路由器" Foreground="#64748B"/><TextBlock Grid.Column="1" Text="{Binding RouterSummary}"/>
-      <TextBlock Grid.Row="1" Text="Polling" Foreground="#64748B" Margin="0,10,0,0"/><TextBlock Grid.Row="1" Grid.Column="1" Text="10 秒（固定）" Margin="0,10,0,0"/>
-      <TextBlock Grid.Row="2" Text="Xiaomi Account" Foreground="#64748B" Margin="0,10,0,0"/><TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding CloudStatus}" Margin="0,10,0,0"/>
+      <TextBlock Grid.Row="1" Text="自动刷新间隔" Foreground="#64748B" Margin="0,14,0,0" VerticalAlignment="Center"/>
+      <StackPanel Grid.Row="1" Grid.Column="1" Orientation="Horizontal" Margin="0,10,0,0"><TextBox x:Name="PollingIntervalBox" Width="76" TextAlignment="Right" PreviewTextInput="PollingIntervalPreviewTextInput"/><TextBlock Text="秒" VerticalAlignment="Center" Margin="8,0,12,0"/><Button Content="应用" Style="{StaticResource SecondaryButton}" Padding="12,5" Click="ApplyPollingIntervalClicked"/></StackPanel>
+      <StackPanel Grid.Row="2" Grid.Column="1" Margin="0,8,0,0"><TextBlock Text="设备状态会按照设置的时间自动更新。" Foreground="#64748B"/><TextBlock Text="推荐使用 10 秒或更长的刷新间隔。过短的间隔会增加网络请求。" Foreground="#64748B" TextWrapping="Wrap"/><TextBlock x:Name="PollingStatus" Foreground="#16A34A" Margin="0,5,0,0"/></StackPanel>
+      <TextBlock Grid.Row="3" Text="Xiaomi 连接" Foreground="#64748B" Margin="0,14,0,0"/><TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding CloudStatus}" Margin="0,14,0,0"/>
     </Grid></Border>
     <TextBlock Text="数据" Style="{StaticResource SectionTitle}" Margin="0,24,0,10"/>
-    <Border Style="{StaticResource SurfaceCard}"><StackPanel><StackPanel Orientation="Horizontal"><Button Content="导出数据" Click="ExportClicked"/><Button Content="导入数据" Style="{StaticResource SecondaryButton}" Click="ImportClicked"/></StackPanel><TextBlock x:Name="DataStatus" Foreground="#64748B" Margin="0,12,0,0" TextWrapping="Wrap"/></StackPanel></Border>
+    <Border Style="{StaticResource SurfaceCard}"><StackPanel><TextBlock Text="数据目录" Foreground="#64748B"/><TextBlock x:Name="DataPathText" Margin="0,5,0,10" TextWrapping="Wrap"/><StackPanel Orientation="Horizontal"><Button Content="导出数据" Click="ExportClicked"/><Button Content="导入数据" Style="{StaticResource SecondaryButton}" Click="ImportClicked"/><Button Content="打开数据目录" Style="{StaticResource SecondaryButton}" Click="OpenDataDirectoryClicked"/></StackPanel><TextBlock x:Name="DataStatus" Foreground="#64748B" Margin="0,12,0,0" TextWrapping="Wrap"/></StackPanel></Border>
     <TextBlock Text="诊断" Style="{StaticResource SectionTitle}" Margin="0,24,0,10"/>
     <Border Style="{StaticResource SurfaceCard}"><TextBlock Text="{Binding Diagnostics}" FontFamily="Consolas" Foreground="#475569" TextWrapping="Wrap"/></Border>
   </StackPanel></ScrollViewer>

@@ -6,10 +6,10 @@ using CloudLight.Presence.Xiaomi.Cloud;
 
 namespace CloudLight.Presence.Xiaomi;
 
-public sealed class XiaomiPresenceSource(ISecureSessionStore store, string migatePythonPath) : IXiaomiPresenceSource
+public sealed class XiaomiPresenceSource(ISecureSessionStore store, string migatePythonPath, string? logsDirectory = null) : IXiaomiPresenceSource
 {
     private static readonly JsonSerializerOptions Options = new(JsonSerializerDefaults.Web) { WriteIndented = true };
-    private readonly MigateLoginBridge _bridge = new(migatePythonPath);
+    private readonly MigateLoginBridge _bridge = new(migatePythonPath, logsDirectory);
     private readonly XiaomiAppGatewayClient _gateway = new();
     private XiaomiSession? _session;
     public bool HasStoredLogin => store.Exists;

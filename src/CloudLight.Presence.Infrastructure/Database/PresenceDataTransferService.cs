@@ -9,17 +9,17 @@ namespace CloudLight.Presence.Infrastructure.Database;
 
 public sealed record ImportResult(int AddedDevices, int UpdatedDevices, int AddedEvents, int SkippedDuplicates);
 
-public sealed class PresenceDataTransferService(AppPaths paths)
+public sealed class PresenceDataTransferService(IAppDataPaths paths)
 {
     private const string Format = "CloudLight.Presence.Export";
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { WriteIndented = true };
-    private string ConnectionString => new SqliteConnectionStringBuilder { DataSource = paths.Database, Pooling = false }.ToString();
+    private string ConnectionString => new SqliteConnectionStringBuilder { DataSource = paths.DatabasePath, Pooling = false }.ToString();
 
     public async Task ExportAsync(string targetPath, CancellationToken cancellationToken)
     {
         var model = new ExportDocument(
-            new ExportManifest(Format, 1, DateTimeOffset.UtcNow, Assembly.GetEntryAssembly()?.GetName().Version?.ToString() ?? "development", false),
-            [], [], [], [], []);
+            new ExportManifest(Format, 2, DateTimeOffset.UtcNow, Assembly.GetEntryAssembly()?.GetName().Version?.ToString() ?? "development", false),
+            [], [], [], [], [], [], []);
         await using var connection = new SqliteConnection(ConnectionString); await connection.OpenAsync(cancellationToken);
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
         await ReadAsync(connection, "SELECT MiotDid,MiotModel,PartnerId,Name,HomeId,RoomId,CreatedAt,LastSeenAt FROM Router", reader =>
@@ -32,6 +32,10 @@ public sealed class PresenceDataTransferService(AppPaths paths)
             model.Sessions.Add(new ExportSession(reader.GetString(0), reader.GetString(1), Time(reader, 2), NullableTime(reader, 3), reader.GetInt32(4) != 0, reader.GetInt32(5) != 0)), cancellationToken);
         await ReadAsync(connection, "SELECT StartedAt,EndedAt,Reason FROM MonitoringGap", reader =>
             model.MonitoringGaps.Add(new ExportGap(Time(reader, 0), NullableTime(reader, 1), reader.GetString(2))), cancellationToken);
+        await ReadAsync(connection, "SELECT ExportId,DisplayName,Note,CreatedAt,UpdatedAt FROM PresenceSubject", reader =>
+            model.Subjects!.Add(new ExportSubject(Guid.Parse(reader.GetString(0)), reader.GetString(1), Text(reader, 2), Time(reader, 3), Time(reader, 4))), cancellationToken);
+        await ReadAsync(connection, "SELECT s.ExportId,r.MiotDid,d.MacAddress,m.CreatedAt FROM SubjectDeviceMembership m JOIN PresenceSubject s ON s.Id=m.SubjectId JOIN NetworkDevice d ON d.Id=m.NetworkDeviceId JOIN Router r ON r.Id=d.RouterId", reader =>
+            model.SubjectDeviceMemberships!.Add(new ExportSubjectDeviceMembership(Guid.Parse(reader.GetString(0)), reader.GetString(1), reader.GetString(2), Time(reader, 3))), cancellationToken);
         await transaction.CommitAsync(cancellationToken);
 
         var temporary = targetPath + ".new";
@@ -87,19 +91,36 @@ public sealed class PresenceDataTransferService(AppPaths paths)
         {
             var changed = await InsertOrIgnoreAsync(connection, "INSERT OR IGNORE INTO MonitoringGap(StartedAt,EndedAt,Reason) VALUES($start,$end,$reason)", [("$start", Iso(value.StartedAt)), ("$end", value.EndedAt is null ? null : Iso(value.EndedAt.Value)), ("$reason", value.Reason)], cancellationToken); skipped += changed == 0 ? 1 : 0;
         }
+        var subjects = new Dictionary<Guid, long>();
+        foreach (var value in document.Subjects ?? [])
+        {
+            var id = await ScalarLongAsync(connection, "SELECT Id FROM PresenceSubject WHERE ExportId=$export", [("$export", value.ExportId.ToString("D"))], cancellationToken);
+            if (id == 0) id = await InsertIdAsync(connection, "INSERT INTO PresenceSubject(ExportId,DisplayName,Note,CreatedAt,UpdatedAt) VALUES($export,$name,$note,$created,$updated)", [("$export", value.ExportId.ToString("D")), ("$name", value.DisplayName), ("$note", value.Note), ("$created", Iso(value.CreatedAt)), ("$updated", Iso(value.UpdatedAt))], cancellationToken);
+            else await ExecuteAsync(connection, "UPDATE PresenceSubject SET DisplayName=$name,Note=$note,UpdatedAt=$updated WHERE Id=$id", [("$name", value.DisplayName), ("$note", value.Note), ("$updated", Iso(value.UpdatedAt)), ("$id", id)], cancellationToken);
+            subjects[value.ExportId] = id;
+        }
+        foreach (var value in document.SubjectDeviceMemberships ?? [])
+        {
+            var subjectId = subjects[value.SubjectExportId];
+            var deviceId = devices[Key(value.RouterMiotDid, PresenceStateMachine.NormalizeMac(value.MacAddress))];
+            await ExecuteAsync(connection, "INSERT INTO SubjectDeviceMembership(SubjectId,NetworkDeviceId,CreatedAt) VALUES($subject,$device,$created) ON CONFLICT(NetworkDeviceId) DO UPDATE SET SubjectId=$subject", [("$subject", subjectId), ("$device", deviceId), ("$created", Iso(value.CreatedAt))], cancellationToken);
+        }
         var totalEventDuplicates = document.Events.Count - addedEvents; skipped += totalEventDuplicates;
         await transaction.CommitAsync(cancellationToken);
+        await new SqlitePresenceRepository(paths).EnsureEveryDeviceHasSubjectAsync(cancellationToken);
         return new ImportResult(addedDevices, updatedDevices, addedEvents, skipped);
     }
 
     private static void Validate(ExportDocument document)
     {
-        if (document.Manifest.Format != Format || document.Manifest.Version != 1 || document.Manifest.ContainsAuthentication) throw new InvalidDataException("不支持或不安全的 CloudLight XiaoMi 备份格式。 ");
+        if (document.Manifest.Format != Format || document.Manifest.Version is < 1 or > 2 || document.Manifest.ContainsAuthentication) throw new InvalidDataException("不支持或不安全的 CloudLight XiaoMi 备份格式。 ");
         if (document.Routers.Any(value => string.IsNullOrWhiteSpace(value.MiotDid) || string.IsNullOrWhiteSpace(value.PartnerId))) throw new InvalidDataException("路由器数据不完整。 ");
         var routerIds = document.Routers.Select(value => value.MiotDid).ToHashSet(StringComparer.OrdinalIgnoreCase);
         if (document.Devices.Any(value => !routerIds.Contains(value.RouterMiotDid))) throw new InvalidDataException("设备引用了不存在的路由器。 ");
         var deviceKeys = document.Devices.Select(value => Key(value.RouterMiotDid, PresenceStateMachine.NormalizeMac(value.MacAddress))).ToHashSet(StringComparer.OrdinalIgnoreCase);
         if (document.Events.Any(value => !deviceKeys.Contains(Key(value.RouterMiotDid, PresenceStateMachine.NormalizeMac(value.MacAddress)))) || document.Sessions.Any(value => !deviceKeys.Contains(Key(value.RouterMiotDid, PresenceStateMachine.NormalizeMac(value.MacAddress))))) throw new InvalidDataException("历史记录引用了不存在的设备。 ");
+        var subjectIds = (document.Subjects ?? []).Select(value => value.ExportId).ToHashSet();
+        if ((document.SubjectDeviceMemberships ?? []).Any(value => !subjectIds.Contains(value.SubjectExportId) || !deviceKeys.Contains(Key(value.RouterMiotDid, PresenceStateMachine.NormalizeMac(value.MacAddress))))) throw new InvalidDataException("主体关联引用了不存在的主体或设备。 ");
     }
 
     private static List<(string, object?)> DeviceParameters(ExportDevice value, long routerId, string mac) => [("$router", routerId), ("$mac", mac), ("$original", value.OriginalName), ("$origin", value.OriginName), ("$custom", value.CustomName), ("$note", value.Note), ("$ip", value.LastIp), ("$connection", value.ConnectionType), ("$signal", value.Signal), ("$state", value.CurrentState), ("$first", Iso(value.FirstSeenAt)), ("$last", Iso(value.LastSeenAt)), ("$changed", value.LastStateChangedAt is null ? null : Iso(value.LastStateChangedAt.Value))];
@@ -115,11 +136,13 @@ public sealed class PresenceDataTransferService(AppPaths paths)
     private static DateTimeOffset? NullableTime(SqliteDataReader reader, int ordinal) => reader.IsDBNull(ordinal) ? null : Time(reader, ordinal);
     private static string Iso(DateTimeOffset value) => value.ToUniversalTime().ToString("O");
 
-    public sealed record ExportDocument(ExportManifest Manifest, List<ExportRouter> Routers, List<ExportDevice> Devices, List<ExportEvent> Events, List<ExportSession> Sessions, List<ExportGap> MonitoringGaps);
+    public sealed record ExportDocument(ExportManifest Manifest, List<ExportRouter> Routers, List<ExportDevice> Devices, List<ExportEvent> Events, List<ExportSession> Sessions, List<ExportGap> MonitoringGaps, List<ExportSubject>? Subjects = null, List<ExportSubjectDeviceMembership>? SubjectDeviceMemberships = null);
     public sealed record ExportManifest(string Format, int Version, DateTimeOffset CreatedAtUtc, string AppVersion, bool ContainsAuthentication);
     public sealed record ExportRouter(string MiotDid, string MiotModel, string PartnerId, string Name, string? HomeId, string? RoomId, DateTimeOffset CreatedAt, DateTimeOffset LastSeenAt);
     public sealed record ExportDevice(string RouterMiotDid, string MacAddress, string? OriginalName, string? OriginName, string? CustomName, string? Note, string? LastIp, string? ConnectionType, int? Signal, int CurrentState, DateTimeOffset FirstSeenAt, DateTimeOffset LastSeenAt, DateTimeOffset? LastStateChangedAt);
     public sealed record ExportEvent(string RouterMiotDid, string MacAddress, int EventType, DateTimeOffset ObservedAt, int Source);
     public sealed record ExportSession(string RouterMiotDid, string MacAddress, DateTimeOffset StartedAt, DateTimeOffset? EndedAt, bool StartKnown, bool EndKnown);
     public sealed record ExportGap(DateTimeOffset StartedAt, DateTimeOffset? EndedAt, string Reason);
+    public sealed record ExportSubject(Guid ExportId, string DisplayName, string? Note, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
+    public sealed record ExportSubjectDeviceMembership(Guid SubjectExportId, string RouterMiotDid, string MacAddress, DateTimeOffset CreatedAt);
 }

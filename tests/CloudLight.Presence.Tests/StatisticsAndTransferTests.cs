@@ -4,6 +4,7 @@ using CloudLight.Presence.Infrastructure.Database;
 using CloudLight.Presence.Infrastructure.Settings;
 using Xunit;
 using Microsoft.Win32;
+using System.Text.Json;
 
 namespace CloudLight.Presence.Tests;
 
@@ -69,6 +70,7 @@ public sealed class StatisticsAndTransferTests
         {
             var source = new SqlitePresenceRepository(new AppPaths(sourceRoot)); await source.InitializeAsync(CancellationToken.None); var now = DateTimeOffset.UtcNow;
             var router = await source.UpsertRouterAsync(RouterAt(now), CancellationToken.None); var device = await source.InsertDeviceAsync(DeviceAt(router.Id, now) with { CustomName = "我的手机", Note = "主力" }, CancellationToken.None);
+            var subject = await source.CreateSubjectAsync("爸爸", "两个网络身份", Guid.NewGuid(), now, CancellationToken.None); await source.SetSubjectDevicesAsync(subject.Id, [device.Id], now, CancellationToken.None);
             await source.AddEventAsync(new PresenceEvent(0, device.Id, PresenceEventType.InitialObservation, now, PresenceSource.Polling), CancellationToken.None);
             await source.AddSessionAsync(new PresenceSession(0, device.Id, now, null, false, false), CancellationToken.None);
             await File.WriteAllTextAsync(Path.Combine(sourceRoot, "auth.dat"), "passToken serviceToken ssecurity Xiaomi Cookie");
@@ -77,10 +79,28 @@ public sealed class StatisticsAndTransferTests
 
             var targetPaths = new AppPaths(targetRoot); var target = new SqlitePresenceRepository(targetPaths); await target.InitializeAsync(CancellationToken.None); var transfer = new PresenceDataTransferService(targetPaths);
             var first = await transfer.ImportAsync(backup, CancellationToken.None); var second = await transfer.ImportAsync(backup, CancellationToken.None);
-            var importedRouter = Assert.Single(await target.GetRoutersAsync(CancellationToken.None)); var importedDevice = Assert.Single(await target.GetDevicesAsync(importedRouter.Id, CancellationToken.None));
+            var importedRouter = Assert.Single(await target.GetRoutersAsync(CancellationToken.None)); var importedDevice = Assert.Single(await target.GetDevicesAsync(importedRouter.Id, CancellationToken.None)); var importedSubject = Assert.Single(await target.GetSubjectsAsync(CancellationToken.None));
             Assert.Equal(1, first.AddedEvents); Assert.Equal(0, second.AddedEvents); Assert.Single(await target.GetEventsAsync(importedDevice.Id, CancellationToken.None)); Assert.Single(await target.GetSessionsAsync(importedDevice.Id, CancellationToken.None)); Assert.Equal("我的手机", importedDevice.CustomName);
+            Assert.Equal("爸爸", importedSubject.DisplayName); Assert.Equal(importedDevice.Id, Assert.Single(await target.GetSubjectDevicesAsync(importedSubject.Id, CancellationToken.None)).Id); Assert.Contains("\"version\": 2", exported);
         }
         finally { if (Directory.Exists(sourceRoot)) Directory.Delete(sourceRoot, true); if (Directory.Exists(targetRoot)) Directory.Delete(targetRoot, true); if (File.Exists(backup)) File.Delete(backup); }
+    }
+
+    [Fact]
+    public async Task VersionOneBackupImportsDevicesAsStandaloneSubjects()
+    {
+        var root = TemporaryRoot(); var backup = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.clpresence");
+        try
+        {
+            var now = DateTimeOffset.UtcNow; var document = new PresenceDataTransferService.ExportDocument(
+                new("CloudLight.Presence.Export", 1, now, "legacy", false),
+                [new("legacy-did", "router", "legacy-partner", "Router", null, null, now, now)],
+                [new("legacy-did", "AA:BB:CC:DD:EE:01", "Phone", "Phone", null, null, "192.168.1.3", "5G", -50, (int)PresenceState.Offline, now, now, now)], [], [], []);
+            await File.WriteAllTextAsync(backup, JsonSerializer.Serialize(document, new JsonSerializerOptions(JsonSerializerDefaults.Web)));
+            var paths = new AppPaths(root); var repository = new SqlitePresenceRepository(paths); await repository.InitializeAsync(CancellationToken.None); await new PresenceDataTransferService(paths).ImportAsync(backup, CancellationToken.None);
+            var router = Assert.Single(await repository.GetRoutersAsync(CancellationToken.None)); var device = Assert.Single(await repository.GetDevicesAsync(router.Id, CancellationToken.None)); var subject = Assert.Single(await repository.GetSubjectsAsync(CancellationToken.None)); Assert.Equal("Phone", subject.DisplayName); Assert.Equal(subject.Id, (await repository.GetDeviceSubjectMapAsync(router.Id, CancellationToken.None))[device.Id]);
+        }
+        finally { if (Directory.Exists(root)) Directory.Delete(root, true); if (File.Exists(backup)) File.Delete(backup); }
     }
 
     private static string TemporaryRoot() { var path = Path.Combine(Path.GetTempPath(), "CloudLight-Presence-Tests", Guid.NewGuid().ToString("N")); Directory.CreateDirectory(path); return path; }

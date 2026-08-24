@@ -6,7 +6,7 @@ using CloudLight.Presence.Core.Interfaces;
 
 namespace CloudLight.Presence.Xiaomi.Authentication;
 
-internal sealed class MigateLoginBridge(string pythonPath)
+internal sealed class MigateLoginBridge(string pythonPath, string? logsDirectory)
 {
     private static readonly JsonSerializerOptions Options = new(JsonSerializerDefaults.Web);
 
@@ -33,23 +33,41 @@ internal sealed class MigateLoginBridge(string pythonPath)
         var start = new ProcessStartInfo(pythonPath)
         {
             UseShellExecute = false,
-            RedirectStandardOutput = false,
-            RedirectStandardError = false,
-            CreateNoWindow = false
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden
         };
         start.ArgumentList.Add(script); start.ArgumentList.Add($@"\\.\pipe\{pipeName}");
         using var process = Process.Start(start) ?? throw new InvalidOperationException("无法启动 migate 登录桥。 ");
+        var standardOutput = process.StandardOutput.ReadToEndAsync(cancellationToken);
+        var standardError = process.StandardError.ReadToEndAsync(cancellationToken);
         await pipe.WaitForConnectionAsync(cancellationToken);
         using var writer = new StreamWriter(pipe, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
         using var reader = new StreamReader(pipe, Encoding.UTF8, leaveOpen: true);
         await writer.WriteLineAsync(JsonSerializer.Serialize(request, Options));
         var line = await reader.ReadLineAsync(cancellationToken);
         await process.WaitForExitAsync(cancellationToken);
+        var response = string.IsNullOrWhiteSpace(line) ? null : JsonSerializer.Deserialize<BridgeResponse>(line, Options);
+        var bridgeError = response?.Ok == true ? null : response?.Error ?? "登录桥没有返回可读取的结果。";
+        await WriteProcessLogAsync(request.Operation, process.ExitCode, await standardOutput, await standardError, bridgeError, cancellationToken);
         if (string.IsNullOrWhiteSpace(line)) throw new AuthenticationRequiredException("Xiaomi 登录桥没有返回结果。");
-        var response = JsonSerializer.Deserialize<BridgeResponse>(line, Options);
         if (response?.Ok != true || response.Result is null)
             throw new AuthenticationRequiredException(response?.Error ?? "Xiaomi 登录或服务会话获取失败。");
         return response.Result;
+    }
+
+    private async Task WriteProcessLogAsync(string operation, int exitCode, string standardOutput, string standardError, string? bridgeError, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(logsDirectory) || (exitCode == 0 && string.IsNullOrWhiteSpace(standardOutput) && string.IsNullOrWhiteSpace(standardError) && string.IsNullOrWhiteSpace(bridgeError))) return;
+        Directory.CreateDirectory(logsDirectory);
+        var path = Path.Combine(logsDirectory, "migate-bridge.log");
+        var entry = $"[{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}] {operation}, exit={exitCode}{Environment.NewLine}" +
+                    (string.IsNullOrWhiteSpace(standardOutput) ? "" : $"stdout: {standardOutput.Trim()}{Environment.NewLine}") +
+                    (string.IsNullOrWhiteSpace(standardError) ? "" : $"stderr: {standardError.Trim()}{Environment.NewLine}") +
+                    (string.IsNullOrWhiteSpace(bridgeError) ? "" : $"error: {bridgeError.Trim()}{Environment.NewLine}");
+        await File.AppendAllTextAsync(path, entry, Encoding.UTF8, cancellationToken);
     }
 
     private sealed record BridgeRequest(string Operation, string Sid, BridgeCookies? AuthCookies);

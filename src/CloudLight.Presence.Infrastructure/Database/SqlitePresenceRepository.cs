@@ -5,13 +5,13 @@ using Microsoft.Data.Sqlite;
 
 namespace CloudLight.Presence.Infrastructure.Database;
 
-public sealed class SqlitePresenceRepository(AppPaths paths) : IPresenceRepository
+public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRepository
 {
-    private string ConnectionString => new SqliteConnectionStringBuilder { DataSource = paths.Database, Pooling = false }.ToString();
+    private string ConnectionString => new SqliteConnectionStringBuilder { DataSource = paths.DatabasePath, Pooling = false }.ToString();
 
     public async Task InitializeAsync(CancellationToken cancellationToken)
     {
-        Directory.CreateDirectory(paths.Root);
+        Directory.CreateDirectory(paths.RootDirectory);
         await using var connection = await OpenAsync(cancellationToken);
         await using var command = connection.CreateCommand();
         command.CommandText = """
@@ -46,8 +46,18 @@ public sealed class SqlitePresenceRepository(AppPaths paths) : IPresenceReposito
             CREATE TABLE IF NOT EXISTS ApplicationRun (
               Id INTEGER PRIMARY KEY AUTOINCREMENT, StartedAt TEXT NOT NULL,
               EndedAt TEXT NULL, LastSuccessfulCloudUpdateAt TEXT NULL);
+            CREATE TABLE IF NOT EXISTS PresenceSubject (
+              Id INTEGER PRIMARY KEY AUTOINCREMENT, ExportId TEXT NOT NULL UNIQUE,
+              DisplayName TEXT NOT NULL, Note TEXT NULL, CreatedAt TEXT NOT NULL, UpdatedAt TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS SubjectDeviceMembership (
+              SubjectId INTEGER NOT NULL, NetworkDeviceId INTEGER NOT NULL UNIQUE, CreatedAt TEXT NOT NULL,
+              PRIMARY KEY(SubjectId, NetworkDeviceId),
+              FOREIGN KEY(SubjectId) REFERENCES PresenceSubject(Id) ON DELETE CASCADE,
+              FOREIGN KEY(NetworkDeviceId) REFERENCES NetworkDevice(Id) ON DELETE CASCADE);
+            CREATE INDEX IF NOT EXISTS IX_SubjectDeviceMembership_Subject ON SubjectDeviceMembership(SubjectId);
             """;
         await command.ExecuteNonQueryAsync(cancellationToken);
+        await EnsureEveryDeviceHasSubjectAsync(cancellationToken);
     }
 
     public async Task<Router> UpsertRouterAsync(Router router, CancellationToken cancellationToken)
@@ -99,14 +109,23 @@ public sealed class SqlitePresenceRepository(AppPaths paths) : IPresenceReposito
     public async Task<NetworkDevice> InsertDeviceAsync(NetworkDevice device, CancellationToken cancellationToken)
     {
         await using var connection = await OpenAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
         await using var command = connection.CreateCommand();
+        command.Transaction = (SqliteTransaction)transaction;
         command.CommandText = """
             INSERT INTO NetworkDevice(RouterId,MacAddress,OriginalName,OriginName,CustomName,Note,LastIp,ConnectionType,Signal,CurrentState,FirstSeenAt,LastSeenAt,LastStateChangedAt)
             VALUES($router,$mac,$original,$origin,$custom,$note,$ip,$connection,$signal,$state,$first,$last,$changed) RETURNING *;
             """;
         AddDeviceParameters(command, device);
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken); await reader.ReadAsync(cancellationToken);
-        return ReadDevice(reader);
+        NetworkDevice created;
+        await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
+        {
+            await reader.ReadAsync(cancellationToken);
+            created = ReadDevice(reader);
+        }
+        await CreateStandaloneSubjectAsync(connection, (SqliteTransaction)transaction, created, device.FirstSeenAt, cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        return created;
     }
 
     public async Task UpdateDeviceAsync(NetworkDevice device, CancellationToken cancellationToken)
@@ -140,6 +159,123 @@ public sealed class SqlitePresenceRepository(AppPaths paths) : IPresenceReposito
         command.CommandText = "UPDATE NetworkDevice SET CustomName=$name,Note=$note WHERE Id=$id";
         Add(command, "$name", NullIfWhiteSpace(customName)); Add(command, "$note", NullIfWhiteSpace(note)); Add(command, "$id", deviceId);
         await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task<PresenceSubject> CreateSubjectAsync(string displayName, string? note, Guid exportId, DateTimeOffset createdAt, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(displayName)) throw new ArgumentException("主体名称不能为空。", nameof(displayName));
+        await using var connection = await OpenAsync(cancellationToken); await using var command = connection.CreateCommand();
+        command.CommandText = "INSERT INTO PresenceSubject(ExportId,DisplayName,Note,CreatedAt,UpdatedAt) VALUES($export,$name,$note,$created,$updated) RETURNING *";
+        Add(command, "$export", exportId.ToString("D")); Add(command, "$name", displayName.Trim()); Add(command, "$note", NullIfWhiteSpace(note)); Add(command, "$created", Time(createdAt)); Add(command, "$updated", Time(createdAt));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken); await reader.ReadAsync(cancellationToken); return ReadSubject(reader);
+    }
+
+    public async Task UpdateSubjectAsync(long subjectId, string displayName, string? note, DateTimeOffset updatedAt, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(displayName)) throw new ArgumentException("主体名称不能为空。", nameof(displayName));
+        await ExecuteAsync("UPDATE PresenceSubject SET DisplayName=$name,Note=$note,UpdatedAt=$updated WHERE Id=$id",
+            [("$id", subjectId), ("$name", displayName.Trim()), ("$note", NullIfWhiteSpace(note)), ("$updated", Time(updatedAt))], cancellationToken);
+    }
+
+    public async Task DeleteSubjectAsync(long subjectId, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        await using (var command = connection.CreateCommand())
+        {
+            command.Transaction = (SqliteTransaction)transaction;
+            command.CommandText = "DELETE FROM PresenceSubject WHERE Id=$id";
+            Add(command, "$id", subjectId);
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+        await EnsureEveryDeviceHasSubjectAsync(connection, (SqliteTransaction)transaction, DateTimeOffset.UtcNow, cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    public async Task<PresenceSubject?> GetSubjectAsync(long subjectId, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken); await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT * FROM PresenceSubject WHERE Id=$id"; Add(command, "$id", subjectId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken); return await reader.ReadAsync(cancellationToken) ? ReadSubject(reader) : null;
+    }
+
+    public async Task<IReadOnlyList<PresenceSubject>> GetSubjectsAsync(CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken); await using var command = connection.CreateCommand(); command.CommandText = "SELECT * FROM PresenceSubject ORDER BY DisplayName";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken); var result = new List<PresenceSubject>();
+        while (await reader.ReadAsync(cancellationToken)) result.Add(ReadSubject(reader)); return result;
+    }
+
+    public async Task<IReadOnlyList<NetworkDevice>> GetSubjectDevicesAsync(long subjectId, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken); await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT d.* FROM NetworkDevice d JOIN SubjectDeviceMembership m ON m.NetworkDeviceId=d.Id WHERE m.SubjectId=$id ORDER BY d.CurrentState DESC,d.Signal DESC,d.LastSeenAt DESC"; Add(command, "$id", subjectId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken); var result = new List<NetworkDevice>();
+        while (await reader.ReadAsync(cancellationToken)) result.Add(ReadDevice(reader)); return result;
+    }
+
+    public async Task<IReadOnlyDictionary<long, long>> GetDeviceSubjectMapAsync(long routerId, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken); await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT m.NetworkDeviceId,m.SubjectId FROM SubjectDeviceMembership m JOIN NetworkDevice d ON d.Id=m.NetworkDeviceId WHERE d.RouterId=$router"; Add(command, "$router", routerId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken); var result = new Dictionary<long, long>();
+        while (await reader.ReadAsync(cancellationToken)) result[reader.GetInt64(0)] = reader.GetInt64(1); return result;
+    }
+
+    public async Task EnsureEveryDeviceHasSubjectAsync(CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        await EnsureEveryDeviceHasSubjectAsync(connection, (SqliteTransaction)transaction, DateTimeOffset.UtcNow, cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    public async Task SetSubjectDevicesAsync(long subjectId, IReadOnlyCollection<long> deviceIds, DateTimeOffset createdAt, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken); await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        await using (var remove = connection.CreateCommand()) { remove.Transaction = (SqliteTransaction)transaction; remove.CommandText = "DELETE FROM SubjectDeviceMembership WHERE SubjectId=$id"; Add(remove, "$id", subjectId); await remove.ExecuteNonQueryAsync(cancellationToken); }
+        foreach (var deviceId in deviceIds.Distinct())
+        {
+            await using var command = connection.CreateCommand(); command.Transaction = (SqliteTransaction)transaction;
+            command.CommandText = "INSERT INTO SubjectDeviceMembership(SubjectId,NetworkDeviceId,CreatedAt) VALUES($subject,$device,$created) ON CONFLICT(NetworkDeviceId) DO UPDATE SET SubjectId=$subject,CreatedAt=$created";
+            Add(command, "$subject", subjectId); Add(command, "$device", deviceId); Add(command, "$created", Time(createdAt)); await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+        await using (var removeEmpty = connection.CreateCommand())
+        {
+            removeEmpty.Transaction = (SqliteTransaction)transaction;
+            removeEmpty.CommandText = "DELETE FROM PresenceSubject WHERE NOT EXISTS (SELECT 1 FROM SubjectDeviceMembership m WHERE m.SubjectId=PresenceSubject.Id)";
+            await removeEmpty.ExecuteNonQueryAsync(cancellationToken);
+        }
+        await EnsureEveryDeviceHasSubjectAsync(connection, (SqliteTransaction)transaction, createdAt, cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    private static async Task EnsureEveryDeviceHasSubjectAsync(SqliteConnection connection, SqliteTransaction transaction, DateTimeOffset createdAt, CancellationToken cancellationToken)
+    {
+        var orphans = new List<NetworkDevice>();
+        await using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = "SELECT d.* FROM NetworkDevice d LEFT JOIN SubjectDeviceMembership m ON m.NetworkDeviceId=d.Id WHERE m.NetworkDeviceId IS NULL ORDER BY d.Id";
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken)) orphans.Add(ReadDevice(reader));
+        }
+        foreach (var device in orphans)
+            await CreateStandaloneSubjectAsync(connection, transaction, device, createdAt, cancellationToken);
+    }
+
+    private static async Task CreateStandaloneSubjectAsync(SqliteConnection connection, SqliteTransaction transaction, NetworkDevice device, DateTimeOffset createdAt, CancellationToken cancellationToken)
+    {
+        await using var subject = connection.CreateCommand();
+        subject.Transaction = transaction;
+        subject.CommandText = "INSERT INTO PresenceSubject(ExportId,DisplayName,Note,CreatedAt,UpdatedAt) VALUES($export,$name,NULL,$created,$created); SELECT last_insert_rowid();";
+        Add(subject, "$export", Guid.NewGuid().ToString("D")); Add(subject, "$name", device.DisplayName); Add(subject, "$created", Time(createdAt));
+        var subjectId = (long)(await subject.ExecuteScalarAsync(cancellationToken) ?? 0L);
+        await using var membership = connection.CreateCommand();
+        membership.Transaction = transaction;
+        membership.CommandText = "INSERT INTO SubjectDeviceMembership(SubjectId,NetworkDeviceId,CreatedAt) VALUES($subject,$device,$created)";
+        Add(membership, "$subject", subjectId); Add(membership, "$device", device.Id); Add(membership, "$created", Time(createdAt));
+        await membership.ExecuteNonQueryAsync(cancellationToken);
     }
 
     public async Task AddEventAsync(PresenceEvent value, CancellationToken cancellationToken)
@@ -263,6 +399,7 @@ public sealed class SqlitePresenceRepository(AppPaths paths) : IPresenceReposito
     }
 
     private static Router ReadRouter(SqliteDataReader reader) => new(reader.GetInt64(reader.GetOrdinal("Id")), reader.GetString(reader.GetOrdinal("MiotDid")), reader.GetString(reader.GetOrdinal("MiotModel")), reader.GetString(reader.GetOrdinal("PartnerId")), reader.GetString(reader.GetOrdinal("Name")), Text(reader, "HomeId"), Text(reader, "RoomId"), ParseTime(reader.GetString(reader.GetOrdinal("CreatedAt"))), ParseTime(reader.GetString(reader.GetOrdinal("LastSeenAt"))));
+    private static PresenceSubject ReadSubject(SqliteDataReader reader) => new(reader.GetInt64(reader.GetOrdinal("Id")), Guid.Parse(reader.GetString(reader.GetOrdinal("ExportId"))), reader.GetString(reader.GetOrdinal("DisplayName")), Text(reader, "Note"), ParseTime(reader.GetString(reader.GetOrdinal("CreatedAt"))), ParseTime(reader.GetString(reader.GetOrdinal("UpdatedAt"))));
     private static NetworkDevice ReadDevice(SqliteDataReader reader) => new(reader.GetInt64(reader.GetOrdinal("Id")), reader.GetInt64(reader.GetOrdinal("RouterId")), reader.GetString(reader.GetOrdinal("MacAddress")), Text(reader, "OriginalName"), Text(reader, "OriginName"), Text(reader, "CustomName"), Text(reader, "Note"), Text(reader, "LastIp"), Text(reader, "ConnectionType"), Integer(reader, "Signal"), (PresenceState)reader.GetInt32(reader.GetOrdinal("CurrentState")), ParseTime(reader.GetString(reader.GetOrdinal("FirstSeenAt"))), ParseTime(reader.GetString(reader.GetOrdinal("LastSeenAt"))), Text(reader, "LastStateChangedAt") is { } changed ? ParseTime(changed) : null);
     private static string? Text(SqliteDataReader reader, string name) { var i = reader.GetOrdinal(name); return reader.IsDBNull(i) ? null : reader.GetString(i); }
     private static int? Integer(SqliteDataReader reader, string name) { var i = reader.GetOrdinal(name); return reader.IsDBNull(i) ? null : reader.GetInt32(i); }

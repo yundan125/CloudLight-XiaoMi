@@ -1,4 +1,4 @@
-# CloudLight XiaoMi 1.0.0
+# CloudLight XiaoMi 1.2.0
 
 CloudLight XiaoMi is a Windows desktop application that records the observed
 online/offline presence of devices connected to a Xiaomi router owned by the signed-in
@@ -15,8 +15,8 @@ DPAPI for authentication storage, and SQLite for local history.
 - Per-user startup registration and per-user installation
 
 For compatibility with existing 1.0.0 data, user data stays under the legacy storage
-path `%LocalAppData%\CloudLight Presence` and is not removed by the
-installer or uninstaller. The 1.0.0 installer contains a private Python 3.14 runtime and
+path `%USERPROFILE%\Documents\CloudLight\CloudLight XiaoMi` (resolved through the actual Windows Documents known folder). Existing data from `%LocalAppData%\CloudLight Presence` is copied and verified automatically on first launch; the old directory is retained and is not removed by the
+installer or uninstaller. The 1.2.0 installer contains a private Python 3.14 runtime and
 MiForge/migate 1.1.10; it does not install or modify system Python.
 
 ## Build
@@ -26,17 +26,17 @@ dotnet build -c Release
 dotnet test -c Release
 dotnet publish .\src\CloudLight.Presence.App\CloudLight.Presence.App.csproj `
   -c Release -r win-x64 --self-contained true `
-  -o .\artifacts\win-x64-1.0.0
+  -o .\artifacts\win-x64-1.2.0
 
 .\installer\Prepare-MigateRuntime.ps1 `
-  -PublishDirectory .\artifacts\win-x64-1.0.0
+  -PublishDirectory .\artifacts\win-x64-1.2.0
 
 & 'C:\Program Files\Inno Setup 7\ISCC.exe' `
   .\installer\CloudLightXiaoMi.iss
 ```
 
 The generated installer is
-`artifacts\CloudLight-XiaoMi-Setup-1.0.0.exe`.
+`artifacts\CloudLight-XiaoMi-Setup-1.2.0.exe`.
 
 ## Architecture notes
 

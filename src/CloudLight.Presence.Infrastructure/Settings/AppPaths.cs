@@ -1,24 +1,50 @@
 namespace CloudLight.Presence.Infrastructure.Settings;
 
-public sealed class AppPaths
+public interface IAppDataPaths
 {
-    public AppPaths(string? root = null)
+    string RootDirectory { get; }
+    string DatabasePath { get; }
+    string SettingsPath { get; }
+    string AuthPath { get; }
+    string LogsDirectory { get; }
+    string ExportsDirectory { get; }
+    string BackupsDirectory { get; }
+    string DiagnosticsDirectory { get; }
+}
+
+public sealed class AppPaths : IAppDataPaths
+{
+    public AppPaths(string? rootDirectory = null, string? legacyRootDirectory = null)
     {
-        Root = root ?? Path.Combine(
+        RootDirectory = rootDirectory ?? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+            "CloudLight",
+            "CloudLight XiaoMi");
+        LegacyRootDirectory = legacyRootDirectory ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "CloudLight Presence");
     }
 
-    public string Root { get; }
-    public string Database => Path.Combine(Root, "presence.db");
-    public string Settings => Path.Combine(Root, "settings.json");
-    public string Auth => Path.Combine(Root, "auth.dat");
+    public string RootDirectory { get; }
+    public string DatabasePath => Path.Combine(RootDirectory, "presence.db");
+    public string SettingsPath => Path.Combine(RootDirectory, "settings.json");
+    public string AuthPath => Path.Combine(RootDirectory, "auth.dat");
+    public string LogsDirectory => Path.Combine(RootDirectory, "logs");
+    public string ExportsDirectory => Path.Combine(RootDirectory, "exports");
+    public string BackupsDirectory => Path.Combine(RootDirectory, "backups");
+    public string DiagnosticsDirectory => Path.Combine(RootDirectory, "diagnostics");
+    public string LegacyRootDirectory { get; }
+
+    public string Root => RootDirectory;
+    public string Database => DatabasePath;
+    public string Settings => SettingsPath;
+    public string Auth => AuthPath;
     public string MigatePython
     {
         get
         {
             var packaged = Path.Combine(AppContext.BaseDirectory, "migate-python", "python.exe");
-            return File.Exists(packaged) ? packaged : Path.Combine(Root, "migate-python", "Scripts", "python.exe");
+            return File.Exists(packaged) ? packaged : Path.Combine(RootDirectory, "migate-python", "Scripts", "python.exe");
         }
     }
 }
