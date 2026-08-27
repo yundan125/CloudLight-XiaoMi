@@ -15,7 +15,7 @@ public sealed class StatisticsAndTransferTests
     {
         const string runKey = @"Software\Microsoft\Windows\CurrentVersion\Run"; const string valueName = "CloudLight XiaoMi"; const string legacyValueName = "CloudLight Presence";
         using var root = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, RegistryView.Registry64); using var key = root.OpenSubKey(runKey, true) ?? root.CreateSubKey(runKey, true);
-        var previous = key.GetValue(valueName); var legacyPrevious = key.GetValue(legacyValueName); var service = new StartupRegistrationService();
+        var previous = key.GetValue(valueName); var legacyPrevious = key.GetValue(legacyValueName); var service = new StartupRegistrationService(Environment.ProcessPath);
         try
         {
             key.SetValue(legacyValueName, "legacy.exe", RegistryValueKind.String); service.Apply(true); Assert.Equal($"\"{Environment.ProcessPath}\" --startup", key.GetValue(valueName)); Assert.Null(key.GetValue(legacyValueName));
@@ -71,6 +71,7 @@ public sealed class StatisticsAndTransferTests
             var source = new SqlitePresenceRepository(new AppPaths(sourceRoot)); await source.InitializeAsync(CancellationToken.None); var now = DateTimeOffset.UtcNow;
             var router = await source.UpsertRouterAsync(RouterAt(now), CancellationToken.None); var device = await source.InsertDeviceAsync(DeviceAt(router.Id, now) with { CustomName = "我的手机", Note = "主力" }, CancellationToken.None);
             var subject = await source.CreateSubjectAsync("爸爸", "两个网络身份", Guid.NewGuid(), now, CancellationToken.None); await source.SetSubjectDevicesAsync(subject.Id, [device.Id], now, CancellationToken.None);
+            await source.CreateNotificationRuleAsync(new NotificationRule(0, subject.Id, true, NotificationCondition.OfflineFor, 14 * 60 * 60, NotificationChannelType.QQ, NotificationTargetType.Private, "user-openid", "{name} {duration}", now, now), CancellationToken.None);
             await source.AddEventAsync(new PresenceEvent(0, device.Id, PresenceEventType.InitialObservation, now, PresenceSource.Polling), CancellationToken.None);
             await source.AddSessionAsync(new PresenceSession(0, device.Id, now, null, false, false), CancellationToken.None);
             await File.WriteAllTextAsync(Path.Combine(sourceRoot, "auth.dat"), "passToken serviceToken ssecurity Xiaomi Cookie");
@@ -81,7 +82,7 @@ public sealed class StatisticsAndTransferTests
             var first = await transfer.ImportAsync(backup, CancellationToken.None); var second = await transfer.ImportAsync(backup, CancellationToken.None);
             var importedRouter = Assert.Single(await target.GetRoutersAsync(CancellationToken.None)); var importedDevice = Assert.Single(await target.GetDevicesAsync(importedRouter.Id, CancellationToken.None)); var importedSubject = Assert.Single(await target.GetSubjectsAsync(CancellationToken.None));
             Assert.Equal(1, first.AddedEvents); Assert.Equal(0, second.AddedEvents); Assert.Single(await target.GetEventsAsync(importedDevice.Id, CancellationToken.None)); Assert.Single(await target.GetSessionsAsync(importedDevice.Id, CancellationToken.None)); Assert.Equal("我的手机", importedDevice.CustomName);
-            Assert.Equal("爸爸", importedSubject.DisplayName); Assert.Equal(importedDevice.Id, Assert.Single(await target.GetSubjectDevicesAsync(importedSubject.Id, CancellationToken.None)).Id); Assert.Contains("\"version\": 2", exported);
+            Assert.Equal("爸爸", importedSubject.DisplayName); Assert.Equal(importedDevice.Id, Assert.Single(await target.GetSubjectDevicesAsync(importedSubject.Id, CancellationToken.None)).Id); var importedRule = Assert.Single(await target.GetNotificationRulesAsync(false, CancellationToken.None)); Assert.Equal(importedSubject.Id, importedRule.SubjectId); Assert.Equal(NotificationCondition.OfflineFor, importedRule.Condition); Assert.Equal("user-openid", importedRule.TargetId); Assert.Contains("\"version\": 2", exported);
         }
         finally { if (Directory.Exists(sourceRoot)) Directory.Delete(sourceRoot, true); if (Directory.Exists(targetRoot)) Directory.Delete(targetRoot, true); if (File.Exists(backup)) File.Delete(backup); }
     }

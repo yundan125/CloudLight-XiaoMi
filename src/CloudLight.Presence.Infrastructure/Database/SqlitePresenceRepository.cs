@@ -26,7 +26,8 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
               MacAddress TEXT NOT NULL, OriginalName TEXT NULL, OriginName TEXT NULL,
               CustomName TEXT NULL, Note TEXT NULL, LastIp TEXT NULL,
               ConnectionType TEXT NULL, Signal INTEGER NULL, CurrentState INTEGER NOT NULL,
-              FirstSeenAt TEXT NOT NULL, LastSeenAt TEXT NOT NULL, LastStateChangedAt TEXT NULL,
+               FirstSeenAt TEXT NOT NULL, LastSeenAt TEXT NOT NULL, LastStateChangedAt TEXT NULL,
+               LastKnownHistoricalState INTEGER NOT NULL DEFAULT 0,
               UNIQUE(RouterId, MacAddress), FOREIGN KEY(RouterId) REFERENCES Router(Id));
             CREATE TABLE IF NOT EXISTS PresenceEvent (
               Id INTEGER PRIMARY KEY AUTOINCREMENT, DeviceId INTEGER NOT NULL,
@@ -55,8 +56,50 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
               FOREIGN KEY(SubjectId) REFERENCES PresenceSubject(Id) ON DELETE CASCADE,
               FOREIGN KEY(NetworkDeviceId) REFERENCES NetworkDevice(Id) ON DELETE CASCADE);
             CREATE INDEX IF NOT EXISTS IX_SubjectDeviceMembership_Subject ON SubjectDeviceMembership(SubjectId);
+            CREATE TABLE IF NOT EXISTS NotificationRule (
+              Id INTEGER PRIMARY KEY AUTOINCREMENT, SubjectId INTEGER NOT NULL,
+              Enabled INTEGER NOT NULL, RuleCondition INTEGER NOT NULL,
+              ThresholdSeconds INTEGER NOT NULL, Channel INTEGER NOT NULL,
+              TargetType INTEGER NOT NULL, TargetId TEXT NOT NULL,
+              MessageTemplate TEXT NOT NULL, CreatedAt TEXT NOT NULL, UpdatedAt TEXT NOT NULL,
+              FOREIGN KEY(SubjectId) REFERENCES PresenceSubject(Id) ON DELETE CASCADE);
+            CREATE INDEX IF NOT EXISTS IX_NotificationRule_Subject_Enabled ON NotificationRule(SubjectId,Enabled);
+            CREATE TABLE IF NOT EXISTS NotificationRuleState (
+              RuleId INTEGER PRIMARY KEY, CurrentEpisodeId TEXT NULL, StateSince TEXT NULL,
+              TriggeredForCurrentEpisode INTEGER NOT NULL, TriggeredAt TEXT NULL,
+              PendingDelivery INTEGER NOT NULL, PendingDeliveryId INTEGER NULL,
+              LastDeliveryError TEXT NULL, UpdatedAt TEXT NOT NULL,
+              FOREIGN KEY(RuleId) REFERENCES NotificationRule(Id) ON DELETE CASCADE);
+            CREATE TABLE IF NOT EXISTS NotificationDelivery (
+              Id INTEGER PRIMARY KEY AUTOINCREMENT, RuleId INTEGER NULL, SubjectId INTEGER NULL,
+              EpisodeId TEXT NOT NULL, CreatedAt TEXT NOT NULL, Status INTEGER NOT NULL,
+              DeliveredAt TEXT NULL, Channel INTEGER NOT NULL, TargetType INTEGER NOT NULL,
+              TargetId TEXT NOT NULL, Message TEXT NOT NULL, Error TEXT NULL,
+              SentParts INTEGER NOT NULL DEFAULT 0, TotalParts INTEGER NOT NULL DEFAULT 0,
+              LastAttemptAt TEXT NULL, NextAttemptAt TEXT NULL,
+              FOREIGN KEY(RuleId) REFERENCES NotificationRule(Id) ON DELETE SET NULL,
+              FOREIGN KEY(SubjectId) REFERENCES PresenceSubject(Id) ON DELETE SET NULL,
+              UNIQUE(RuleId,EpisodeId));
+            CREATE INDEX IF NOT EXISTS IX_NotificationDelivery_Pending ON NotificationDelivery(Status,NextAttemptAt);
+            CREATE INDEX IF NOT EXISTS IX_NotificationDelivery_Created ON NotificationDelivery(CreatedAt DESC);
+            CREATE TABLE IF NOT EXISTS ConnectionAlertState (
+              Id INTEGER PRIMARY KEY CHECK(Id=1), FailureEpisodeId TEXT NULL,
+              FailureStartedAt TEXT NULL, LastSuccessfulCloudUpdateAt TEXT NULL,
+              FailureAlertSent INTEGER NOT NULL, RecoveryAlertSent INTEGER NOT NULL,
+              UpdatedAt TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS SystemNotificationDelivery (
+              Id INTEGER PRIMARY KEY AUTOINCREMENT, Kind INTEGER NOT NULL, EpisodeId TEXT NOT NULL,
+              CreatedAt TEXT NOT NULL, Status INTEGER NOT NULL, DeliveredAt TEXT NULL,
+              Channel INTEGER NOT NULL, TargetType INTEGER NOT NULL, TargetId TEXT NOT NULL,
+              Message TEXT NOT NULL, Error TEXT NULL, SentParts INTEGER NOT NULL DEFAULT 0,
+              TotalParts INTEGER NOT NULL DEFAULT 0, LastAttemptAt TEXT NULL, NextAttemptAt TEXT NULL,
+              UNIQUE(Kind,EpisodeId));
+            CREATE INDEX IF NOT EXISTS IX_SystemNotificationDelivery_Pending ON SystemNotificationDelivery(Status,NextAttemptAt);
+            CREATE INDEX IF NOT EXISTS IX_SystemNotificationDelivery_Created ON SystemNotificationDelivery(CreatedAt DESC);
             """;
         await command.ExecuteNonQueryAsync(cancellationToken);
+        await EnsureNetworkDeviceHistorySchemaAsync(connection, cancellationToken);
+        await MigrateNotificationDeliverySchemaAsync(connection, cancellationToken);
         await EnsureEveryDeviceHasSubjectAsync(cancellationToken);
     }
 
@@ -88,6 +131,14 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         return result;
     }
 
+    public async Task<Router?> GetRouterAsync(long routerId, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand(); command.CommandText = "SELECT * FROM Router WHERE Id=$id"; Add(command, "$id", routerId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadRouter(reader) : null;
+    }
+
     public async Task<NetworkDevice?> FindDeviceAsync(long routerId, string macAddress, CancellationToken cancellationToken)
     {
         await using var connection = await OpenAsync(cancellationToken);
@@ -113,8 +164,8 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         await using var command = connection.CreateCommand();
         command.Transaction = (SqliteTransaction)transaction;
         command.CommandText = """
-            INSERT INTO NetworkDevice(RouterId,MacAddress,OriginalName,OriginName,CustomName,Note,LastIp,ConnectionType,Signal,CurrentState,FirstSeenAt,LastSeenAt,LastStateChangedAt)
-            VALUES($router,$mac,$original,$origin,$custom,$note,$ip,$connection,$signal,$state,$first,$last,$changed) RETURNING *;
+            INSERT INTO NetworkDevice(RouterId,MacAddress,OriginalName,OriginName,CustomName,Note,LastIp,ConnectionType,Signal,CurrentState,FirstSeenAt,LastSeenAt,LastStateChangedAt,LastKnownHistoricalState)
+            VALUES($router,$mac,$original,$origin,$custom,$note,$ip,$connection,$signal,$state,$first,$last,$changed,$historical) RETURNING *;
             """;
         AddDeviceParameters(command, device);
         NetworkDevice created;
@@ -135,7 +186,7 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         command.CommandText = """
             UPDATE NetworkDevice SET OriginalName=$original,OriginName=$origin,LastIp=$ip,
               ConnectionType=$connection,Signal=$signal,CurrentState=$state,LastSeenAt=$last,
-              LastStateChangedAt=$changed WHERE Id=$id;
+              LastStateChangedAt=$changed,LastKnownHistoricalState=$historical WHERE Id=$id;
             """;
         AddDeviceParameters(command, device); Add(command, "$id", device.Id);
         await command.ExecuteNonQueryAsync(cancellationToken);
@@ -151,6 +202,10 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         var result = new List<NetworkDevice>(); while (await reader.ReadAsync(cancellationToken)) result.Add(ReadDevice(reader));
         return result;
     }
+
+    public async Task ResetCurrentObservedStateAsync(long routerId, CancellationToken cancellationToken) =>
+        await ExecuteAsync("UPDATE NetworkDevice SET CurrentState=$state WHERE RouterId=$router", [
+            ("$state", (int)PresenceState.Unknown), ("$router", routerId)], cancellationToken);
 
     public async Task UpdateDeviceMetadataAsync(long deviceId, string? customName, string? note, CancellationToken cancellationToken)
     {
@@ -357,6 +412,13 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
             await using var close = connection.CreateCommand(); close.Transaction = (SqliteTransaction)transaction;
             close.CommandText = "UPDATE ApplicationRun SET EndedAt=$end WHERE Id=$id"; Add(close, "$end", Time(startedAt)); Add(close, "$id", previousId.Value); await close.ExecuteNonQueryAsync(cancellationToken);
         }
+        await using (var reset = connection.CreateCommand())
+        {
+            reset.Transaction = (SqliteTransaction)transaction;
+            reset.CommandText = "UPDATE NetworkDevice SET CurrentState=$state";
+            Add(reset, "$state", (int)PresenceState.Unknown);
+            await reset.ExecuteNonQueryAsync(cancellationToken);
+        }
         await using var insert = connection.CreateCommand(); insert.Transaction = (SqliteTransaction)transaction;
         insert.CommandText = "INSERT INTO ApplicationRun(StartedAt) VALUES($start); SELECT last_insert_rowid();"; Add(insert, "$start", Time(startedAt));
         var id = (long)(await insert.ExecuteScalarAsync(cancellationToken) ?? 0L); await transaction.CommitAsync(cancellationToken); return id;
@@ -368,11 +430,221 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
     public async Task EndApplicationRunAsync(long runId, DateTimeOffset endedAt, CancellationToken cancellationToken) =>
         await ExecuteAsync("UPDATE ApplicationRun SET EndedAt=$end WHERE Id=$id AND EndedAt IS NULL", [("$id", runId), ("$end", Time(endedAt))], cancellationToken);
 
+    public async Task<IReadOnlyList<NotificationRule>> GetNotificationRulesAsync(bool enabledOnly, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken); await using var command = connection.CreateCommand();
+        command.CommandText = enabledOnly ? "SELECT * FROM NotificationRule WHERE Enabled=1 ORDER BY UpdatedAt DESC,Id" : "SELECT * FROM NotificationRule ORDER BY UpdatedAt DESC,Id";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken); var result = new List<NotificationRule>();
+        while (await reader.ReadAsync(cancellationToken)) result.Add(ReadNotificationRule(reader));
+        return result;
+    }
+
+    public async Task<NotificationRule?> GetNotificationRuleAsync(long ruleId, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken); await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT * FROM NotificationRule WHERE Id=$id"; Add(command, "$id", ruleId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadNotificationRule(reader) : null;
+    }
+
+    public async Task<NotificationRule> CreateNotificationRuleAsync(NotificationRule rule, CancellationToken cancellationToken)
+    {
+        var normalized = NormalizeRule(rule);
+        await using var connection = await OpenAsync(cancellationToken); await using var command = connection.CreateCommand();
+        command.CommandText = "INSERT INTO NotificationRule(SubjectId,Enabled,RuleCondition,ThresholdSeconds,Channel,TargetType,TargetId,MessageTemplate,CreatedAt,UpdatedAt) VALUES($subject,$enabled,$condition,$threshold,$channel,$targetType,$target,$template,$created,$updated) RETURNING *";
+        AddRuleParameters(command, normalized);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken); await reader.ReadAsync(cancellationToken); return ReadNotificationRule(reader);
+    }
+
+    public async Task UpdateNotificationRuleAsync(NotificationRule rule, CancellationToken cancellationToken)
+    {
+        if (rule.Id <= 0) throw new ArgumentException("通知规则编号无效。", nameof(rule));
+        var normalized = NormalizeRule(rule);
+        await ExecuteAsync("UPDATE NotificationRule SET SubjectId=$subject,Enabled=$enabled,RuleCondition=$condition,ThresholdSeconds=$threshold,Channel=$channel,TargetType=$targetType,TargetId=$target,MessageTemplate=$template,UpdatedAt=$updated WHERE Id=$id",
+            [("$subject", normalized.SubjectId), ("$enabled", normalized.Enabled ? 1 : 0), ("$condition", (int)normalized.Condition), ("$threshold", normalized.ThresholdSeconds), ("$channel", (int)normalized.Channel), ("$targetType", (int)normalized.TargetType), ("$target", normalized.TargetId), ("$template", normalized.MessageTemplate), ("$updated", Time(normalized.UpdatedAt)), ("$id", normalized.Id)], cancellationToken);
+    }
+
+    public Task DeleteNotificationRuleAsync(long ruleId, CancellationToken cancellationToken) =>
+        ExecuteAsync("DELETE FROM NotificationRule WHERE Id=$id", [("$id", ruleId)], cancellationToken);
+
+    public async Task<NotificationRuleState?> GetNotificationRuleStateAsync(long ruleId, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken); await using var command = connection.CreateCommand(); command.CommandText = "SELECT * FROM NotificationRuleState WHERE RuleId=$id"; Add(command, "$id", ruleId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken); return await reader.ReadAsync(cancellationToken) ? ReadNotificationRuleState(reader) : null;
+    }
+
+    public async Task UpsertNotificationRuleStateAsync(NotificationRuleState state, CancellationToken cancellationToken)
+    {
+        await ExecuteAsync("INSERT INTO NotificationRuleState(RuleId,CurrentEpisodeId,StateSince,TriggeredForCurrentEpisode,TriggeredAt,PendingDelivery,PendingDeliveryId,LastDeliveryError,UpdatedAt) VALUES($rule,$episode,$since,$triggered,$triggeredAt,$pending,$delivery,$error,$updated) ON CONFLICT(RuleId) DO UPDATE SET CurrentEpisodeId=$episode,StateSince=$since,TriggeredForCurrentEpisode=$triggered,TriggeredAt=$triggeredAt,PendingDelivery=$pending,PendingDeliveryId=$delivery,LastDeliveryError=$error,UpdatedAt=$updated",
+            [("$rule", state.RuleId), ("$episode", state.CurrentEpisodeId), ("$since", state.StateSince is null ? null : Time(state.StateSince.Value)), ("$triggered", state.TriggeredForCurrentEpisode ? 1 : 0), ("$triggeredAt", state.TriggeredAt is null ? null : Time(state.TriggeredAt.Value)), ("$pending", state.PendingDelivery ? 1 : 0), ("$delivery", state.PendingDeliveryId), ("$error", state.LastDeliveryError), ("$updated", Time(state.UpdatedAt))], cancellationToken);
+    }
+
+    public async Task<NotificationDelivery?> GetNotificationDeliveryAsync(long deliveryId, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken); await using var command = connection.CreateCommand(); command.CommandText = "SELECT * FROM NotificationDelivery WHERE Id=$id"; Add(command, "$id", deliveryId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken); return await reader.ReadAsync(cancellationToken) ? ReadNotificationDelivery(reader) : null;
+    }
+
+    public async Task<NotificationDelivery?> GetNotificationDeliveryForEpisodeAsync(long ruleId, string episodeId, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken); await using var command = connection.CreateCommand(); command.CommandText = "SELECT * FROM NotificationDelivery WHERE RuleId=$rule AND EpisodeId=$episode"; Add(command, "$rule", ruleId); Add(command, "$episode", episodeId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken); return await reader.ReadAsync(cancellationToken) ? ReadNotificationDelivery(reader) : null;
+    }
+
+    public async Task<NotificationDelivery> CreateNotificationDeliveryAsync(NotificationDelivery delivery, CancellationToken cancellationToken)
+    {
+        if (delivery.RuleId is not > 0 || delivery.SubjectId is not > 0 || string.IsNullOrWhiteSpace(delivery.EpisodeId)) throw new ArgumentException("通知投递信息不完整。", nameof(delivery));
+        if (delivery.Channel != NotificationChannelType.QQ) throw new ArgumentOutOfRangeException(nameof(delivery), "当前只支持 QQ 通知。");
+        if (delivery.TargetType is not (NotificationTargetType.Private or NotificationTargetType.Group) || string.IsNullOrWhiteSpace(delivery.TargetId)) throw new ArgumentException("QQ 通知目标无效。", nameof(delivery));
+        await using var connection = await OpenAsync(cancellationToken);
+        await using (var insert = connection.CreateCommand())
+        {
+            insert.CommandText = "INSERT OR IGNORE INTO NotificationDelivery(RuleId,SubjectId,EpisodeId,CreatedAt,Status,DeliveredAt,Channel,TargetType,TargetId,Message,Error,SentParts,TotalParts,LastAttemptAt,NextAttemptAt) VALUES($rule,$subject,$episode,$created,$status,$delivered,$channel,$targetType,$target,$message,$error,$sent,$total,$last,$next)";
+            AddDeliveryParameters(insert, delivery); await insert.ExecuteNonQueryAsync(cancellationToken);
+        }
+        await using var select = connection.CreateCommand(); select.CommandText = "SELECT * FROM NotificationDelivery WHERE RuleId=$rule AND EpisodeId=$episode"; Add(select, "$rule", delivery.RuleId); Add(select, "$episode", delivery.EpisodeId);
+        await using var reader = await select.ExecuteReaderAsync(cancellationToken); if (!await reader.ReadAsync(cancellationToken)) throw new InvalidOperationException("通知投递记录保存失败。"); return ReadNotificationDelivery(reader);
+    }
+
+    public Task UpdateNotificationDeliveryAsync(NotificationDelivery delivery, CancellationToken cancellationToken) =>
+        ExecuteAsync("UPDATE NotificationDelivery SET Status=$status,DeliveredAt=$delivered,Error=$error,SentParts=$sent,TotalParts=$total,LastAttemptAt=$last,NextAttemptAt=$next WHERE Id=$id",
+            [("$status", (int)delivery.Status), ("$delivered", delivery.DeliveredAt is null ? null : Time(delivery.DeliveredAt.Value)), ("$error", delivery.Error), ("$sent", delivery.SentParts), ("$total", delivery.TotalParts), ("$last", delivery.LastAttemptAt is null ? null : Time(delivery.LastAttemptAt.Value)), ("$next", delivery.NextAttemptAt is null ? null : Time(delivery.NextAttemptAt.Value)), ("$id", delivery.Id)], cancellationToken);
+
+    public async Task<IReadOnlyList<NotificationDelivery>> GetPendingNotificationDeliveriesAsync(DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken); await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT * FROM NotificationDelivery WHERE RuleId IS NOT NULL AND Status IN ($pending,$failed) AND (NextAttemptAt IS NULL OR NextAttemptAt<=$now) AND (TotalParts=0 OR SentParts<TotalParts) ORDER BY CreatedAt,Id"; Add(command, "$pending", (int)NotificationDeliveryStatus.Pending); Add(command, "$failed", (int)NotificationDeliveryStatus.Failed); Add(command, "$now", Time(now));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken); var result = new List<NotificationDelivery>(); while (await reader.ReadAsync(cancellationToken)) result.Add(ReadNotificationDelivery(reader)); return result;
+    }
+
+    public async Task<IReadOnlyList<NotificationDelivery>> GetRecentNotificationDeliveriesAsync(int limit, CancellationToken cancellationToken)
+    {
+        limit = Math.Clamp(limit, 1, 200);
+        await using var connection = await OpenAsync(cancellationToken); await using var command = connection.CreateCommand(); command.CommandText = "SELECT * FROM NotificationDelivery ORDER BY CreatedAt DESC,Id DESC LIMIT $limit"; Add(command, "$limit", limit);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken); var result = new List<NotificationDelivery>(); while (await reader.ReadAsync(cancellationToken)) result.Add(ReadNotificationDelivery(reader)); return result;
+    }
+
+    public async Task<ConnectionAlertState?> GetConnectionAlertStateAsync(CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken); await using var command = connection.CreateCommand(); command.CommandText = "SELECT * FROM ConnectionAlertState WHERE Id=1";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken)) return null;
+        return new(Text(reader, "FailureEpisodeId"), Text(reader, "FailureStartedAt") is { } started ? ParseTime(started) : null,
+            Text(reader, "LastSuccessfulCloudUpdateAt") is { } updated ? ParseTime(updated) : null,
+            reader.GetInt32(reader.GetOrdinal("FailureAlertSent")) != 0,
+            reader.GetInt32(reader.GetOrdinal("RecoveryAlertSent")) != 0,
+            ParseTime(reader.GetString(reader.GetOrdinal("UpdatedAt"))));
+    }
+
+    public Task UpsertConnectionAlertStateAsync(ConnectionAlertState state, CancellationToken cancellationToken) =>
+        ExecuteAsync("INSERT INTO ConnectionAlertState(Id,FailureEpisodeId,FailureStartedAt,LastSuccessfulCloudUpdateAt,FailureAlertSent,RecoveryAlertSent,UpdatedAt) VALUES(1,$episode,$started,$last,$failure,$recovery,$updated) ON CONFLICT(Id) DO UPDATE SET FailureEpisodeId=$episode,FailureStartedAt=$started,LastSuccessfulCloudUpdateAt=$last,FailureAlertSent=$failure,RecoveryAlertSent=$recovery,UpdatedAt=$updated",
+            [("$episode", state.FailureEpisodeId), ("$started", state.FailureStartedAt is null ? null : Time(state.FailureStartedAt.Value)), ("$last", state.LastSuccessfulCloudUpdateAt is null ? null : Time(state.LastSuccessfulCloudUpdateAt.Value)), ("$failure", state.FailureAlertSent ? 1 : 0), ("$recovery", state.RecoveryAlertSent ? 1 : 0), ("$updated", Time(state.UpdatedAt))], cancellationToken);
+
+    public async Task<SystemNotificationDelivery?> GetSystemNotificationDeliveryAsync(long deliveryId, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken); await using var command = connection.CreateCommand(); command.CommandText = "SELECT * FROM SystemNotificationDelivery WHERE Id=$id"; Add(command, "$id", deliveryId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken); return await reader.ReadAsync(cancellationToken) ? ReadSystemNotificationDelivery(reader) : null;
+    }
+
+    public async Task<SystemNotificationDelivery> CreateSystemNotificationDeliveryAsync(SystemNotificationDelivery delivery, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(delivery.EpisodeId) || string.IsNullOrWhiteSpace(delivery.TargetId)) throw new ArgumentException("系统通知投递信息不完整。", nameof(delivery));
+        if (delivery.Kind is not (SystemNotificationKind.XiaomiConnectionFailure or SystemNotificationKind.XiaomiConnectionRecovery)) throw new ArgumentOutOfRangeException(nameof(delivery));
+        if (delivery.Channel != NotificationChannelType.QQ || delivery.TargetType is not (NotificationTargetType.Private or NotificationTargetType.Group)) throw new ArgumentException("系统通知目标无效。", nameof(delivery));
+        await using var connection = await OpenAsync(cancellationToken);
+        await using (var insert = connection.CreateCommand())
+        {
+            insert.CommandText = "INSERT OR IGNORE INTO SystemNotificationDelivery(Kind,EpisodeId,CreatedAt,Status,DeliveredAt,Channel,TargetType,TargetId,Message,Error,SentParts,TotalParts,LastAttemptAt,NextAttemptAt) VALUES($kind,$episode,$created,$status,$delivered,$channel,$targetType,$target,$message,$error,$sent,$total,$last,$next)";
+            AddSystemDeliveryParameters(insert, delivery); await insert.ExecuteNonQueryAsync(cancellationToken);
+        }
+        await using var select = connection.CreateCommand(); select.CommandText = "SELECT * FROM SystemNotificationDelivery WHERE Kind=$kind AND EpisodeId=$episode"; Add(select, "$kind", (int)delivery.Kind); Add(select, "$episode", delivery.EpisodeId);
+        await using var reader = await select.ExecuteReaderAsync(cancellationToken); if (!await reader.ReadAsync(cancellationToken)) throw new InvalidOperationException("系统通知投递记录保存失败。"); return ReadSystemNotificationDelivery(reader);
+    }
+
+    public Task UpdateSystemNotificationDeliveryAsync(SystemNotificationDelivery delivery, CancellationToken cancellationToken) =>
+        ExecuteAsync("UPDATE SystemNotificationDelivery SET Status=$status,DeliveredAt=$delivered,Error=$error,SentParts=$sent,TotalParts=$total,LastAttemptAt=$last,NextAttemptAt=$next WHERE Id=$id",
+            [("$status", (int)delivery.Status), ("$delivered", delivery.DeliveredAt is null ? null : Time(delivery.DeliveredAt.Value)), ("$error", delivery.Error), ("$sent", delivery.SentParts), ("$total", delivery.TotalParts), ("$last", delivery.LastAttemptAt is null ? null : Time(delivery.LastAttemptAt.Value)), ("$next", delivery.NextAttemptAt is null ? null : Time(delivery.NextAttemptAt.Value)), ("$id", delivery.Id)], cancellationToken);
+
+    public async Task<IReadOnlyList<SystemNotificationDelivery>> GetPendingSystemNotificationDeliveriesAsync(DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken); await using var command = connection.CreateCommand(); command.CommandText = "SELECT * FROM SystemNotificationDelivery WHERE Status IN ($pending,$failed) AND (NextAttemptAt IS NULL OR NextAttemptAt<=$now) AND (TotalParts=0 OR SentParts<TotalParts) ORDER BY CreatedAt,Id"; Add(command, "$pending", (int)NotificationDeliveryStatus.Pending); Add(command, "$failed", (int)NotificationDeliveryStatus.Failed); Add(command, "$now", Time(now));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken); var result = new List<SystemNotificationDelivery>(); while (await reader.ReadAsync(cancellationToken)) result.Add(ReadSystemNotificationDelivery(reader)); return result;
+    }
+
+    public async Task<IReadOnlyList<SystemNotificationDelivery>> GetRecentSystemNotificationDeliveriesAsync(int limit, CancellationToken cancellationToken)
+    {
+        limit = Math.Clamp(limit, 1, 200); await using var connection = await OpenAsync(cancellationToken); await using var command = connection.CreateCommand(); command.CommandText = "SELECT * FROM SystemNotificationDelivery ORDER BY CreatedAt DESC,Id DESC LIMIT $limit"; Add(command, "$limit", limit);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken); var result = new List<SystemNotificationDelivery>(); while (await reader.ReadAsync(cancellationToken)) result.Add(ReadSystemNotificationDelivery(reader)); return result;
+    }
+
+    public async Task MergeSubjectsAsync(long sourceSubjectId, long targetSubjectId, DateTimeOffset updatedAt, CancellationToken cancellationToken)
+    {
+        if (sourceSubjectId <= 0 || targetSubjectId <= 0 || sourceSubjectId == targetSubjectId) throw new ArgumentException("需要选择两个不同的主体。", nameof(sourceSubjectId));
+        await using var connection = await OpenAsync(cancellationToken); await using var transaction = await connection.BeginTransactionAsync(cancellationToken); var sqliteTransaction = (SqliteTransaction)transaction;
+        await ExecuteInTransactionAsync(connection, sqliteTransaction, "INSERT INTO SubjectDeviceMembership(SubjectId,NetworkDeviceId,CreatedAt) SELECT $target,NetworkDeviceId,$created FROM SubjectDeviceMembership WHERE SubjectId=$source ON CONFLICT(NetworkDeviceId) DO UPDATE SET SubjectId=$target,CreatedAt=$created", [("$source", sourceSubjectId), ("$target", targetSubjectId), ("$created", Time(updatedAt))], cancellationToken);
+        await ExecuteInTransactionAsync(connection, sqliteTransaction, "DELETE FROM NotificationRule AS source WHERE source.SubjectId=$source AND EXISTS (SELECT 1 FROM NotificationRule t WHERE t.SubjectId=$target AND t.RuleCondition=source.RuleCondition AND t.ThresholdSeconds=source.ThresholdSeconds AND t.Channel=source.Channel AND t.TargetType=source.TargetType AND t.TargetId=source.TargetId AND t.MessageTemplate=source.MessageTemplate)", [("$source", sourceSubjectId), ("$target", targetSubjectId)], cancellationToken);
+        await ExecuteInTransactionAsync(connection, sqliteTransaction, "UPDATE NotificationRule SET SubjectId=$target,UpdatedAt=$updated WHERE SubjectId=$source", [("$source", sourceSubjectId), ("$target", targetSubjectId), ("$updated", Time(updatedAt))], cancellationToken);
+        await ExecuteInTransactionAsync(connection, sqliteTransaction, "UPDATE NotificationDelivery SET SubjectId=$target WHERE SubjectId=$source", [("$source", sourceSubjectId), ("$target", targetSubjectId)], cancellationToken);
+        await ExecuteInTransactionAsync(connection, sqliteTransaction, "DELETE FROM PresenceSubject WHERE Id=$source", [("$source", sourceSubjectId)], cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
     private async Task ExecuteAsync(string sql, (string Name, object? Value)[] parameters, CancellationToken cancellationToken)
     {
         await using var connection = await OpenAsync(cancellationToken); await using var command = connection.CreateCommand(); command.CommandText = sql;
         foreach (var parameter in parameters) Add(command, parameter.Name, parameter.Value);
         await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task EnsureNetworkDeviceHistorySchemaAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    {
+        var hasHistoricalState = false;
+        await using (var info = connection.CreateCommand())
+        {
+            info.CommandText = "PRAGMA table_info(NetworkDevice)";
+            await using var reader = await info.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+                hasHistoricalState |= string.Equals(reader.GetString(1), "LastKnownHistoricalState", StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (hasHistoricalState) return;
+        await using var alter = connection.CreateCommand();
+        alter.CommandText = "ALTER TABLE NetworkDevice ADD COLUMN LastKnownHistoricalState INTEGER NOT NULL DEFAULT 0";
+        await alter.ExecuteNonQueryAsync(cancellationToken);
+        await using var backfill = connection.CreateCommand();
+        backfill.CommandText = "UPDATE NetworkDevice SET LastKnownHistoricalState=CurrentState";
+        await backfill.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task MigrateNotificationDeliverySchemaAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    {
+        var needsMigration = false;
+        await using (var info = connection.CreateCommand())
+        {
+            info.CommandText = "PRAGMA table_info(NotificationDelivery)";
+            await using var reader = await info.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var name = reader.GetString(1);
+                if (name is "RuleId" or "SubjectId") needsMigration |= reader.GetInt32(3) != 0;
+            }
+        }
+        await using (var foreignKeys = connection.CreateCommand())
+        {
+            foreignKeys.CommandText = "PRAGMA foreign_key_list(NotificationDelivery)";
+            await using var reader = await foreignKeys.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var table = reader.GetString(2); var onDelete = reader.GetString(6);
+                if (table is "NotificationRule" or "PresenceSubject") needsMigration |= !string.Equals(onDelete, "SET NULL", StringComparison.OrdinalIgnoreCase);
+            }
+        }
+        if (!needsMigration) return;
+
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        var sqliteTransaction = (SqliteTransaction)transaction;
+        await ExecuteInTransactionAsync(connection, sqliteTransaction, "DROP INDEX IF EXISTS IX_NotificationDelivery_Pending; DROP INDEX IF EXISTS IX_NotificationDelivery_Created; ALTER TABLE NotificationDelivery RENAME TO NotificationDelivery_Legacy; CREATE TABLE NotificationDelivery_New (Id INTEGER PRIMARY KEY AUTOINCREMENT, RuleId INTEGER NULL, SubjectId INTEGER NULL, EpisodeId TEXT NOT NULL, CreatedAt TEXT NOT NULL, Status INTEGER NOT NULL, DeliveredAt TEXT NULL, Channel INTEGER NOT NULL, TargetType INTEGER NOT NULL, TargetId TEXT NOT NULL, Message TEXT NOT NULL, Error TEXT NULL, SentParts INTEGER NOT NULL DEFAULT 0, TotalParts INTEGER NOT NULL DEFAULT 0, LastAttemptAt TEXT NULL, NextAttemptAt TEXT NULL, FOREIGN KEY(RuleId) REFERENCES NotificationRule(Id) ON DELETE SET NULL, FOREIGN KEY(SubjectId) REFERENCES PresenceSubject(Id) ON DELETE SET NULL, UNIQUE(RuleId,EpisodeId)); INSERT INTO NotificationDelivery_New(Id,RuleId,SubjectId,EpisodeId,CreatedAt,Status,DeliveredAt,Channel,TargetType,TargetId,Message,Error,SentParts,TotalParts,LastAttemptAt,NextAttemptAt) SELECT Id,RuleId,SubjectId,EpisodeId,CreatedAt,Status,DeliveredAt,Channel,TargetType,TargetId,Message,Error,SentParts,TotalParts,LastAttemptAt,NextAttemptAt FROM NotificationDelivery_Legacy; DROP TABLE NotificationDelivery_Legacy; ALTER TABLE NotificationDelivery_New RENAME TO NotificationDelivery; CREATE INDEX IX_NotificationDelivery_Pending ON NotificationDelivery(Status,NextAttemptAt); CREATE INDEX IX_NotificationDelivery_Created ON NotificationDelivery(CreatedAt DESC);", [], cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
     }
 
     private async Task<SqliteConnection> OpenAsync(CancellationToken cancellationToken)
@@ -389,6 +661,53 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         var value = await command.ExecuteScalarAsync(cancellationToken); return value is string text ? ParseTime(text) : null;
     }
 
+    private static async Task<int> ExecuteInTransactionAsync(SqliteConnection connection, SqliteTransaction transaction, string sql, (string Name, object? Value)[] parameters, CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand(); command.Transaction = transaction; command.CommandText = sql;
+        foreach (var parameter in parameters) Add(command, parameter.Name, parameter.Value);
+        return await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static NotificationRule NormalizeRule(NotificationRule value)
+    {
+        if (value.SubjectId <= 0) throw new ArgumentException("通知规则必须绑定到主体。", nameof(value));
+        if (value.Condition is not (NotificationCondition.OnlineFor or NotificationCondition.OfflineFor)) throw new ArgumentOutOfRangeException(nameof(value), "通知条件无效。");
+        if (value.ThresholdSeconds is < 60 or > 365 * 24 * 60 * 60) throw new ArgumentOutOfRangeException(nameof(value), "通知时长必须在 1 分钟到 365 天之间。");
+        if (value.Channel != NotificationChannelType.QQ) throw new ArgumentOutOfRangeException(nameof(value), "当前只支持 QQ 通知。");
+        if (value.TargetType is not (NotificationTargetType.Private or NotificationTargetType.Group)) throw new ArgumentOutOfRangeException(nameof(value), "QQ 通知目标类型无效。");
+        var target = value.TargetId.Trim();
+        if (target.Length is 0 or > 256 || target.Any(char.IsWhiteSpace)) throw new ArgumentException("QQ 目标 OpenID 无效。", nameof(value));
+        var template = value.MessageTemplate?.Trim() ?? string.Empty;
+        if (template.Length > 10_000) throw new ArgumentException("通知内容过长。", nameof(value));
+        return value with { TargetId = target, MessageTemplate = template };
+    }
+
+    private static void AddRuleParameters(SqliteCommand command, NotificationRule value)
+    {
+        Add(command, "$subject", value.SubjectId); Add(command, "$enabled", value.Enabled ? 1 : 0);
+        Add(command, "$condition", (int)value.Condition); Add(command, "$threshold", value.ThresholdSeconds);
+        Add(command, "$channel", (int)value.Channel); Add(command, "$targetType", (int)value.TargetType);
+        Add(command, "$target", value.TargetId); Add(command, "$template", value.MessageTemplate);
+        Add(command, "$created", Time(value.CreatedAt)); Add(command, "$updated", Time(value.UpdatedAt));
+    }
+
+    private static void AddDeliveryParameters(SqliteCommand command, NotificationDelivery value)
+    {
+        Add(command, "$rule", value.RuleId); Add(command, "$subject", value.SubjectId); Add(command, "$episode", value.EpisodeId);
+        Add(command, "$created", Time(value.CreatedAt)); Add(command, "$status", (int)value.Status);
+        Add(command, "$delivered", value.DeliveredAt is null ? null : Time(value.DeliveredAt.Value)); Add(command, "$channel", (int)value.Channel);
+        Add(command, "$targetType", (int)value.TargetType); Add(command, "$target", value.TargetId); Add(command, "$message", value.Message);
+        Add(command, "$error", value.Error); Add(command, "$sent", value.SentParts); Add(command, "$total", value.TotalParts);
+        Add(command, "$last", value.LastAttemptAt is null ? null : Time(value.LastAttemptAt.Value)); Add(command, "$next", value.NextAttemptAt is null ? null : Time(value.NextAttemptAt.Value));
+    }
+
+    private static void AddSystemDeliveryParameters(SqliteCommand command, SystemNotificationDelivery value)
+    {
+        Add(command, "$kind", (int)value.Kind); Add(command, "$episode", value.EpisodeId); Add(command, "$created", Time(value.CreatedAt)); Add(command, "$status", (int)value.Status);
+        Add(command, "$delivered", value.DeliveredAt is null ? null : Time(value.DeliveredAt.Value)); Add(command, "$channel", (int)value.Channel); Add(command, "$targetType", (int)value.TargetType); Add(command, "$target", value.TargetId); Add(command, "$message", value.Message); Add(command, "$error", value.Error); Add(command, "$sent", value.SentParts); Add(command, "$total", value.TotalParts);
+        Add(command, "$last", value.LastAttemptAt is null ? null : Time(value.LastAttemptAt.Value)); Add(command, "$next", value.NextAttemptAt is null ? null : Time(value.NextAttemptAt.Value));
+    }
+
     private static void AddDeviceParameters(SqliteCommand command, NetworkDevice value)
     {
         Add(command, "$router", value.RouterId); Add(command, "$mac", value.MacAddress); Add(command, "$original", value.OriginalName);
@@ -396,11 +715,20 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         Add(command, "$ip", value.LastIp); Add(command, "$connection", value.ConnectionType); Add(command, "$signal", value.Signal);
         Add(command, "$state", (int)value.CurrentState); Add(command, "$first", Time(value.FirstSeenAt)); Add(command, "$last", Time(value.LastSeenAt));
         Add(command, "$changed", value.LastStateChangedAt is null ? null : Time(value.LastStateChangedAt.Value));
+        Add(command, "$historical", (int)(value.LastKnownHistoricalState ?? value.CurrentState));
     }
 
     private static Router ReadRouter(SqliteDataReader reader) => new(reader.GetInt64(reader.GetOrdinal("Id")), reader.GetString(reader.GetOrdinal("MiotDid")), reader.GetString(reader.GetOrdinal("MiotModel")), reader.GetString(reader.GetOrdinal("PartnerId")), reader.GetString(reader.GetOrdinal("Name")), Text(reader, "HomeId"), Text(reader, "RoomId"), ParseTime(reader.GetString(reader.GetOrdinal("CreatedAt"))), ParseTime(reader.GetString(reader.GetOrdinal("LastSeenAt"))));
     private static PresenceSubject ReadSubject(SqliteDataReader reader) => new(reader.GetInt64(reader.GetOrdinal("Id")), Guid.Parse(reader.GetString(reader.GetOrdinal("ExportId"))), reader.GetString(reader.GetOrdinal("DisplayName")), Text(reader, "Note"), ParseTime(reader.GetString(reader.GetOrdinal("CreatedAt"))), ParseTime(reader.GetString(reader.GetOrdinal("UpdatedAt"))));
-    private static NetworkDevice ReadDevice(SqliteDataReader reader) => new(reader.GetInt64(reader.GetOrdinal("Id")), reader.GetInt64(reader.GetOrdinal("RouterId")), reader.GetString(reader.GetOrdinal("MacAddress")), Text(reader, "OriginalName"), Text(reader, "OriginName"), Text(reader, "CustomName"), Text(reader, "Note"), Text(reader, "LastIp"), Text(reader, "ConnectionType"), Integer(reader, "Signal"), (PresenceState)reader.GetInt32(reader.GetOrdinal("CurrentState")), ParseTime(reader.GetString(reader.GetOrdinal("FirstSeenAt"))), ParseTime(reader.GetString(reader.GetOrdinal("LastSeenAt"))), Text(reader, "LastStateChangedAt") is { } changed ? ParseTime(changed) : null);
+    private static NetworkDevice ReadDevice(SqliteDataReader reader)
+    {
+        var device = new NetworkDevice(reader.GetInt64(reader.GetOrdinal("Id")), reader.GetInt64(reader.GetOrdinal("RouterId")), reader.GetString(reader.GetOrdinal("MacAddress")), Text(reader, "OriginalName"), Text(reader, "OriginName"), Text(reader, "CustomName"), Text(reader, "Note"), Text(reader, "LastIp"), Text(reader, "ConnectionType"), Integer(reader, "Signal"), (PresenceState)reader.GetInt32(reader.GetOrdinal("CurrentState")), ParseTime(reader.GetString(reader.GetOrdinal("FirstSeenAt"))), ParseTime(reader.GetString(reader.GetOrdinal("LastSeenAt"))), Text(reader, "LastStateChangedAt") is { } changed ? ParseTime(changed) : null);
+        return device with { LastKnownHistoricalState = (PresenceState)reader.GetInt32(reader.GetOrdinal("LastKnownHistoricalState")) };
+    }
+    private static NotificationRule ReadNotificationRule(SqliteDataReader reader) => new(reader.GetInt64(reader.GetOrdinal("Id")), reader.GetInt64(reader.GetOrdinal("SubjectId")), reader.GetInt32(reader.GetOrdinal("Enabled")) != 0, (NotificationCondition)reader.GetInt32(reader.GetOrdinal("RuleCondition")), reader.GetInt64(reader.GetOrdinal("ThresholdSeconds")), (NotificationChannelType)reader.GetInt32(reader.GetOrdinal("Channel")), (NotificationTargetType)reader.GetInt32(reader.GetOrdinal("TargetType")), reader.GetString(reader.GetOrdinal("TargetId")), reader.GetString(reader.GetOrdinal("MessageTemplate")), ParseTime(reader.GetString(reader.GetOrdinal("CreatedAt"))), ParseTime(reader.GetString(reader.GetOrdinal("UpdatedAt"))));
+    private static NotificationRuleState ReadNotificationRuleState(SqliteDataReader reader) => new(reader.GetInt64(reader.GetOrdinal("RuleId")), Text(reader, "CurrentEpisodeId"), Text(reader, "StateSince") is { } since ? ParseTime(since) : null, reader.GetInt32(reader.GetOrdinal("TriggeredForCurrentEpisode")) != 0, Text(reader, "TriggeredAt") is { } triggered ? ParseTime(triggered) : null, reader.GetInt32(reader.GetOrdinal("PendingDelivery")) != 0, reader.IsDBNull(reader.GetOrdinal("PendingDeliveryId")) ? null : reader.GetInt64(reader.GetOrdinal("PendingDeliveryId")), Text(reader, "LastDeliveryError"), ParseTime(reader.GetString(reader.GetOrdinal("UpdatedAt"))));
+    private static NotificationDelivery ReadNotificationDelivery(SqliteDataReader reader) => new(reader.GetInt64(reader.GetOrdinal("Id")), reader.IsDBNull(reader.GetOrdinal("RuleId")) ? null : reader.GetInt64(reader.GetOrdinal("RuleId")), reader.IsDBNull(reader.GetOrdinal("SubjectId")) ? null : reader.GetInt64(reader.GetOrdinal("SubjectId")), reader.GetString(reader.GetOrdinal("EpisodeId")), ParseTime(reader.GetString(reader.GetOrdinal("CreatedAt"))), (NotificationDeliveryStatus)reader.GetInt32(reader.GetOrdinal("Status")), Text(reader, "DeliveredAt") is { } delivered ? ParseTime(delivered) : null, (NotificationChannelType)reader.GetInt32(reader.GetOrdinal("Channel")), (NotificationTargetType)reader.GetInt32(reader.GetOrdinal("TargetType")), reader.GetString(reader.GetOrdinal("TargetId")), reader.GetString(reader.GetOrdinal("Message")), Text(reader, "Error"), reader.GetInt32(reader.GetOrdinal("SentParts")), reader.GetInt32(reader.GetOrdinal("TotalParts")), Text(reader, "LastAttemptAt") is { } attempted ? ParseTime(attempted) : null, Text(reader, "NextAttemptAt") is { } next ? ParseTime(next) : null);
+    private static SystemNotificationDelivery ReadSystemNotificationDelivery(SqliteDataReader reader) => new(reader.GetInt64(reader.GetOrdinal("Id")), (SystemNotificationKind)reader.GetInt32(reader.GetOrdinal("Kind")), reader.GetString(reader.GetOrdinal("EpisodeId")), ParseTime(reader.GetString(reader.GetOrdinal("CreatedAt"))), (NotificationDeliveryStatus)reader.GetInt32(reader.GetOrdinal("Status")), Text(reader, "DeliveredAt") is { } delivered ? ParseTime(delivered) : null, (NotificationChannelType)reader.GetInt32(reader.GetOrdinal("Channel")), (NotificationTargetType)reader.GetInt32(reader.GetOrdinal("TargetType")), reader.GetString(reader.GetOrdinal("TargetId")), reader.GetString(reader.GetOrdinal("Message")), Text(reader, "Error"), reader.GetInt32(reader.GetOrdinal("SentParts")), reader.GetInt32(reader.GetOrdinal("TotalParts")), Text(reader, "LastAttemptAt") is { } attempted ? ParseTime(attempted) : null, Text(reader, "NextAttemptAt") is { } next ? ParseTime(next) : null);
     private static string? Text(SqliteDataReader reader, string name) { var i = reader.GetOrdinal(name); return reader.IsDBNull(i) ? null : reader.GetString(i); }
     private static int? Integer(SqliteDataReader reader, string name) { var i = reader.GetOrdinal(name); return reader.IsDBNull(i) ? null : reader.GetInt32(i); }
     private static void Add(SqliteCommand command, string name, object? value) => command.Parameters.AddWithValue(name, value ?? DBNull.Value);

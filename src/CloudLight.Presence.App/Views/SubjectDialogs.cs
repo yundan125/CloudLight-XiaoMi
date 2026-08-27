@@ -10,12 +10,12 @@ namespace CloudLight.Presence.App.Views;
 
 public static class SubjectDialogs
 {
-    public static IReadOnlyCollection<long>? ManageDevices(Window owner, IReadOnlyList<NetworkDevice> devices, IReadOnlyCollection<long> selectedIds)
+    public static IReadOnlyCollection<long>? ManageDevices(Window owner, IReadOnlyList<NetworkDevice> devices, IReadOnlyCollection<long> selectedIds, string? description = null, string accept = "保存")
     {
-        var window = Dialog(owner, "管理关联设备"); window.Height = 540; var panel = Panel(); panel.Children.Add(Label("选择要加入这个分组的设备；取消勾选即可移除。"));
+        var window = Dialog(owner, "管理关联设备"); window.Height = 540; var panel = Panel(); panel.Children.Add(Label(description ?? "选择要加入这个分组的设备；取消勾选即可移除。"));
         var listPanel = new StackPanel(); var checks = new List<(CheckBox Check, long Id)>();
         foreach (var device in devices) { var check = new CheckBox { Content = $"{device.DisplayName}   {device.MacAddress}   {device.ConnectionType ?? "未知"}", IsChecked = selectedIds.Contains(device.Id), Margin = new Thickness(0, 5, 0, 5) }; checks.Add((check, device.Id)); listPanel.Children.Add(check); }
-        panel.Children.Add(new ScrollViewer { Content = listPanel, Height = 350, VerticalScrollBarVisibility = ScrollBarVisibility.Auto }); panel.Children.Add(Buttons(window, "保存")); window.Content = panel;
+        panel.Children.Add(new ScrollViewer { Content = listPanel, Height = 350, VerticalScrollBarVisibility = ScrollBarVisibility.Auto }); panel.Children.Add(Buttons(window, accept)); window.Content = panel;
         return window.ShowDialog() == true ? checks.Where(value => value.Check.IsChecked == true).Select(value => value.Id).ToArray() : null;
     }
 

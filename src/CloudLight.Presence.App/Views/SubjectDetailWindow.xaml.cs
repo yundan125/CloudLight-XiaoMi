@@ -14,10 +14,31 @@ public partial class SubjectDetailWindow : Window
         var devices = await _repository.GetDevicesAsync(_routerId, CancellationToken.None); var selected = _viewModel.Members.Select(value => value.Device.Id).ToArray(); var result = SubjectDialogs.ManageDevices(this, devices, selected); if (result is null) return;
         await _repository.SetSubjectDevicesAsync(_viewModel.Subject.Id, result, DateTimeOffset.UtcNow, CancellationToken.None); await _viewModel.ReloadAsync(); await _changed();
     }
+    private async void SplitClicked(object sender, RoutedEventArgs e)
+    {
+        var devices = await _repository.GetDevicesAsync(_routerId, CancellationToken.None);
+        var selected = _viewModel.Members.Select(value => value.Device.Id).ToArray();
+        if (selected.Length < 2)
+        {
+            System.Windows.MessageBox.Show(this, "当前主体只有一个设备，不需要拆分。", "拆分主体", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var result = SubjectDialogs.ManageDevices(this, devices, selected, "选择要保留在当前主体中的设备；取消勾选的设备会成为新的独立主体，当前主体及其自动提醒会保留。至少保留一个设备。", "拆分");
+        if (result is null || result.Count == selected.Length) return;
+        if (result.Count == 0)
+        {
+            System.Windows.MessageBox.Show(this, "拆分时至少要为当前主体保留一个设备。", "拆分主体", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        await _repository.SetSubjectDevicesAsync(_viewModel.Subject.Id, result, DateTimeOffset.UtcNow, CancellationToken.None);
+        await _viewModel.ReloadAsync(); await _changed();
+    }
     private async void DeleteClicked(object sender, RoutedEventArgs e)
     {
-        var message = $"拆分“{_viewModel.DisplayName}”？\n\n关联的设备会恢复为独立主体，不会删除任何设备或历史记录。";
-        if (System.Windows.MessageBox.Show(this, message, "拆分此分组", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
+        var message = $"解散“{_viewModel.DisplayName}”？\n\n关联的设备会分别恢复为独立主体；当前主体及其自动提醒会被删除，不会删除设备或历史记录。";
+        if (System.Windows.MessageBox.Show(this, message, "解散主体", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
         await _repository.DeleteSubjectAsync(_viewModel.Subject.Id, CancellationToken.None); await _changed(); Close();
     }
     private void WindowSizeChanged(object sender, SizeChangedEventArgs e)

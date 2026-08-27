@@ -4,6 +4,24 @@ public enum PresenceState { Unknown = 0, Online = 1, Offline = 2 }
 public enum PresenceEventType { Online = 1, Offline = 2, InitialObservation = 3 }
 public enum PresenceSource { Polling = 1 }
 public enum SubjectActivityType { Online = 1, Offline = 2, UnknownPeriod = 3 }
+public enum NotificationCondition { OnlineFor = 1, OfflineFor = 2 }
+public enum NotificationChannelType { QQ = 1 }
+public enum NotificationTargetType { Private = 1, Group = 2 }
+public enum NotificationDeliveryStatus { Pending = 1, Delivered = 2, Failed = 3, Canceled = 4 }
+public enum SystemNotificationKind { XiaomiConnectionFailure = 1, XiaomiConnectionRecovery = 2 }
+public enum NotificationConnectionState
+{
+    NotConfigured,
+    Stopped,
+    Authenticating,
+    Connecting,
+    Identifying,
+    Connected,
+    Reconnecting,
+    AuthenticationFailed,
+    GatewayFailed,
+    Stopping
+}
 
 public sealed record Router(
     long Id,
@@ -32,6 +50,12 @@ public sealed record NetworkDevice(
     DateTimeOffset LastSeenAt,
     DateTimeOffset? LastStateChangedAt)
 {
+    // CurrentState is the observation for the current monitoring run. It is
+    // deliberately allowed to be Unknown between runs, while the historical
+    // state remains available for continuity and duration calculations.
+    public PresenceState? LastKnownHistoricalState { get; init; }
+    public PresenceState CurrentObservedState => CurrentState;
+
     public string DisplayName => FirstNonEmpty(CustomName, OriginalName, OriginName, MacAddress);
 
     private static string FirstNonEmpty(params string?[] values) =>
@@ -77,7 +101,133 @@ public sealed record SubjectPresenceSnapshot(
     IReadOnlyList<NetworkDevice> Members,
     PresenceState CurrentState,
     DateTimeOffset? LastStateChangedAt,
-    NetworkDevice? ActiveDevice);
+    NetworkDevice? ActiveDevice,
+    DateTimeOffset? ConfirmedStateSince = null,
+    DateTimeOffset? LastOnlineTime = null,
+    DateTimeOffset? LastOfflineTime = null,
+    string? RouterName = null);
+
+public sealed record SubjectPresenceFact(
+    PresenceSubject Subject,
+    IReadOnlyList<NetworkDevice> Members,
+    PresenceState CurrentState,
+    DateTimeOffset? StateSince,
+    bool StateSinceKnown,
+    TimeSpan ConfirmedDuration,
+    DateTimeOffset? LastOnlineTime,
+    DateTimeOffset? LastOfflineTime,
+    NetworkDevice? ActiveDevice,
+    string? RouterName);
+
+public sealed record NotificationRule(
+    long Id,
+    long SubjectId,
+    bool Enabled,
+    NotificationCondition Condition,
+    long ThresholdSeconds,
+    NotificationChannelType Channel,
+    NotificationTargetType TargetType,
+    string TargetId,
+    string MessageTemplate,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset UpdatedAt);
+
+public sealed record NotificationRuleState(
+    long RuleId,
+    string? CurrentEpisodeId,
+    DateTimeOffset? StateSince,
+    bool TriggeredForCurrentEpisode,
+    DateTimeOffset? TriggeredAt,
+    bool PendingDelivery,
+    long? PendingDeliveryId,
+    string? LastDeliveryError,
+    DateTimeOffset UpdatedAt);
+
+public sealed record NotificationDelivery(
+    long Id,
+    long? RuleId,
+    long? SubjectId,
+    string EpisodeId,
+    DateTimeOffset CreatedAt,
+    NotificationDeliveryStatus Status,
+    DateTimeOffset? DeliveredAt,
+    NotificationChannelType Channel,
+    NotificationTargetType TargetType,
+    string TargetId,
+    string Message,
+    string? Error,
+    int SentParts,
+    int TotalParts,
+    DateTimeOffset? LastAttemptAt,
+    DateTimeOffset? NextAttemptAt);
+
+public sealed record SystemNotificationDelivery(
+    long Id,
+    SystemNotificationKind Kind,
+    string EpisodeId,
+    DateTimeOffset CreatedAt,
+    NotificationDeliveryStatus Status,
+    DateTimeOffset? DeliveredAt,
+    NotificationChannelType Channel,
+    NotificationTargetType TargetType,
+    string TargetId,
+    string Message,
+    string? Error,
+    int SentParts,
+    int TotalParts,
+    DateTimeOffset? LastAttemptAt,
+    DateTimeOffset? NextAttemptAt);
+
+public sealed record ConnectionAlertState(
+    string? FailureEpisodeId,
+    DateTimeOffset? FailureStartedAt,
+    DateTimeOffset? LastSuccessfulCloudUpdateAt,
+    bool FailureAlertSent,
+    bool RecoveryAlertSent,
+    DateTimeOffset UpdatedAt);
+
+public sealed record ConnectionAlertSettings(
+    bool Enabled = true,
+    bool RecoveryEnabled = true,
+    bool UseDefaultTarget = true,
+    NotificationTargetType TargetType = NotificationTargetType.Private,
+    string TargetId = "");
+
+public sealed record ConnectionAlertConfiguration(
+    ConnectionAlertSettings Settings,
+    NotificationTargetType DefaultTargetType,
+    string DefaultTargetId);
+
+public sealed record NotificationRequest(
+    long DeliveryId,
+    long RuleId,
+    long SubjectId,
+    string EpisodeId,
+    NotificationChannelType Channel,
+    NotificationTargetType TargetType,
+    string TargetId,
+    string Message,
+    DateTimeOffset CreatedAt);
+
+public sealed record NotificationSendResult(
+    bool Success,
+    int SentParts,
+    int TotalParts,
+    string? Error = null,
+    IReadOnlyList<string>? MessageIds = null);
+
+public sealed record NotificationChannelStatus(
+    NotificationChannelType Channel,
+    bool Configured,
+    bool Running,
+    bool Connected,
+    NotificationConnectionState ConnectionState,
+    string? LastError = null,
+    int ReconnectCount = 0,
+    DateTimeOffset? AccessTokenExpiresAt = null,
+    DateTimeOffset? LastConnectedAt = null,
+    DateTimeOffset? LastHeartbeatAt = null,
+    DateTimeOffset? LastHeartbeatAckAt = null);
 
 public sealed record ApplicationRun(
     long Id,

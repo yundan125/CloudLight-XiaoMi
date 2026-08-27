@@ -6,6 +6,7 @@ public interface IAppDataPaths
     string DatabasePath { get; }
     string SettingsPath { get; }
     string AuthPath { get; }
+    string QqAuthPath { get; }
     string LogsDirectory { get; }
     string ExportsDirectory { get; }
     string BackupsDirectory { get; }
@@ -29,6 +30,7 @@ public sealed class AppPaths : IAppDataPaths
     public string DatabasePath => Path.Combine(RootDirectory, "presence.db");
     public string SettingsPath => Path.Combine(RootDirectory, "settings.json");
     public string AuthPath => Path.Combine(RootDirectory, "auth.dat");
+    public string QqAuthPath => Path.Combine(RootDirectory, "qqbot-app-secret.dat");
     public string LogsDirectory => Path.Combine(RootDirectory, "logs");
     public string ExportsDirectory => Path.Combine(RootDirectory, "exports");
     public string BackupsDirectory => Path.Combine(RootDirectory, "backups");

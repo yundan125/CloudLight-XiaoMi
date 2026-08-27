@@ -6,11 +6,13 @@ public static class PresenceDurationFormatter
 {
     public static string Format(NetworkDevice device, DateTimeOffset now)
     {
+        if (device.CurrentObservedState == PresenceState.Unknown)
+            return StateText(PresenceState.Unknown);
         if (device.LastStateChangedAt is null)
         {
-            return device.CurrentState == PresenceState.Offline ? "离线时间未知" : StateText(device.CurrentState);
+            return device.CurrentObservedState == PresenceState.Offline ? "离线时间未知" : StateText(device.CurrentObservedState);
         }
-        return Format(device.CurrentState, device.LastStateChangedAt, now);
+        return Format(device.CurrentObservedState, device.LastStateChangedAt, now);
     }
 
     public static string Format(PresenceState state, DateTimeOffset? stateSinceUtc, DateTimeOffset now)

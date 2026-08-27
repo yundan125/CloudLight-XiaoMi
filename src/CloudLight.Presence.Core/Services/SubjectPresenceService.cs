@@ -9,49 +9,40 @@ public sealed class SubjectPresenceService(IPresenceRepository repository, IPres
 
     public async Task<SubjectPresenceSnapshot?> GetSnapshotAsync(long subjectId, DateTimeOffset now, CancellationToken cancellationToken)
     {
+        var fact = await GetCurrentFactAsync(subjectId, now, cancellationToken);
+        return fact is null ? null : new(fact.Subject, fact.Members, fact.CurrentState, LegacyStateChangedAt(fact), fact.ActiveDevice,
+            fact.StateSince, fact.LastOnlineTime, fact.LastOfflineTime, fact.RouterName);
+    }
+
+    public async Task<SubjectPresenceFact?> GetCurrentFactAsync(long subjectId, DateTimeOffset now, CancellationToken cancellationToken)
+    {
         var subject = await repository.GetSubjectAsync(subjectId, cancellationToken);
         if (subject is null) return null;
         var members = await repository.GetSubjectDevicesAsync(subjectId, cancellationToken);
-        if (members.Count == 0) return new(subject, members, PresenceState.Unknown, null, null);
-        var from = members.Min(value => value.FirstSeenAt);
-        var timeline = await GetAggregateStateTimelineAsync(members, from, now, cancellationToken);
-        var current = timeline.LastOrDefault();
-        var active = members.Where(value => value.CurrentState == PresenceState.Online)
+        var active = members.Where(value => value.CurrentObservedState == PresenceState.Online)
             .OrderByDescending(value => value.Signal ?? int.MinValue).ThenByDescending(value => value.LastSeenAt).FirstOrDefault();
-        return new(subject, members, current?.State ?? PresenceState.Unknown, current?.Start, active);
-    }
+        var routerName = await GetRouterNameAsync(members, cancellationToken);
+        if (members.Count == 0)
+            return new(subject, members, PresenceState.Unknown, null, false, TimeSpan.Zero, null, null, active, routerName);
 
-    private async Task<IReadOnlyList<PresenceTimelineSegment>> GetAggregateStateTimelineAsync(IReadOnlyList<NetworkDevice> members, DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken)
-    {
-        var sessions = new List<(NetworkDevice Device, IReadOnlyList<PresenceSession> Sessions)>(members.Count);
-        var boundaries = new SortedSet<DateTimeOffset> { from, to };
-        foreach (var member in members)
-        {
-            var values = await repository.GetSessionsAsync(member.Id, cancellationToken);
-            sessions.Add((member, values));
-            boundaries.Add(Max(from, member.FirstSeenAt));
-            foreach (var session in values)
-            {
-                var start = Max(from, session.StartedAt); var end = Min(to, session.EndedAt ?? to);
-                if (end > start) { boundaries.Add(start); boundaries.Add(end); }
-            }
-        }
+        var currentState = Aggregate(members.Select(value => value.CurrentObservedState));
+        var from = members.Min(value => value.FirstSeenAt);
+        var timeline = await GetTimelineAsync(subjectId, from, now, cancellationToken);
+        if (currentState == PresenceState.Unknown)
+            return new(subject, members, PresenceState.Unknown, null, false, TimeSpan.Zero,
+                LastBoundary(timeline, PresenceState.Online, timeline.Count),
+                LastBoundary(timeline, PresenceState.Offline, timeline.Count), active, routerName);
 
-        var points = boundaries.ToArray();
-        var raw = new List<PresenceTimelineSegment>();
-        for (var index = 0; index < points.Length - 1; index++)
-        {
-            var start = points[index]; var end = points[index + 1];
-            var states = sessions.Select(value => start < value.Device.FirstSeenAt
-                ? PresenceState.Unknown
-                : value.Sessions.Any(session => session.StartedAt < end && (session.EndedAt ?? to) > start)
-                    ? PresenceState.Online : PresenceState.Offline).ToArray();
-            var state = states.Contains(PresenceState.Online) ? PresenceState.Online
-                : states.All(value => value == PresenceState.Offline) ? PresenceState.Offline : PresenceState.Unknown;
-            Append(raw, start, end, state);
-        }
-        ApplyOfflineGrace(raw, to);
-        return Coalesce(raw);
+        var historicalCurrent = timeline.LastOrDefault();
+        var currentIndex = historicalCurrent is null ? 0 : timeline.Count - 1;
+        var stateSince = historicalCurrent?.State == currentState
+            ? await ResolveConfirmedStateSinceAsync(members, historicalCurrent, now, cancellationToken)
+            : null;
+        var stateSinceKnown = stateSince is not null;
+        var duration = stateSince is { } confirmedSince ? NonNegative(now - confirmedSince) : TimeSpan.Zero;
+        return new(subject, members, currentState, stateSince, stateSinceKnown, duration,
+            LastBoundary(timeline, PresenceState.Online, currentIndex),
+            LastBoundary(timeline, PresenceState.Offline, currentIndex), active, routerName);
     }
 
     public async Task<PresenceStatistics> GetSubjectStatisticsAsync(long subjectId, DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken)
@@ -80,8 +71,7 @@ public sealed class SubjectPresenceService(IPresenceRepository repository, IPres
         {
             var start = points[index]; var end = points[index + 1];
             var states = timelines.Select(value => StateAt(value, start, end)).ToArray();
-            var state = states.Contains(PresenceState.Online) ? PresenceState.Online
-                : states.All(value => value == PresenceState.Offline) ? PresenceState.Offline : PresenceState.Unknown;
+            var state = Aggregate(states);
             Append(raw, start, end, state);
         }
 
@@ -106,6 +96,13 @@ public sealed class SubjectPresenceService(IPresenceRepository repository, IPres
 
     private static PresenceState StateAt(IReadOnlyList<PresenceTimelineSegment> values, DateTimeOffset start, DateTimeOffset end) =>
         values.FirstOrDefault(value => value.Start < end && value.End > start)?.State ?? PresenceState.Unknown;
+    public static PresenceState Aggregate(IEnumerable<PresenceState> states)
+    {
+        var values = states as PresenceState[] ?? states.ToArray();
+        if (values.Contains(PresenceState.Online)) return PresenceState.Online;
+        if (values.Contains(PresenceState.Unknown)) return PresenceState.Unknown;
+        return PresenceState.Offline;
+    }
     private static void Append(List<PresenceTimelineSegment> values, DateTimeOffset start, DateTimeOffset end, PresenceState state)
     {
         if (values.Count > 0 && values[^1].State == state && values[^1].End == start) values[^1] = values[^1] with { End = end };
@@ -119,6 +116,70 @@ public sealed class SubjectPresenceService(IPresenceRepository repository, IPres
     }
     private static TimeSpan Sum(IEnumerable<PresenceTimelineSegment> values, PresenceState state) =>
         TimeSpan.FromTicks(values.Where(value => value.State == state).Sum(value => (value.End - value.Start).Ticks));
-    private static DateTimeOffset Max(DateTimeOffset left, DateTimeOffset right) => left > right ? left : right;
-    private static DateTimeOffset Min(DateTimeOffset left, DateTimeOffset right) => left < right ? left : right;
+    private async Task<DateTimeOffset?> ResolveConfirmedStateSinceAsync(IReadOnlyList<NetworkDevice> members, PresenceTimelineSegment current, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        var candidates = new List<DateTimeOffset>();
+        foreach (var member in members)
+        {
+            var relevant = current.State switch
+            {
+                PresenceState.Online => member.CurrentObservedState == PresenceState.Online,
+                PresenceState.Offline => member.CurrentObservedState == PresenceState.Offline,
+                _ => false
+            };
+            if (!relevant) continue;
+
+            if (member.LastStateChangedAt is { } lastChangedAt)
+                candidates.Add(lastChangedAt);
+
+            var sessions = await repository.GetSessionsAsync(member.Id, cancellationToken);
+            foreach (var session in sessions)
+            {
+                if (current.State == PresenceState.Online && session.StartKnown && session.EndedAt is null)
+                    candidates.Add(session.StartedAt);
+                if (current.State == PresenceState.Offline && session.EndKnown && session.EndedAt is { } endedAt)
+                    candidates.Add(endedAt);
+            }
+
+            var events = await repository.GetEventsAsync(member.Id, cancellationToken);
+            foreach (var value in events)
+            {
+                if ((current.State == PresenceState.Online && value.EventType == PresenceEventType.Online) ||
+                    (current.State == PresenceState.Offline && value.EventType == PresenceEventType.Offline))
+                    candidates.Add(value.ObservedAt);
+            }
+        }
+
+        if (candidates.Count == 0) return null;
+        var gaps = await repository.GetMonitoringGapsAsync(current.Start, now, cancellationToken);
+        var valid = candidates
+            .Where(value => value >= current.Start && value <= current.End && value <= now)
+            .Distinct()
+            .Where(value => !gaps.Any(gap => gap.StartedAt < now && (gap.EndedAt ?? now) > value))
+            .ToArray();
+        if (valid.Length == 0) return null;
+        return current.State == PresenceState.Online ? valid.Min() : valid.Max();
+    }
+
+    private async Task<string?> GetRouterNameAsync(IReadOnlyList<NetworkDevice> members, CancellationToken cancellationToken)
+    {
+        var routerIds = members.Select(value => value.RouterId).Distinct().ToArray();
+        if (routerIds.Length == 0) return null;
+        var routers = await repository.GetRoutersAsync(cancellationToken);
+        var names = routers.Where(value => routerIds.Contains(value.Id)).Select(value => value.Name).Where(value => !string.IsNullOrWhiteSpace(value)).Distinct().ToArray();
+        return names.Length == 0 ? null : string.Join("、", names);
+    }
+
+    private static DateTimeOffset? LastBoundary(IReadOnlyList<PresenceTimelineSegment> timeline, PresenceState state, int exclusiveEnd)
+    {
+        for (var index = Math.Min(exclusiveEnd, timeline.Count) - 1; index >= 0; index--)
+            if (timeline[index].State == state) return timeline[index].End;
+        return null;
+    }
+
+    private static TimeSpan NonNegative(TimeSpan value) => value < TimeSpan.Zero ? TimeSpan.Zero : value;
+    private static DateTimeOffset? LegacyStateChangedAt(SubjectPresenceFact fact)
+    {
+        return fact.StateSinceKnown ? fact.StateSince : null;
+    }
 }

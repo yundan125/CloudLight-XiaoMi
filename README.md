@@ -1,4 +1,4 @@
-# CloudLight XiaoMi 1.2.0
+# CloudLight XiaoMi 1.2.1
 
 CloudLight XiaoMi is a Windows desktop application that records the observed
 online/offline presence of devices connected to a Xiaomi router owned by the signed-in
@@ -11,12 +11,13 @@ DPAPI for authentication storage, and SQLite for local history.
 - 10-second cloud polling with tray/background operation
 - 24-hour, 3-day, 7-day, and 30-day statistics and presence timelines
 - Explicit Unknown periods for monitoring gaps
+- PresenceSubject-based QQ alerts for continuous online/offline thresholds
 - Versioned `.clpresence` export/import without Xiaomi credentials
 - Per-user startup registration and per-user installation
 
 For compatibility with existing 1.0.0 data, user data stays under the legacy storage
 path `%USERPROFILE%\Documents\CloudLight\CloudLight XiaoMi` (resolved through the actual Windows Documents known folder). Existing data from `%LocalAppData%\CloudLight Presence` is copied and verified automatically on first launch; the old directory is retained and is not removed by the
-installer or uninstaller. The 1.2.0 installer contains a private Python 3.14 runtime and
+installer or uninstaller. The 1.2.1 installer contains a private Python 3.14 runtime and
 MiForge/migate 1.1.10; it does not install or modify system Python.
 
 ## Build
@@ -26,17 +27,22 @@ dotnet build -c Release
 dotnet test -c Release
 dotnet publish .\src\CloudLight.Presence.App\CloudLight.Presence.App.csproj `
   -c Release -r win-x64 --self-contained true `
-  -o .\artifacts\win-x64-1.2.0
+  -o .\artifacts\win-x64-1.2.1
 
 .\installer\Prepare-MigateRuntime.ps1 `
-  -PublishDirectory .\artifacts\win-x64-1.2.0
+  -PublishDirectory .\artifacts\win-x64-1.2.1
 
 & 'C:\Program Files\Inno Setup 7\ISCC.exe' `
   .\installer\CloudLightXiaoMi.iss
 ```
 
 The generated installer is
-`artifacts\CloudLight-XiaoMi-Setup-1.2.0.exe`.
+`artifacts\CloudLight-XiaoMi-Setup-1.2.1.exe`.
+
+The desktop application must be started through `CloudLight.XiaoMi.exe` (the WPF
+`WinExe` apphost). Do not launch the GUI with `dotnet CloudLight.XiaoMi.dll`;
+`dotnet.exe` is a console host and can create a visible black window. The installed
+shortcuts, startup registration, and installer launch all point to the apphost.
 
 ## Architecture notes
 

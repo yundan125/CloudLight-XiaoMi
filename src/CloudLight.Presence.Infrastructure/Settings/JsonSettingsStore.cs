@@ -1,4 +1,5 @@
 using System.Text.Json;
+using CloudLight.Presence.Core.Models;
 
 namespace CloudLight.Presence.Infrastructure.Settings;
 
@@ -6,7 +7,21 @@ public sealed record PresenceSettings(
     string? SelectedRouterPartnerId = null,
     bool StartWithWindows = false,
     bool StartMinimized = true,
-    int PollingIntervalSeconds = 10);
+    int PollingIntervalSeconds = 10)
+{
+    public QqNotificationSettings Qq { get; init; } = new();
+    public ConnectionAlertSettings ConnectionAlerts { get; init; } = new();
+}
+
+public sealed record QqNotificationSettings(
+    bool Enabled = false,
+    bool AutoConnect = true,
+    string AppId = "",
+    bool GatewayReconnectEnabled = true,
+    string ProxyMode = "environment",
+    string ProxyUrl = "",
+    NotificationTargetType DefaultTargetType = NotificationTargetType.Private,
+    string DefaultTargetId = "");
 
 public sealed class JsonSettingsStore(IAppDataPaths paths)
 {

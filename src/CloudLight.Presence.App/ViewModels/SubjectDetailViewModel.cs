@@ -16,13 +16,13 @@ public sealed class SubjectDetailViewModel : ObservableObject, IDisposable
         Show24HoursCommand = new AsyncRelayCommand(() => LoadTimelineAsync(1, "24小时")); Show3DaysCommand = new AsyncRelayCommand(() => LoadTimelineAsync(3, "3天")); Show7DaysCommand = new AsyncRelayCommand(() => LoadTimelineAsync(7, "7天")); Show30DaysCommand = new AsyncRelayCommand(() => LoadTimelineAsync(30, "30天")); SaveCommand = new AsyncRelayCommand(SaveAsync);
         BeginNameEditCommand = new RelayCommand(BeginNameEdit); CancelNameEditCommand = new RelayCommand(CancelNameEdit); SaveNameCommand = new AsyncRelayCommand(SaveNameAsync);
         BeginNoteEditCommand = new RelayCommand(BeginNoteEdit); CancelNoteEditCommand = new RelayCommand(CancelNoteEdit); SaveNoteCommand = new AsyncRelayCommand(SaveNoteAsync);
-        _monitor.SnapshotApplied += SnapshotApplied; _timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) }; _timer.Tick += (_, _) => UpdateDuration(); _timer.Start();
+        _monitor.SnapshotApplied += SnapshotApplied; _monitor.StatusChanged += MonitorStatusChanged; _timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) }; _timer.Tick += (_, _) => UpdateDuration(); _timer.Start();
     }
     public PresenceSubject Subject => _subject; public string WindowTitle => $"{DisplayName} - CloudLight XiaoMi"; public string DisplayName { get => _displayName; private set => Set(ref _displayName, value); } public string? Note { get => _note; private set => Set(ref _note, value); } public string NoteText => string.IsNullOrWhiteSpace(Note) ? "未填写备注" : Note;
     public string NameDraft { get => _nameDraft; set => Set(ref _nameDraft, value); } public string? NoteDraft { get => _noteDraft; set => Set(ref _noteDraft, value); }
     public bool IsNameEditing { get => _isNameEditing; private set => Set(ref _isNameEditing, value); } public bool IsNoteEditing { get => _isNoteEditing; private set => Set(ref _isNoteEditing, value); }
     public bool ShowUnrecordedPeriods { get => _showUnrecordedPeriods; set { if (Set(ref _showUnrecordedPeriods, value)) RebuildHistory(); } }
-    public PresenceState CurrentState => _snapshot?.CurrentState ?? PresenceState.Unknown; public string State => CurrentState switch { PresenceState.Online => "在线", PresenceState.Offline => "离线", _ => "未知" }; public string StateMark => CurrentState == PresenceState.Online ? "●" : CurrentState == PresenceState.Offline ? "○" : "◇"; public string StateColor => CurrentState == PresenceState.Online ? "#16A34A" : CurrentState == PresenceState.Offline ? "#64748B" : "#D97706";
+    public PresenceState CurrentState => _snapshot?.CurrentState ?? PresenceState.Unknown; public string State => CurrentState switch { PresenceState.Online => "在线", PresenceState.Offline => "离线", _ => "未知" }; public string StateMark => CurrentState == PresenceState.Online ? "●" : CurrentState == PresenceState.Offline ? "○" : "◇"; public string StateColor => CurrentState == PresenceState.Online ? "#16A34A" : CurrentState == PresenceState.Offline ? "#64748B" : "#D97706"; public string CurrentConnection => CurrentState == PresenceState.Unknown ? "正在检测在线设备" : _snapshot?.ActiveDevice is null ? "当前没有在线设备" : $"当前：{_snapshot.ActiveDevice.ConnectionType ?? "连接方式未知"} · {(_snapshot.ActiveDevice.Signal is null ? "-" : $"{_snapshot.ActiveDevice.Signal} dBm")}";
     public string Duration { get => _duration; private set => Set(ref _duration, value); } public string SaveStatus { get => _saveStatus; private set => Set(ref _saveStatus, value); }
     public ObservableCollection<SubjectMemberViewModel> Members { get; } = []; public ObservableCollection<StatisticCardViewModel> Statistics { get; } = []; public ObservableCollection<PresenceTimelineSegment> Timeline { get; } = []; public ObservableCollection<HistoryItemViewModel> History { get; } = [];
     public bool HasNoMembers => Members.Count == 0; public bool HasNoHistory => History.Count == 0;
@@ -68,14 +68,20 @@ public sealed class SubjectDetailViewModel : ObservableObject, IDisposable
         await _repository.UpdateSubjectAsync(Subject.Id, DisplayName, NoteDraft, DateTimeOffset.UtcNow, CancellationToken.None); IsNoteEditing = false; await ReloadAsync(); SaveStatus = "备注已保存"; SubjectChanged?.Invoke(this, EventArgs.Empty);
     }
     private void SnapshotApplied(object? sender, EventArgs e) { var dispatcher = System.Windows.Application.Current?.Dispatcher; if (dispatcher is null || dispatcher.CheckAccess()) _ = ReloadAsync(); else _ = dispatcher.InvokeAsync(ReloadAsync); }
-    private void RaiseState() { Raise(nameof(CurrentState)); Raise(nameof(State)); Raise(nameof(StateMark)); Raise(nameof(StateColor)); UpdateDuration(); }
-    private void UpdateDuration() => Duration = PresenceDurationFormatter.Format(CurrentState, _snapshot?.LastStateChangedAt, DateTimeOffset.UtcNow);
-    public void Dispose() { _monitor.SnapshotApplied -= SnapshotApplied; _timer.Stop(); }
+    private void MonitorStatusChanged(object? sender, MonitorStatus status)
+    {
+        if (status.State == CloudConnectionState.Connected) return;
+        var dispatcher = System.Windows.Application.Current?.Dispatcher;
+        if (dispatcher is null || dispatcher.CheckAccess()) _ = ReloadAsync(); else _ = dispatcher.InvokeAsync(ReloadAsync);
+    }
+    private void RaiseState() { Raise(nameof(CurrentState)); Raise(nameof(State)); Raise(nameof(StateMark)); Raise(nameof(StateColor)); Raise(nameof(CurrentConnection)); UpdateDuration(); }
+    private void UpdateDuration() => Duration = PresenceDurationFormatter.Format(CurrentState, _snapshot?.ConfirmedStateSince, DateTimeOffset.UtcNow);
+    public void Dispose() { _monitor.SnapshotApplied -= SnapshotApplied; _monitor.StatusChanged -= MonitorStatusChanged; _timer.Stop(); }
     private static string Format(TimeSpan value) => value.TotalHours >= 1 ? $"{(int)value.TotalHours}小时{value.Minutes}分钟" : $"{value.Minutes}分钟";
 }
 
 public sealed class SubjectMemberViewModel
 {
     public SubjectMemberViewModel(NetworkDevice device, Action<NetworkDevice> open) { Device = device; OpenCommand = new RelayCommand(() => open(device)); }
-    public NetworkDevice Device { get; } public string Name => Device.DisplayName; public string Mac => Device.MacAddress; public string Connection => Device.ConnectionType ?? "未知"; public string Ip => Device.LastIp ?? "-"; public string Signal => Device.Signal is null ? "-" : $"{Device.Signal} dBm"; public string StateMark => Device.CurrentState == PresenceState.Online ? "●" : "○"; public string StateColor => Device.CurrentState == PresenceState.Online ? "#16A34A" : "#64748B"; public RelayCommand OpenCommand { get; }
+    public NetworkDevice Device { get; } public string Name => Device.DisplayName; public string Mac => Device.MacAddress; public string Connection => Device.ConnectionType ?? "未知"; public string Ip => Device.LastIp ?? "-"; public string Signal => Device.Signal is null ? "-" : $"{Device.Signal} dBm"; public string StateMark => Device.CurrentObservedState == PresenceState.Online ? "●" : Device.CurrentObservedState == PresenceState.Offline ? "○" : "◇"; public string StateColor => Device.CurrentObservedState == PresenceState.Online ? "#16A34A" : Device.CurrentObservedState == PresenceState.Offline ? "#64748B" : "#D97706"; public RelayCommand OpenCommand { get; }
 }

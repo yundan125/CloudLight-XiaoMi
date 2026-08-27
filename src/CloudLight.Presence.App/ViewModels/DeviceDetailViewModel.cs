@@ -18,14 +18,14 @@ public sealed class DeviceDetailViewModel : ObservableObject, IDisposable
     {
         _repository = repository; _statistics = statistics; _monitor = monitor; _device = device; _customName = device.CustomName; _note = device.Note; _duration = PresenceDurationFormatter.Format(device, DateTimeOffset.UtcNow);
         Show24HoursCommand = new AsyncRelayCommand(() => LoadTimelineAsync(1, "24小时")); Show3DaysCommand = new AsyncRelayCommand(() => LoadTimelineAsync(3, "3天")); Show7DaysCommand = new AsyncRelayCommand(() => LoadTimelineAsync(7, "7天")); Show30DaysCommand = new AsyncRelayCommand(() => LoadTimelineAsync(30, "30天")); SaveCommand = new AsyncRelayCommand(SaveAsync);
-        _monitor.SnapshotApplied += MonitorSnapshotApplied;
+        _monitor.SnapshotApplied += MonitorSnapshotApplied; _monitor.StatusChanged += MonitorStatusChanged;
         _timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) }; _timer.Tick += (_, _) => Duration = PresenceDurationFormatter.Format(Device, DateTimeOffset.UtcNow); _timer.Start();
     }
     public NetworkDevice Device => _device;
-    public string Title => Device.DisplayName; public string WindowTitle => $"{Title} - CloudLight XiaoMi"; public string State => PresenceDurationFormatter.StateText(Device.CurrentState);
+    public string Title => Device.DisplayName; public string WindowTitle => $"{Title} - CloudLight XiaoMi"; public string State => PresenceDurationFormatter.StateText(Device.CurrentObservedState);
     public string Duration { get => _duration; private set => Set(ref _duration, value); }
-    public string StateMark => Device.CurrentState == PresenceState.Online ? "●" : "○";
-    public string StateColor => Device.CurrentState == PresenceState.Online ? "#16A34A" : "#64748B";
+    public string StateMark => Device.CurrentObservedState == PresenceState.Online ? "●" : Device.CurrentObservedState == PresenceState.Offline ? "○" : "◇";
+    public string StateColor => Device.CurrentObservedState == PresenceState.Online ? "#16A34A" : Device.CurrentObservedState == PresenceState.Offline ? "#64748B" : "#D97706";
     public string Mac => Device.MacAddress; public string Ip => Device.LastIp ?? "-"; public string Connection => Device.ConnectionType ?? "未知";
     public string Signal => Device.Signal is null ? "-" : $"{Device.Signal} dBm"; public string FirstSeen => Device.FirstSeenAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
     public string LastSeen => Device.LastSeenAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"); public string LastChanged => Device.LastStateChangedAt?.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") ?? "尚无状态变化";
@@ -79,6 +79,13 @@ public sealed class DeviceDetailViewModel : ObservableObject, IDisposable
         if (dispatcher is null || dispatcher.CheckAccess()) _ = ReloadAsync(includeDevice: true);
         else _ = dispatcher.InvokeAsync(() => ReloadAsync(includeDevice: true));
     }
+    private void MonitorStatusChanged(object? sender, MonitorStatus status)
+    {
+        if (status.State == CloudConnectionState.Connected) return;
+        var dispatcher = System.Windows.Application.Current?.Dispatcher;
+        if (dispatcher is null || dispatcher.CheckAccess()) _ = ReloadAsync(includeDevice: true);
+        else _ = dispatcher.InvokeAsync(() => ReloadAsync(includeDevice: true));
+    }
     private void UpdateDevice(NetworkDevice device)
     {
         _device = device;
@@ -88,7 +95,7 @@ public sealed class DeviceDetailViewModel : ObservableObject, IDisposable
     }
     public void Dispose()
     {
-        _monitor.SnapshotApplied -= MonitorSnapshotApplied;
+        _monitor.SnapshotApplied -= MonitorSnapshotApplied; _monitor.StatusChanged -= MonitorStatusChanged;
         _timer.Stop();
     }
     private static string Format(TimeSpan value) { var hours = (int)value.TotalHours; return hours > 0 ? $"{hours}小时{value.Minutes}分钟" : $"{value.Minutes}分钟"; }

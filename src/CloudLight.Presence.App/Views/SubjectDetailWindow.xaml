@@ -24,8 +24,12 @@
         <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
         <StackPanel><TextBlock Text="{Binding DisplayName}" FontSize="29" FontWeight="SemiBold" Foreground="#172033"/>
           <StackPanel Orientation="Horizontal" Margin="0,8,0,0"><TextBlock Text="{Binding StateMark}" Foreground="{Binding StateColor}" Margin="0,0,7,0"/><TextBlock Text="{Binding Duration}" FontWeight="SemiBold"/></StackPanel>
+          <TextBlock Text="{Binding CurrentConnection}" Foreground="#64748B" Margin="0,6,0,0"/>
         </StackPanel>
-        <Button Grid.Column="1" Content="拆分此分组" Style="{StaticResource DeleteButton}" VerticalAlignment="Top" Click="DeleteClicked"/>
+        <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Top">
+          <Button Content="拆分主体" Style="{StaticResource SecondaryButton}" Click="SplitClicked"/>
+          <Button Content="解散主体" Style="{StaticResource DeleteButton}" Click="DeleteClicked"/>
+        </StackPanel>
       </Grid>
 
       <Border Style="{StaticResource SurfaceCard}" Margin="0,26,0,0">

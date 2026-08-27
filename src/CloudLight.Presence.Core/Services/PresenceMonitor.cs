@@ -4,8 +4,8 @@ using CloudLight.Presence.Core.Presence;
 
 namespace CloudLight.Presence.Core.Services;
 
-public enum CloudConnectionState { Disconnected, Connecting, Connected, Reconnecting, NeedsLogin, Paused }
-public sealed record MonitorStatus(CloudConnectionState State, DateTimeOffset? LastUpdate, string? Message = null);
+public enum CloudConnectionState { Disconnected, Connecting, Connected, Reconnecting, ConfirmedUnavailable, NeedsLogin, Paused }
+public sealed record MonitorStatus(CloudConnectionState State, DateTimeOffset? LastUpdate, string? Message = null, DateTimeOffset? LastSuccessfulCloudUpdate = null, string? RouterName = null);
 
 public sealed class PresenceMonitor(
     IXiaomiPresenceSource source,
@@ -21,6 +21,7 @@ public sealed class PresenceMonitor(
     private Router? _router;
     private long? _cloudGapId;
     private int _failures;
+    private DateTimeOffset? _lastSuccessfulCloudUpdate;
     private bool _isRefreshing;
     private int _pollingIntervalSeconds = (int)DefaultPollingInterval.TotalSeconds;
     public event EventHandler<MonitorStatus>? StatusChanged;
@@ -37,13 +38,13 @@ public sealed class PresenceMonitor(
         Volatile.Write(ref _pollingIntervalSeconds, (int)interval.TotalSeconds);
     }
 
-    public Task StartAsync(Router router, CancellationToken cancellationToken)
+    public async Task StartAsync(Router router, CancellationToken cancellationToken)
     {
-        if (IsRunning) return Task.CompletedTask;
+        if (IsRunning) return;
         _router = router;
+        await repository.ResetCurrentObservedStateAsync(router.Id, cancellationToken);
         _runCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _runTask = RunAsync(router, _runCancellation.Token);
-        return Task.CompletedTask;
     }
 
     public async Task RefreshNowAsync(CancellationToken cancellationToken)
@@ -61,6 +62,7 @@ public sealed class PresenceMonitor(
         }
         _runCancellation?.Dispose(); _runCancellation = null; _runTask = null;
         await repository.StartMonitoringGapAsync(DateTimeOffset.UtcNow, reason, cancellationToken);
+        if (_router is { } router) await repository.ResetCurrentObservedStateAsync(router.Id, cancellationToken);
         Raise(new MonitorStatus(reason == "暂停监控" ? CloudConnectionState.Paused : CloudConnectionState.Disconnected, null));
     }
 
@@ -84,7 +86,7 @@ public sealed class PresenceMonitor(
             catch (Exception exception)
             {
                 var delay = RetryIntervals[Math.Min(Math.Max(_failures - 1, 0), RetryIntervals.Length - 1)];
-                Raise(new MonitorStatus(CloudConnectionState.Reconnecting, null, $"{exception.Message}；{delay.TotalSeconds:0} 秒后重试"));
+                Raise(new MonitorStatus(_failures >= 2 ? CloudConnectionState.ConfirmedUnavailable : CloudConnectionState.Reconnecting, null, $"{exception.Message}；{delay.TotalSeconds:0} 秒后重试", _lastSuccessfulCloudUpdate, router.Name));
                 await Task.Delay(delay, cancellationToken);
             }
         }
@@ -105,11 +107,13 @@ public sealed class PresenceMonitor(
                 _cloudGapId = null;
             }
             _failures = 0;
-            Raise(new MonitorStatus(CloudConnectionState.Connected, now));
+            _lastSuccessfulCloudUpdate = now;
+            Raise(new MonitorStatus(CloudConnectionState.Connected, now, null, _lastSuccessfulCloudUpdate, router.Name));
             SnapshotApplied?.Invoke(this, EventArgs.Empty);
         }
         catch (AuthenticationRequiredException exception)
         {
+            await repository.ResetCurrentObservedStateAsync(router.Id, cancellationToken);
             Raise(new MonitorStatus(CloudConnectionState.NeedsLogin, null, exception.Message));
             throw;
         }
@@ -120,9 +124,10 @@ public sealed class PresenceMonitor(
         catch (Exception exception)
         {
             _cloudGapId ??= await repository.StartMonitoringGapAsync(DateTimeOffset.UtcNow, "Xiaomi Cloud 暂时不可用", cancellationToken);
+            await repository.ResetCurrentObservedStateAsync(router.Id, cancellationToken);
             _failures++;
             if (manual)
-                Raise(new MonitorStatus(CloudConnectionState.Connected, null, $"刷新失败：{exception.Message}"));
+                Raise(new MonitorStatus(_failures >= 2 ? CloudConnectionState.ConfirmedUnavailable : CloudConnectionState.Reconnecting, null, $"刷新失败：{exception.Message}", _lastSuccessfulCloudUpdate, router.Name));
             throw;
         }
         finally

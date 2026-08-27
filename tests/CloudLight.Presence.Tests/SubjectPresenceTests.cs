@@ -1,4 +1,5 @@
 using CloudLight.Presence.Core.Models;
+using CloudLight.Presence.Core.Interfaces;
 using CloudLight.Presence.Core.Services;
 using CloudLight.Presence.Infrastructure.Database;
 using CloudLight.Presence.Infrastructure.Settings;
@@ -8,6 +9,49 @@ namespace CloudLight.Presence.Tests;
 
 public sealed class SubjectPresenceTests
 {
+    [Theory]
+    [MemberData(nameof(AggregateCases))]
+    public void AggregateUsesOnlineUnknownOfflinePrecedence(PresenceState[] states, PresenceState expected)
+    {
+        Assert.Equal(expected, SubjectPresenceService.Aggregate(states));
+    }
+
+    public static IEnumerable<object[]> AggregateCases =>
+    [
+        [new[] { PresenceState.Online, PresenceState.Unknown }, PresenceState.Online],
+        [new[] { PresenceState.Online, PresenceState.Offline }, PresenceState.Online],
+        [new[] { PresenceState.Unknown, PresenceState.Offline }, PresenceState.Unknown],
+        [new[] { PresenceState.Offline, PresenceState.Offline }, PresenceState.Offline],
+        [new[] { PresenceState.Online, PresenceState.Unknown, PresenceState.Offline }, PresenceState.Online]
+    ];
+
+    [Fact]
+    public async Task MonitoringGapUnknownDoesNotOverrideAnotherMembersOnlineFact()
+    {
+        await WithSubject(async (repository, _, subject, a, b) =>
+        {
+            var statistics = new FixedStatisticsService
+            {
+                [a.Id] = PresenceState.Unknown,
+                [b.Id] = PresenceState.Online
+            };
+            await repository.UpdateDeviceAsync(a with { CurrentState = PresenceState.Unknown }, CancellationToken.None);
+            await repository.UpdateDeviceAsync(b with { CurrentState = PresenceState.Online, LastKnownHistoricalState = PresenceState.Online }, CancellationToken.None);
+            var service = new SubjectPresenceService(repository, statistics);
+            var fact = await service.GetCurrentFactAsync(subject.Id, At(14), CancellationToken.None);
+            var snapshot = await service.GetSnapshotAsync(subject.Id, At(14), CancellationToken.None);
+            Assert.Equal(PresenceState.Online, fact!.CurrentState);
+            Assert.Equal(fact.CurrentState, snapshot!.CurrentState);
+            Assert.Equal(PresenceState.Online, (await service.GetTimelineAsync(subject.Id, At(10), At(14), CancellationToken.None)).Single().State);
+
+            statistics[a.Id] = PresenceState.Unknown;
+            statistics[b.Id] = PresenceState.Offline;
+            await repository.UpdateDeviceAsync(b with { CurrentState = PresenceState.Offline }, CancellationToken.None);
+            fact = await service.GetCurrentFactAsync(subject.Id, At(14), CancellationToken.None);
+            Assert.Equal(PresenceState.Unknown, fact!.CurrentState);
+        });
+    }
+
     [Fact]
     public async Task AnyOnlineMemberMakesSubjectOnline()
     {
@@ -31,14 +75,16 @@ public sealed class SubjectPresenceTests
     }
 
     [Fact]
-    public async Task RepeatedSnapshotsKeepAggregateStateSinceAcrossMonitoringGaps()
+    public async Task MonitoringGapDoesNotBecomeAConfirmedAggregateStateChange()
     {
         await WithSubject(async (repository, service, subject, a, _) =>
         {
             var started = At(10); await repository.AddSessionAsync(new(0, a.Id, started, null, true, false), CancellationToken.None);
             var gap = await repository.StartMonitoringGapAsync(At(11), "restart", CancellationToken.None); await repository.EndMonitoringGapAsync(gap, At(11).AddSeconds(10), CancellationToken.None);
+            var firstFact = await service.GetCurrentFactAsync(subject.Id, At(12), CancellationToken.None); var secondFact = await service.GetCurrentFactAsync(subject.Id, At(12).AddMinutes(2), CancellationToken.None);
             var first = await service.GetSnapshotAsync(subject.Id, At(12), CancellationToken.None); var second = await service.GetSnapshotAsync(subject.Id, At(12).AddMinutes(2), CancellationToken.None);
-            Assert.Equal(started, first!.LastStateChangedAt); Assert.Equal(first.LastStateChangedAt, second!.LastStateChangedAt); Assert.Equal(PresenceState.Online, second.CurrentState);
+            Assert.Equal(PresenceState.Online, firstFact!.CurrentState); Assert.False(firstFact.StateSinceKnown); Assert.Null(firstFact.StateSince); Assert.Equal(TimeSpan.Zero, firstFact.ConfirmedDuration);
+            Assert.Equal(PresenceState.Online, secondFact!.CurrentState); Assert.False(secondFact.StateSinceKnown); Assert.Null(secondFact.StateSince); Assert.Null(first!.ConfirmedStateSince); Assert.Null(second!.ConfirmedStateSince); Assert.Null(second.LastStateChangedAt);
             var timeline = await service.GetTimelineAsync(subject.Id, started, At(12), CancellationToken.None);
             var hidden = SubjectActivityBuilder.Build(timeline, includeUnknownPeriods: false); Assert.Single(hidden); Assert.Equal(new SubjectActivityItem(started, SubjectActivityType.Online), hidden[0]);
             var shown = SubjectActivityBuilder.Build(timeline, includeUnknownPeriods: true); Assert.Equal([SubjectActivityType.Online, SubjectActivityType.UnknownPeriod, SubjectActivityType.Online], shown.Select(value => value.Type).ToArray());
@@ -100,4 +146,16 @@ public sealed class SubjectPresenceTests
     }
     private static NetworkDevice Device(long router, string mac, DateTimeOffset at, bool online) => new(0, router, mac, "Phone", "Phone", null, null, "192.168.1.2", "5G", -45, online ? PresenceState.Online : PresenceState.Offline, at, at, at);
     private static DateTimeOffset At(int hour) => new(2026, 8, 24, hour, 0, 0, TimeSpan.Zero);
+
+    private sealed class FixedStatisticsService : Dictionary<long, PresenceState>, IPresenceStatisticsService
+    {
+        public Task<PresenceStatistics> GetStatisticsAsync(long deviceId, DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken)
+        {
+            var state = this[deviceId];
+            return Task.FromResult(new PresenceStatistics(from, to, state == PresenceState.Online ? to - from : TimeSpan.Zero, state == PresenceState.Offline ? to - from : TimeSpan.Zero, state == PresenceState.Unknown ? to - from : TimeSpan.Zero));
+        }
+
+        public Task<IReadOnlyList<PresenceTimelineSegment>> GetTimelineAsync(long deviceId, DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<PresenceTimelineSegment>>([new(from, to, this[deviceId])]);
+    }
 }
