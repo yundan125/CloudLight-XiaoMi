@@ -17,5 +17,6 @@
     <ProjectReference Include="..\..\src\CloudLight.Presence.Core\CloudLight.Presence.Core.csproj" />
     <ProjectReference Include="..\..\src\CloudLight.Presence.Infrastructure\CloudLight.Presence.Infrastructure.csproj" />
     <ProjectReference Include="..\..\src\CloudLight.Presence.App\CloudLight.Presence.App.csproj" />
+    <ProjectReference Include="..\..\src\CloudLight.Presence.Xiaomi\CloudLight.Presence.Xiaomi.csproj" />
   </ItemGroup>
 </Project>

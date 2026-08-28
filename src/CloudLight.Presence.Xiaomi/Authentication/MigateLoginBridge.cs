@@ -54,7 +54,7 @@ internal sealed class MigateLoginBridge(string pythonPath, string? logsDirectory
         await WriteProcessLogAsync(request.Operation, process.ExitCode, await standardOutput, await standardError, bridgeError, cancellationToken);
         if (string.IsNullOrWhiteSpace(line)) throw new AuthenticationRequiredException("Xiaomi 登录桥没有返回结果。");
         if (response?.Ok != true || response.Result is null)
-            throw new AuthenticationRequiredException(response?.Error ?? "Xiaomi 登录或服务会话获取失败。");
+            throw new AuthenticationRequiredException("Xiaomi 登录或服务会话获取失败。");
         return response.Result;
     }
 
@@ -64,9 +64,9 @@ internal sealed class MigateLoginBridge(string pythonPath, string? logsDirectory
         Directory.CreateDirectory(logsDirectory);
         var path = Path.Combine(logsDirectory, "migate-bridge.log");
         var entry = $"[{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}] {operation}, exit={exitCode}{Environment.NewLine}" +
-                    (string.IsNullOrWhiteSpace(standardOutput) ? "" : $"stdout: {standardOutput.Trim()}{Environment.NewLine}") +
-                    (string.IsNullOrWhiteSpace(standardError) ? "" : $"stderr: {standardError.Trim()}{Environment.NewLine}") +
-                    (string.IsNullOrWhiteSpace(bridgeError) ? "" : $"error: {bridgeError.Trim()}{Environment.NewLine}");
+                    (string.IsNullOrWhiteSpace(standardOutput) ? "" : $"stdout: <omitted>{Environment.NewLine}") +
+                    (string.IsNullOrWhiteSpace(standardError) ? "" : $"stderr: <omitted>{Environment.NewLine}") +
+                    (string.IsNullOrWhiteSpace(bridgeError) ? "" : $"error: <omitted>{Environment.NewLine}");
         await File.AppendAllTextAsync(path, entry, Encoding.UTF8, cancellationToken);
     }
 

@@ -35,14 +35,20 @@ public sealed class SubjectPresenceService(IPresenceRepository repository, IPres
 
         var historicalCurrent = timeline.LastOrDefault();
         var currentIndex = historicalCurrent is null ? 0 : timeline.Count - 1;
-        var stateSince = historicalCurrent?.State == currentState
-            ? await ResolveConfirmedStateSinceAsync(members, historicalCurrent, now, cancellationToken)
-            : null;
+        var persistedCurrent = await repository.GetSubjectCurrentStateAsync(subjectId, cancellationToken);
+        var stateSince = persistedCurrent?.CurrentState == currentState
+            ? persistedCurrent.StateSince
+            : historicalCurrent?.State == currentState
+                ? await ResolveConfirmedStateSinceAsync(members, historicalCurrent, now, cancellationToken)
+                : ResolveMemberFallbackStateSince(members, currentState);
         var stateSinceKnown = stateSince is not null;
         var duration = stateSince is { } confirmedSince ? NonNegative(now - confirmedSince) : TimeSpan.Zero;
+        DateTimeOffset? notificationStateSince = stateSince is { } value
+            ? await ResolveNotificationStateSinceAsync(persistedCurrent, value, now, cancellationToken)
+            : null;
         return new(subject, members, currentState, stateSince, stateSinceKnown, duration,
             LastBoundary(timeline, PresenceState.Online, currentIndex),
-            LastBoundary(timeline, PresenceState.Offline, currentIndex), active, routerName);
+            LastBoundary(timeline, PresenceState.Offline, currentIndex), active, routerName, notificationStateSince);
     }
 
     public async Task<PresenceStatistics> GetSubjectStatisticsAsync(long subjectId, DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken)
@@ -151,14 +157,45 @@ public sealed class SubjectPresenceService(IPresenceRepository repository, IPres
         }
 
         if (candidates.Count == 0) return null;
-        var gaps = await repository.GetMonitoringGapsAsync(current.Start, now, cancellationToken);
         var valid = candidates
-            .Where(value => value >= current.Start && value <= current.End && value <= now)
+            .Where(value => value <= now)
             .Distinct()
-            .Where(value => !gaps.Any(gap => gap.StartedAt < now && (gap.EndedAt ?? now) > value))
             .ToArray();
         if (valid.Length == 0) return null;
         return current.State == PresenceState.Online ? valid.Min() : valid.Max();
+    }
+
+    private static DateTimeOffset? ResolveMemberFallbackStateSince(
+        IReadOnlyList<NetworkDevice> members,
+        PresenceState currentState)
+    {
+        var candidates = members
+            .Where(member => member.CurrentObservedState == currentState)
+            .Select(member => member.LastStateChangedAt ?? member.LastSeenAt)
+            .ToArray();
+        if (candidates.Length == 0) return null;
+        return currentState == PresenceState.Online ? candidates.Min() : candidates.Max();
+    }
+
+    private async Task<DateTimeOffset?> ResolveNotificationStateSinceAsync(
+        SubjectCurrentState? persistedCurrent,
+        DateTimeOffset stateSince,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        if (persistedCurrent is null) return stateSince;
+        var gaps = await repository.GetMonitoringGapsAsync(stateSince, now, cancellationToken);
+        // Until a successful snapshot at or after the end of every gap, a
+        // restored visual duration is not safe notification evidence.
+        if (gaps.Any(gap => gap.StartedAt > stateSince &&
+                            (gap.EndedAt is null || gap.EndedAt > persistedCurrent.LastObservedAt)))
+            return null;
+        var latestGapEnd = gaps
+            .Where(gap => gap.StartedAt > stateSince && gap.EndedAt is { } endedAt && endedAt <= persistedCurrent.LastObservedAt)
+            .Select(gap => gap.EndedAt!.Value)
+            .DefaultIfEmpty(stateSince)
+            .Max();
+        return latestGapEnd > stateSince ? latestGapEnd : stateSince;
     }
 
     private async Task<string?> GetRouterNameAsync(IReadOnlyList<NetworkDevice> members, CancellationToken cancellationToken)

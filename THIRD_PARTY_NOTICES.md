@@ -17,3 +17,10 @@ packages listed in `installer/requirements-migate-runtime.txt`. Their license me
 retained inside the packaged Python distribution and installed `*.dist-info` directories.
 This private runtime is located inside the application directory and does not modify the
 system Python installation.
+
+## Inno Setup Chinese Simplified translation
+
+- Source: https://github.com/jrsoftware/issrc/tree/is-6_7_3/Files/Languages/Unofficial
+- Version basis: Inno Setup 6.7.3 (`is-6_7_3`)
+- Maintainer: Zhenghan Yang (as identified in the translation header)
+- Usage: Simplified Chinese strings for the CloudLight XiaoMi installer.

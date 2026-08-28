@@ -3,7 +3,15 @@ namespace CloudLight.Presence.Core.Models;
 public enum PresenceState { Unknown = 0, Online = 1, Offline = 2 }
 public enum PresenceEventType { Online = 1, Offline = 2, InitialObservation = 3 }
 public enum PresenceSource { Polling = 1 }
-public enum SubjectActivityType { Online = 1, Offline = 2, UnknownPeriod = 3 }
+public enum SubjectPresenceEventType { DetectedOnlineAfterGap = 1, DetectedOfflineAfterGap = 2 }
+public enum SubjectActivityType
+{
+    Online = 1,
+    Offline = 2,
+    UnknownPeriod = 3,
+    DetectedOnlineAfterGap = 4,
+    DetectedOfflineAfterGap = 5
+}
 public enum NotificationCondition { OnlineFor = 1, OfflineFor = 2 }
 public enum NotificationChannelType { QQ = 1 }
 public enum NotificationTargetType { Private = 1, Group = 2 }
@@ -69,6 +77,18 @@ public sealed record PresenceEvent(
     DateTimeOffset ObservedAt,
     PresenceSource Source);
 
+/// <summary>
+/// A subject-level observation made on the first successful poll after a
+/// monitoring gap.  ObservedAt is intentionally not a claimed transition
+/// time; the actual transition happened somewhere in the unobserved interval.
+/// </summary>
+public sealed record SubjectPresenceEvent(
+    long Id,
+    long SubjectId,
+    SubjectPresenceEventType EventType,
+    DateTimeOffset ObservedAt,
+    long MonitoringGapId);
+
 public sealed record PresenceSession(
     long Id,
     long DeviceId,
@@ -82,6 +102,27 @@ public sealed record MonitoringGap(
     DateTimeOffset StartedAt,
     DateTimeOffset? EndedAt,
     string Reason);
+
+/// <summary>
+/// The aggregate state captured before a monitoring gap is first reconciled.
+/// It is deliberately immutable for that gap so a failed or cancelled
+/// multi-MAC snapshot cannot change the comparison baseline for its retry.
+/// </summary>
+public sealed record MonitoringGapSubjectBaseline(
+    long MonitoringGapId,
+    long SubjectId,
+    PresenceState State);
+
+/// <summary>
+/// The last confirmed aggregate state for a person/device subject.  This is
+/// intentionally separate from individual MAC observations: one phone may
+/// move between bands without changing the subject's online episode.
+/// </summary>
+public sealed record SubjectCurrentState(
+    long SubjectId,
+    PresenceState CurrentState,
+    DateTimeOffset StateSince,
+    DateTimeOffset LastObservedAt);
 
 public sealed record PresenceSubject(
     long Id,
@@ -117,7 +158,8 @@ public sealed record SubjectPresenceFact(
     DateTimeOffset? LastOnlineTime,
     DateTimeOffset? LastOfflineTime,
     NetworkDevice? ActiveDevice,
-    string? RouterName);
+    string? RouterName,
+    DateTimeOffset? NotificationStateSince = null);
 
 public sealed record NotificationRule(
     long Id,

@@ -1,0 +1,52 @@
+<Window x:Class="CloudLight.Presence.App.Views.XiaomiActionDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="执行设备操作" Width="520" MinWidth="420" SizeToContent="Height"
+        MaxHeight="680" WindowStartupLocation="CenterOwner" ResizeMode="NoResize"
+        Background="#F5F7FB" ShowInTaskbar="False">
+  <Grid Margin="24">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+    <TextBlock Text="{Binding DisplayName, StringFormat=执行“{0}”}" FontSize="22" FontWeight="SemiBold" Foreground="#172033" TextWrapping="Wrap"/>
+    <Border Grid.Row="1" Background="#FFF7ED" BorderBrush="#FED7AA" BorderThickness="1" CornerRadius="8" Padding="12" Margin="0,16,0,0" Visibility="{Binding RequiresConfirmation, Converter={StaticResource BooleanToVisibility}}">
+      <TextBlock Text="{Binding RiskWarning}" Foreground="#9A3412" TextWrapping="Wrap"/>
+    </Border>
+    <Border Grid.Row="2" Style="{StaticResource SurfaceCard}" Margin="0,16,0,0">
+      <StackPanel>
+        <TextBlock Text="操作参数" Style="{StaticResource SectionTitle}" Margin="0,0,0,10"/>
+        <ItemsControl ItemsSource="{Binding InputArguments}">
+          <ItemsControl.ItemTemplate>
+            <DataTemplate>
+              <Grid Margin="0,5">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="145"/><ColumnDefinition/></Grid.ColumnDefinitions>
+                <StackPanel VerticalAlignment="Center">
+                  <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold"/>
+                  <TextBlock Text="必填" Foreground="#64748B" FontSize="11" Visibility="{Binding IsRequired, Converter={StaticResource BooleanToVisibility}}"/>
+                </StackPanel>
+                <CheckBox Grid.Column="1" Content="开启" IsChecked="{Binding BoolValue, Mode=TwoWay}" Visibility="{Binding IsBoolean, Converter={StaticResource BooleanToVisibility}}" VerticalAlignment="Center"/>
+                <ComboBox Grid.Column="1" ItemsSource="{Binding ValueOptions}" DisplayMemberPath="DisplayName" SelectedItem="{Binding SelectedOption, Mode=TwoWay}" Visibility="{Binding IsEnum, Converter={StaticResource BooleanToVisibility}}"/>
+                <StackPanel Grid.Column="1" Visibility="{Binding IsNumber, Converter={StaticResource BooleanToVisibility}}">
+                  <Slider Minimum="{Binding MinimumDouble}" Maximum="{Binding MaximumDouble}" Value="{Binding SliderValue, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" IsSnapToTickEnabled="True"/>
+                  <StackPanel Orientation="Horizontal" Margin="0,3,0,0">
+                    <TextBlock Text="{Binding SliderText}"/>
+                    <TextBlock Text="{Binding UnitText}" Foreground="#64748B" Margin="8,0,0,0"/>
+                  </StackPanel>
+                </StackPanel>
+                <TextBox Grid.Column="1" Text="{Binding TextValue, UpdateSourceTrigger=PropertyChanged}" Visibility="{Binding IsTextFallback, Converter={StaticResource BooleanToVisibility}}"/>
+              </Grid>
+            </DataTemplate>
+          </ItemsControl.ItemTemplate>
+        </ItemsControl>
+        <TextBlock x:Name="ErrorText" Foreground="#DC2626" TextWrapping="Wrap" Margin="0,12,0,0"/>
+      </StackPanel>
+    </Border>
+    <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+      <Button Content="取消" Style="{StaticResource SecondaryButton}" Click="CancelClicked"/>
+      <Button Content="执行" Click="ExecuteClicked" Margin="0"/>
+    </StackPanel>
+  </Grid>
+</Window>

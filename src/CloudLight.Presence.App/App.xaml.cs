@@ -68,7 +68,7 @@ public partial class App : System.Windows.Application
             return new ConnectionAlertConfiguration(alerts, qq.DefaultTargetType, qq.DefaultTargetId);
         });
         var notificationSettings = new NotificationSettingsViewModel(repository, settings, qqSecretStore, qqChannel);
-        var viewModel = new MainViewModel(repository, subjectPresence, source, monitor, settings, notificationSettings);
+        var viewModel = new MainViewModel(repository, subjectPresence, source, monitor, settings, notificationSettings, source);
         var window = new MainWindow(viewModel, repository, subjectPresence, monitor, new PresenceDataTransferService(paths), startup, paths, runId, notificationRuntime, connectionAlerts, qqChannel, dispatcher); MainWindow = window;
         var startupLaunch = e.Args.Any(value => string.Equals(value, "--startup", StringComparison.OrdinalIgnoreCase));
         if (!startupLaunch) window.Show();

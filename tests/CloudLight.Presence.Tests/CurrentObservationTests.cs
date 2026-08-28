@@ -143,7 +143,7 @@ public sealed class CurrentObservationTests
     }
 
     [Fact]
-    public async Task GapThenSameOnlinePollReconfirmsWithoutInventingEventOrStateSince()
+    public async Task GapThenSameOnlinePollPreservesStateSinceWithoutInventingEvent()
     {
         await using var fixture = await CreateFixtureAsync(PresenceState.Online);
         var gap = await fixture.Repository.StartMonitoringGapAsync(At(8), "restart", CancellationToken.None);
@@ -157,8 +157,9 @@ public sealed class CurrentObservationTests
         var afterEvents = await fixture.Repository.GetEventsAsync(fixture.Devices[0].Id, CancellationToken.None);
 
         Assert.Equal(PresenceState.Online, fact!.CurrentState);
-        Assert.False(fact.StateSinceKnown);
-        Assert.Null(fact.StateSince);
+        Assert.True(fact.StateSinceKnown);
+        Assert.Equal(At(6), fact.StateSince);
+        Assert.Equal(TimeSpan.FromHours(6), fact.ConfirmedDuration);
         Assert.Equal(beforeEvents.Count, afterEvents.Count);
     }
 
@@ -178,6 +179,27 @@ public sealed class CurrentObservationTests
         Assert.True(fact.StateSinceKnown);
         Assert.Equal(At(6), fact.StateSince);
         Assert.Equal(beforeEvents.Count, afterEvents.Count);
+    }
+
+    [Fact]
+    public async Task MultiMacBandSwitchKeepsAggregateOnlineStateSince()
+    {
+        await using var fixture = await CreateFixtureAsync(PresenceState.Online);
+        var machine = new PresenceStateMachine(fixture.Repository);
+
+        await machine.ApplySnapshotAsync(fixture.Router.Id,
+            [Observation(fixture.Devices[0], online: false), Observation(fixture.Devices[1], online: true)], At(10), CancellationToken.None);
+        await machine.ApplySnapshotAsync(fixture.Router.Id,
+            [Observation(fixture.Devices[0], online: true), Observation(fixture.Devices[1], online: false)], At(11), CancellationToken.None);
+
+        var fact = await CurrentFactAsync(fixture);
+        var persisted = await fixture.Repository.GetSubjectCurrentStateAsync(fixture.Subject.Id, CancellationToken.None);
+
+        Assert.Equal(PresenceState.Online, fact!.CurrentState);
+        Assert.True(fact.StateSinceKnown);
+        Assert.Equal(At(6), fact.StateSince);
+        Assert.Equal(At(6), persisted!.StateSince);
+        Assert.Empty(await fixture.Repository.GetSubjectPresenceEventsAsync(fixture.Subject.Id, At(0), At(12), CancellationToken.None));
     }
 
     private static async Task<SubjectPresenceFact?> CurrentFactAsync(Fixture fixture) =>

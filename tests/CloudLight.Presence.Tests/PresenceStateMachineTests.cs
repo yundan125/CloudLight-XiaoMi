@@ -1,5 +1,6 @@
 using CloudLight.Presence.Core.Models;
 using CloudLight.Presence.Core.Presence;
+using CloudLight.Presence.Core.Services;
 using CloudLight.Presence.Infrastructure.Database;
 using CloudLight.Presence.Infrastructure.Settings;
 using Xunit;
@@ -40,6 +41,32 @@ public sealed class PresenceStateMachineTests : IAsyncLifetime
         var device = (await _repository.GetDevicesAsync(_router.Id, CancellationToken.None)).Single();
         var events = await _repository.GetEventsAsync(device.Id, CancellationToken.None); var sessions = await _repository.GetSessionsAsync(device.Id, CancellationToken.None);
         Assert.Single(events); Assert.Equal(PresenceEventType.InitialObservation, events[0].EventType); Assert.Single(sessions); Assert.False(sessions[0].StartKnown);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task FirstObservationEstablishesSubjectStateSince(bool online)
+    {
+        var observedAt = DateTimeOffset.UtcNow;
+        await Apply(online, observedAt);
+
+        var subject = Assert.Single(await _repository.GetSubjectsAsync(CancellationToken.None));
+        var state = await _repository.GetSubjectCurrentStateAsync(subject.Id, CancellationToken.None);
+        var fact = await new SubjectPresenceService(_repository, new PresenceStatisticsService(_repository))
+            .GetCurrentFactAsync(subject.Id, observedAt.AddMinutes(5), CancellationToken.None);
+        var device = Assert.Single(await _repository.GetDevicesAsync(_router.Id, CancellationToken.None));
+        var events = await _repository.GetEventsAsync(device.Id, CancellationToken.None);
+
+        var expected = online ? PresenceState.Online : PresenceState.Offline;
+        Assert.Equal(expected, state!.CurrentState);
+        Assert.Equal(observedAt, state.StateSince);
+        Assert.Equal(expected, fact!.CurrentState);
+        Assert.True(fact.StateSinceKnown);
+        Assert.Equal(observedAt, fact.StateSince);
+        Assert.Equal(TimeSpan.FromMinutes(5), fact.ConfirmedDuration);
+        Assert.Single(events, value => value.EventType == PresenceEventType.InitialObservation);
+        Assert.Empty(await _repository.GetSubjectPresenceEventsAsync(subject.Id, observedAt, observedAt.AddMinutes(5), CancellationToken.None));
     }
 
     [Fact]

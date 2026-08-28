@@ -42,6 +42,13 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
             CREATE TABLE IF NOT EXISTS MonitoringGap (
               Id INTEGER PRIMARY KEY AUTOINCREMENT, StartedAt TEXT NOT NULL,
               EndedAt TEXT NULL, Reason TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS MonitoringGapSubjectBaseline (
+              MonitoringGapId INTEGER NOT NULL, SubjectId INTEGER NOT NULL,
+              State INTEGER NOT NULL,
+              PRIMARY KEY(MonitoringGapId, SubjectId),
+              FOREIGN KEY(MonitoringGapId) REFERENCES MonitoringGap(Id) ON DELETE CASCADE,
+              FOREIGN KEY(SubjectId) REFERENCES PresenceSubject(Id) ON DELETE CASCADE);
+            CREATE INDEX IF NOT EXISTS IX_MonitoringGapSubjectBaseline_Subject ON MonitoringGapSubjectBaseline(SubjectId);
             CREATE UNIQUE INDEX IF NOT EXISTS UX_PresenceSession_Stable ON PresenceSession(DeviceId, StartedAt);
             CREATE UNIQUE INDEX IF NOT EXISTS UX_MonitoringGap_Stable ON MonitoringGap(StartedAt, Reason);
             CREATE TABLE IF NOT EXISTS ApplicationRun (
@@ -50,6 +57,18 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
             CREATE TABLE IF NOT EXISTS PresenceSubject (
               Id INTEGER PRIMARY KEY AUTOINCREMENT, ExportId TEXT NOT NULL UNIQUE,
               DisplayName TEXT NOT NULL, Note TEXT NULL, CreatedAt TEXT NOT NULL, UpdatedAt TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS SubjectCurrentState (
+              SubjectId INTEGER PRIMARY KEY, CurrentState INTEGER NOT NULL,
+              StateSince TEXT NOT NULL, LastObservedAt TEXT NOT NULL,
+              FOREIGN KEY(SubjectId) REFERENCES PresenceSubject(Id) ON DELETE CASCADE);
+            CREATE INDEX IF NOT EXISTS IX_SubjectCurrentState_Observed ON SubjectCurrentState(LastObservedAt DESC);
+            CREATE TABLE IF NOT EXISTS SubjectPresenceEvent (
+              Id INTEGER PRIMARY KEY AUTOINCREMENT, SubjectId INTEGER NOT NULL,
+              EventType INTEGER NOT NULL, ObservedAt TEXT NOT NULL, MonitoringGapId INTEGER NOT NULL,
+              FOREIGN KEY(SubjectId) REFERENCES PresenceSubject(Id) ON DELETE CASCADE,
+              FOREIGN KEY(MonitoringGapId) REFERENCES MonitoringGap(Id) ON DELETE CASCADE,
+              UNIQUE(SubjectId, MonitoringGapId));
+            CREATE INDEX IF NOT EXISTS IX_SubjectPresenceEvent_Subject_Observed ON SubjectPresenceEvent(SubjectId, ObservedAt DESC);
             CREATE TABLE IF NOT EXISTS SubjectDeviceMembership (
               SubjectId INTEGER NOT NULL, NetworkDeviceId INTEGER NOT NULL UNIQUE, CreatedAt TEXT NOT NULL,
               PRIMARY KEY(SubjectId, NetworkDeviceId),
@@ -101,6 +120,7 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         await EnsureNetworkDeviceHistorySchemaAsync(connection, cancellationToken);
         await MigrateNotificationDeliverySchemaAsync(connection, cancellationToken);
         await EnsureEveryDeviceHasSubjectAsync(cancellationToken);
+        await EnsureSubjectCurrentStatesAsync(cancellationToken);
     }
 
     public async Task<Router> UpsertRouterAsync(Router router, CancellationToken cancellationToken)
@@ -244,6 +264,7 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
             await command.ExecuteNonQueryAsync(cancellationToken);
         }
         await EnsureEveryDeviceHasSubjectAsync(connection, (SqliteTransaction)transaction, DateTimeOffset.UtcNow, cancellationToken);
+        await BackfillMissingSubjectCurrentStatesAsync(connection, (SqliteTransaction)transaction, cancellationToken);
         await transaction.CommitAsync(cancellationToken);
     }
 
@@ -282,26 +303,55 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         await using var connection = await OpenAsync(cancellationToken);
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
         await EnsureEveryDeviceHasSubjectAsync(connection, (SqliteTransaction)transaction, DateTimeOffset.UtcNow, cancellationToken);
+        await BackfillMissingSubjectCurrentStatesAsync(connection, (SqliteTransaction)transaction, cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    public async Task EnsureSubjectCurrentStatesAsync(CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        await BackfillMissingSubjectCurrentStatesAsync(connection, (SqliteTransaction)transaction, cancellationToken);
         await transaction.CommitAsync(cancellationToken);
     }
 
     public async Task SetSubjectDevicesAsync(long subjectId, IReadOnlyCollection<long> deviceIds, DateTimeOffset createdAt, CancellationToken cancellationToken)
     {
         await using var connection = await OpenAsync(cancellationToken); await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
-        await using (var remove = connection.CreateCommand()) { remove.Transaction = (SqliteTransaction)transaction; remove.CommandText = "DELETE FROM SubjectDeviceMembership WHERE SubjectId=$id"; Add(remove, "$id", subjectId); await remove.ExecuteNonQueryAsync(cancellationToken); }
+        var sqliteTransaction = (SqliteTransaction)transaction;
+        var affectedSubjectIds = new HashSet<long> { subjectId };
         foreach (var deviceId in deviceIds.Distinct())
         {
-            await using var command = connection.CreateCommand(); command.Transaction = (SqliteTransaction)transaction;
+            await using var existing = connection.CreateCommand();
+            existing.Transaction = sqliteTransaction;
+            existing.CommandText = "SELECT SubjectId FROM SubjectDeviceMembership WHERE NetworkDeviceId=$device";
+            Add(existing, "$device", deviceId);
+            var value = await existing.ExecuteScalarAsync(cancellationToken);
+            if (value is not null and not DBNull) affectedSubjectIds.Add(Convert.ToInt64(value));
+        }
+        foreach (var affectedSubjectId in affectedSubjectIds)
+        {
+            await using var clear = connection.CreateCommand();
+            clear.Transaction = sqliteTransaction;
+            clear.CommandText = "DELETE FROM SubjectCurrentState WHERE SubjectId=$subject";
+            Add(clear, "$subject", affectedSubjectId);
+            await clear.ExecuteNonQueryAsync(cancellationToken);
+        }
+        await using (var remove = connection.CreateCommand()) { remove.Transaction = sqliteTransaction; remove.CommandText = "DELETE FROM SubjectDeviceMembership WHERE SubjectId=$id"; Add(remove, "$id", subjectId); await remove.ExecuteNonQueryAsync(cancellationToken); }
+        foreach (var deviceId in deviceIds.Distinct())
+        {
+            await using var command = connection.CreateCommand(); command.Transaction = sqliteTransaction;
             command.CommandText = "INSERT INTO SubjectDeviceMembership(SubjectId,NetworkDeviceId,CreatedAt) VALUES($subject,$device,$created) ON CONFLICT(NetworkDeviceId) DO UPDATE SET SubjectId=$subject,CreatedAt=$created";
             Add(command, "$subject", subjectId); Add(command, "$device", deviceId); Add(command, "$created", Time(createdAt)); await command.ExecuteNonQueryAsync(cancellationToken);
         }
         await using (var removeEmpty = connection.CreateCommand())
         {
-            removeEmpty.Transaction = (SqliteTransaction)transaction;
+            removeEmpty.Transaction = sqliteTransaction;
             removeEmpty.CommandText = "DELETE FROM PresenceSubject WHERE NOT EXISTS (SELECT 1 FROM SubjectDeviceMembership m WHERE m.SubjectId=PresenceSubject.Id)";
             await removeEmpty.ExecuteNonQueryAsync(cancellationToken);
         }
-        await EnsureEveryDeviceHasSubjectAsync(connection, (SqliteTransaction)transaction, createdAt, cancellationToken);
+        await EnsureEveryDeviceHasSubjectAsync(connection, sqliteTransaction, createdAt, cancellationToken);
+        await BackfillMissingSubjectCurrentStatesAsync(connection, sqliteTransaction, cancellationToken);
         await transaction.CommitAsync(cancellationToken);
     }
 
@@ -317,6 +367,51 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         }
         foreach (var device in orphans)
             await CreateStandaloneSubjectAsync(connection, transaction, device, createdAt, cancellationToken);
+    }
+
+    private static async Task BackfillMissingSubjectCurrentStatesAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        var subjectIds = new List<long>();
+        await using (var subjects = connection.CreateCommand())
+        {
+            subjects.Transaction = transaction;
+            subjects.CommandText = "SELECT s.Id FROM PresenceSubject s WHERE NOT EXISTS (SELECT 1 FROM SubjectCurrentState c WHERE c.SubjectId=s.Id) ORDER BY s.Id";
+            await using var reader = await subjects.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken)) subjectIds.Add(reader.GetInt64(0));
+        }
+
+        foreach (var subjectId in subjectIds)
+        {
+            var members = new List<NetworkDevice>();
+            await using (var devices = connection.CreateCommand())
+            {
+                devices.Transaction = transaction;
+                devices.CommandText = "SELECT d.* FROM NetworkDevice d JOIN SubjectDeviceMembership m ON m.NetworkDeviceId=d.Id WHERE m.SubjectId=$subject";
+                Add(devices, "$subject", subjectId);
+                await using var reader = await devices.ExecuteReaderAsync(cancellationToken);
+                while (await reader.ReadAsync(cancellationToken)) members.Add(ReadDevice(reader));
+            }
+
+            if (members.Count == 0) continue;
+            var state = AggregateHistoricalState(members);
+            if (state is not (PresenceState.Online or PresenceState.Offline)) continue;
+            var relevant = members.Where(value => (value.LastKnownHistoricalState ?? value.CurrentObservedState) == state).ToArray();
+            if (relevant.Length == 0) continue;
+            var candidates = relevant.Select(value => value.LastStateChangedAt ?? value.LastSeenAt).ToArray();
+            var stateSince = state == PresenceState.Online ? candidates.Min() : candidates.Max();
+            var lastObservedAt = members.Max(value => value.LastSeenAt);
+            await using var insert = connection.CreateCommand();
+            insert.Transaction = transaction;
+            insert.CommandText = "INSERT OR IGNORE INTO SubjectCurrentState(SubjectId,CurrentState,StateSince,LastObservedAt) VALUES($subject,$state,$since,$observed)";
+            Add(insert, "$subject", subjectId);
+            Add(insert, "$state", (int)state);
+            Add(insert, "$since", Time(stateSince));
+            Add(insert, "$observed", Time(lastObservedAt));
+            await insert.ExecuteNonQueryAsync(cancellationToken);
+        }
     }
 
     private static async Task CreateStandaloneSubjectAsync(SqliteConnection connection, SqliteTransaction transaction, NetworkDevice device, DateTimeOffset createdAt, CancellationToken cancellationToken)
@@ -348,12 +443,74 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         return result;
     }
 
+    public async Task<SubjectCurrentState?> GetSubjectCurrentStateAsync(long subjectId, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT SubjectId,CurrentState,StateSince,LastObservedAt FROM SubjectCurrentState WHERE SubjectId=$subject";
+        Add(command, "$subject", subjectId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadSubjectCurrentState(reader) : null;
+    }
+
+    public async Task<IReadOnlyList<SubjectCurrentState>> GetSubjectCurrentStatesAsync(
+        IReadOnlyCollection<long> subjectIds,
+        CancellationToken cancellationToken)
+    {
+        if (subjectIds.Count == 0) return [];
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        var placeholders = subjectIds.Distinct().Select((_, index) => $"$subject{index}").ToArray();
+        command.CommandText = $"SELECT SubjectId,CurrentState,StateSince,LastObservedAt FROM SubjectCurrentState WHERE SubjectId IN ({string.Join(',', placeholders)})";
+        foreach (var (subjectId, index) in subjectIds.Distinct().Select((value, index) => (value, index)))
+            Add(command, placeholders[index], subjectId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var result = new List<SubjectCurrentState>();
+        while (await reader.ReadAsync(cancellationToken)) result.Add(ReadSubjectCurrentState(reader));
+        return result;
+    }
+
+    public Task UpsertSubjectCurrentStateAsync(SubjectCurrentState state, CancellationToken cancellationToken)
+    {
+        if (state.CurrentState is not (PresenceState.Online or PresenceState.Offline))
+            throw new ArgumentOutOfRangeException(nameof(state), "主体当前状态必须是在线或离线。");
+        return ExecuteAsync(
+            "INSERT INTO SubjectCurrentState(SubjectId,CurrentState,StateSince,LastObservedAt) VALUES($subject,$state,$since,$observed) ON CONFLICT(SubjectId) DO UPDATE SET CurrentState=$state,StateSince=$since,LastObservedAt=$observed",
+            [("$subject", state.SubjectId), ("$state", (int)state.CurrentState), ("$since", Time(state.StateSince)), ("$observed", Time(state.LastObservedAt))],
+            cancellationToken);
+    }
+
+    public Task AddSubjectPresenceEventAsync(SubjectPresenceEvent value, CancellationToken cancellationToken) =>
+        ExecuteAsync("INSERT OR IGNORE INTO SubjectPresenceEvent(SubjectId,EventType,ObservedAt,MonitoringGapId) VALUES($subject,$type,$at,$gap)",
+            [("$subject", value.SubjectId), ("$type", (int)value.EventType), ("$at", Time(value.ObservedAt)), ("$gap", value.MonitoringGapId)], cancellationToken);
+
+    public async Task<IReadOnlyList<SubjectPresenceEvent>> GetSubjectPresenceEventsAsync(
+        long subjectId,
+        DateTimeOffset from,
+        DateTimeOffset to,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken); await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT * FROM SubjectPresenceEvent WHERE SubjectId=$subject AND ObservedAt >= $from AND ObservedAt <= $to ORDER BY ObservedAt DESC";
+        Add(command, "$subject", subjectId); Add(command, "$from", Time(from)); Add(command, "$to", Time(to));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var result = new List<SubjectPresenceEvent>();
+        while (await reader.ReadAsync(cancellationToken))
+            result.Add(new SubjectPresenceEvent(reader.GetInt64(0), reader.GetInt64(1),
+                (SubjectPresenceEventType)reader.GetInt32(2), ParseTime(reader.GetString(3)), reader.GetInt64(4)));
+        return result;
+    }
+
     public async Task AddSessionAsync(PresenceSession value, CancellationToken cancellationToken) =>
         await ExecuteAsync("INSERT INTO PresenceSession(DeviceId,StartedAt,EndedAt,StartKnown,EndKnown) VALUES($device,$start,$end,$sk,$ek)",
             [("$device", value.DeviceId), ("$start", Time(value.StartedAt)), ("$end", value.EndedAt is null ? null : Time(value.EndedAt.Value)), ("$sk", value.StartKnown ? 1 : 0), ("$ek", value.EndKnown ? 1 : 0)], cancellationToken);
 
     public async Task CloseOpenSessionAsync(long deviceId, DateTimeOffset endedAt, CancellationToken cancellationToken) =>
         await ExecuteAsync("UPDATE PresenceSession SET EndedAt=$end,EndKnown=1 WHERE Id=(SELECT Id FROM PresenceSession WHERE DeviceId=$device AND EndedAt IS NULL ORDER BY StartedAt DESC LIMIT 1)",
+            [("$device", deviceId), ("$end", Time(endedAt))], cancellationToken);
+
+    public async Task CloseOpenSessionAtBoundaryAsync(long deviceId, DateTimeOffset endedAt, CancellationToken cancellationToken) =>
+        await ExecuteAsync("UPDATE PresenceSession SET EndedAt=$end,EndKnown=0 WHERE DeviceId=$device AND EndedAt IS NULL AND StartedAt <= $end",
             [("$device", deviceId), ("$end", Time(endedAt))], cancellationToken);
 
     public async Task<IReadOnlyList<PresenceSession>> GetSessionsAsync(long deviceId, CancellationToken cancellationToken)
@@ -375,19 +532,79 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         return result;
     }
 
-    public async Task<long> StartMonitoringGapAsync(DateTimeOffset startedAt, string reason, CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<MonitoringGapSubjectBaseline>> GetMonitoringGapSubjectBaselinesAsync(
+        long monitoringGapId,
+        CancellationToken cancellationToken)
     {
         await using var connection = await OpenAsync(cancellationToken); await using var command = connection.CreateCommand();
-        command.CommandText = "INSERT INTO MonitoringGap(StartedAt,Reason) VALUES($at,$reason); SELECT last_insert_rowid();";
-        Add(command, "$at", Time(startedAt)); Add(command, "$reason", reason);
-        return (long)(await command.ExecuteScalarAsync(cancellationToken) ?? 0L);
+        command.CommandText = "SELECT MonitoringGapId,SubjectId,State FROM MonitoringGapSubjectBaseline WHERE MonitoringGapId=$gap";
+        Add(command, "$gap", monitoringGapId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var result = new List<MonitoringGapSubjectBaseline>();
+        while (await reader.ReadAsync(cancellationToken))
+            result.Add(new MonitoringGapSubjectBaseline(reader.GetInt64(0), reader.GetInt64(1), (PresenceState)reader.GetInt32(2)));
+        return result;
     }
 
-    public async Task EndMonitoringGapAsync(long gapId, DateTimeOffset endedAt, CancellationToken cancellationToken) =>
-        await ExecuteAsync("UPDATE MonitoringGap SET EndedAt=$end WHERE Id=$id", [("$id", gapId), ("$end", Time(endedAt))], cancellationToken);
+    public Task AddMonitoringGapSubjectBaselineAsync(MonitoringGapSubjectBaseline baseline, CancellationToken cancellationToken) =>
+        ExecuteAsync("INSERT OR IGNORE INTO MonitoringGapSubjectBaseline(MonitoringGapId,SubjectId,State) VALUES($gap,$subject,$state)",
+            [("$gap", baseline.MonitoringGapId), ("$subject", baseline.SubjectId), ("$state", (int)baseline.State)], cancellationToken);
 
-    public async Task CloseOpenMonitoringGapsAsync(DateTimeOffset endedAt, CancellationToken cancellationToken) =>
-        await ExecuteAsync("UPDATE MonitoringGap SET EndedAt=$end WHERE EndedAt IS NULL", [("$end", Time(endedAt))], cancellationToken);
+    public async Task<long> StartMonitoringGapAsync(DateTimeOffset startedAt, string reason, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        var sqliteTransaction = (SqliteTransaction)transaction;
+        await using var command = connection.CreateCommand(); command.Transaction = sqliteTransaction;
+        command.CommandText = "INSERT INTO MonitoringGap(StartedAt,Reason) VALUES($at,$reason); SELECT last_insert_rowid();";
+        Add(command, "$at", Time(startedAt)); Add(command, "$reason", reason);
+        var id = (long)(await command.ExecuteScalarAsync(cancellationToken) ?? 0L);
+        await CloseOpenSessionsAtAsync(connection, sqliteTransaction, startedAt, cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        return id;
+    }
+
+    public async Task EndMonitoringGapAsync(long gapId, DateTimeOffset endedAt, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        var sqliteTransaction = (SqliteTransaction)transaction;
+        await ExecuteInTransactionAsync(connection, sqliteTransaction,
+            "UPDATE PresenceSession SET EndedAt=(SELECT StartedAt FROM MonitoringGap WHERE Id=$id),EndKnown=0 WHERE EndedAt IS NULL AND StartedAt <= (SELECT StartedAt FROM MonitoringGap WHERE Id=$id)",
+            [("$id", gapId)], cancellationToken);
+        await ExecuteInTransactionAsync(connection, sqliteTransaction,
+            "UPDATE MonitoringGap SET EndedAt=$end WHERE Id=$id",
+            [("$id", gapId), ("$end", Time(endedAt))], cancellationToken);
+        await ExecuteInTransactionAsync(connection, sqliteTransaction,
+            "DELETE FROM MonitoringGapSubjectBaseline WHERE MonitoringGapId=$id",
+            [("$id", gapId)], cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    public async Task CloseOpenMonitoringGapsAsync(DateTimeOffset endedAt, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        var sqliteTransaction = (SqliteTransaction)transaction;
+        var starts = new List<DateTimeOffset>();
+        await using (var command = connection.CreateCommand())
+        {
+            command.Transaction = sqliteTransaction;
+            command.CommandText = "SELECT StartedAt FROM MonitoringGap WHERE EndedAt IS NULL AND StartedAt < $end ORDER BY StartedAt";
+            Add(command, "$end", Time(endedAt));
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken)) starts.Add(ParseTime(reader.GetString(0)));
+        }
+        foreach (var start in starts)
+            await CloseOpenSessionsAtAsync(connection, sqliteTransaction, start, cancellationToken);
+        await ExecuteInTransactionAsync(connection, sqliteTransaction,
+            "DELETE FROM MonitoringGapSubjectBaseline WHERE MonitoringGapId IN (SELECT Id FROM MonitoringGap WHERE EndedAt IS NULL AND StartedAt < $end)",
+            [("$end", Time(endedAt))], cancellationToken);
+        await ExecuteInTransactionAsync(connection, sqliteTransaction,
+            "UPDATE MonitoringGap SET EndedAt=$end WHERE EndedAt IS NULL AND StartedAt < $end",
+            [("$end", Time(endedAt))], cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+    }
 
     public async Task<long> StartApplicationRunAsync(DateTimeOffset startedAt, CancellationToken cancellationToken)
     {
@@ -406,8 +623,9 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
             if (gapStart < startedAt)
             {
                 await using var gap = connection.CreateCommand(); gap.Transaction = (SqliteTransaction)transaction;
-                gap.CommandText = "INSERT OR IGNORE INTO MonitoringGap(StartedAt,EndedAt,Reason) VALUES($start,$end,'UnexpectedTermination')";
-                Add(gap, "$start", Time(gapStart)); Add(gap, "$end", Time(startedAt)); await gap.ExecuteNonQueryAsync(cancellationToken);
+                gap.CommandText = "INSERT OR IGNORE INTO MonitoringGap(StartedAt,EndedAt,Reason) VALUES($start,NULL,'UnexpectedTermination')";
+                Add(gap, "$start", Time(gapStart)); await gap.ExecuteNonQueryAsync(cancellationToken);
+                await CloseOpenSessionsAtAsync(connection, (SqliteTransaction)transaction, gapStart, cancellationToken);
             }
             await using var close = connection.CreateCommand(); close.Transaction = (SqliteTransaction)transaction;
             close.CommandText = "UPDATE ApplicationRun SET EndedAt=$end WHERE Id=$id"; Add(close, "$end", Time(startedAt)); Add(close, "$id", previousId.Value); await close.ExecuteNonQueryAsync(cancellationToken);
@@ -581,11 +799,13 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
     {
         if (sourceSubjectId <= 0 || targetSubjectId <= 0 || sourceSubjectId == targetSubjectId) throw new ArgumentException("需要选择两个不同的主体。", nameof(sourceSubjectId));
         await using var connection = await OpenAsync(cancellationToken); await using var transaction = await connection.BeginTransactionAsync(cancellationToken); var sqliteTransaction = (SqliteTransaction)transaction;
+        await ExecuteInTransactionAsync(connection, sqliteTransaction, "DELETE FROM SubjectCurrentState WHERE SubjectId=$target", [("$target", targetSubjectId)], cancellationToken);
         await ExecuteInTransactionAsync(connection, sqliteTransaction, "INSERT INTO SubjectDeviceMembership(SubjectId,NetworkDeviceId,CreatedAt) SELECT $target,NetworkDeviceId,$created FROM SubjectDeviceMembership WHERE SubjectId=$source ON CONFLICT(NetworkDeviceId) DO UPDATE SET SubjectId=$target,CreatedAt=$created", [("$source", sourceSubjectId), ("$target", targetSubjectId), ("$created", Time(updatedAt))], cancellationToken);
         await ExecuteInTransactionAsync(connection, sqliteTransaction, "DELETE FROM NotificationRule AS source WHERE source.SubjectId=$source AND EXISTS (SELECT 1 FROM NotificationRule t WHERE t.SubjectId=$target AND t.RuleCondition=source.RuleCondition AND t.ThresholdSeconds=source.ThresholdSeconds AND t.Channel=source.Channel AND t.TargetType=source.TargetType AND t.TargetId=source.TargetId AND t.MessageTemplate=source.MessageTemplate)", [("$source", sourceSubjectId), ("$target", targetSubjectId)], cancellationToken);
         await ExecuteInTransactionAsync(connection, sqliteTransaction, "UPDATE NotificationRule SET SubjectId=$target,UpdatedAt=$updated WHERE SubjectId=$source", [("$source", sourceSubjectId), ("$target", targetSubjectId), ("$updated", Time(updatedAt))], cancellationToken);
         await ExecuteInTransactionAsync(connection, sqliteTransaction, "UPDATE NotificationDelivery SET SubjectId=$target WHERE SubjectId=$source", [("$source", sourceSubjectId), ("$target", targetSubjectId)], cancellationToken);
         await ExecuteInTransactionAsync(connection, sqliteTransaction, "DELETE FROM PresenceSubject WHERE Id=$source", [("$source", sourceSubjectId)], cancellationToken);
+        await BackfillMissingSubjectCurrentStatesAsync(connection, sqliteTransaction, cancellationToken);
         await transaction.CommitAsync(cancellationToken);
     }
 
@@ -668,6 +888,11 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         return await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
+    private static Task CloseOpenSessionsAtAsync(SqliteConnection connection, SqliteTransaction transaction, DateTimeOffset boundary, CancellationToken cancellationToken) =>
+        ExecuteInTransactionAsync(connection, transaction,
+            "UPDATE PresenceSession SET EndedAt=$end,EndKnown=0 WHERE EndedAt IS NULL AND StartedAt <= $end",
+            [("$end", Time(boundary))], cancellationToken);
+
     private static NotificationRule NormalizeRule(NotificationRule value)
     {
         if (value.SubjectId <= 0) throw new ArgumentException("通知规则必须绑定到主体。", nameof(value));
@@ -718,8 +943,17 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         Add(command, "$historical", (int)(value.LastKnownHistoricalState ?? value.CurrentState));
     }
 
+    private static PresenceState AggregateHistoricalState(IEnumerable<NetworkDevice> members)
+    {
+        var states = members.Select(value => value.LastKnownHistoricalState ?? value.CurrentObservedState).ToArray();
+        if (states.Contains(PresenceState.Online)) return PresenceState.Online;
+        if (states.Contains(PresenceState.Unknown)) return PresenceState.Unknown;
+        return PresenceState.Offline;
+    }
+
     private static Router ReadRouter(SqliteDataReader reader) => new(reader.GetInt64(reader.GetOrdinal("Id")), reader.GetString(reader.GetOrdinal("MiotDid")), reader.GetString(reader.GetOrdinal("MiotModel")), reader.GetString(reader.GetOrdinal("PartnerId")), reader.GetString(reader.GetOrdinal("Name")), Text(reader, "HomeId"), Text(reader, "RoomId"), ParseTime(reader.GetString(reader.GetOrdinal("CreatedAt"))), ParseTime(reader.GetString(reader.GetOrdinal("LastSeenAt"))));
     private static PresenceSubject ReadSubject(SqliteDataReader reader) => new(reader.GetInt64(reader.GetOrdinal("Id")), Guid.Parse(reader.GetString(reader.GetOrdinal("ExportId"))), reader.GetString(reader.GetOrdinal("DisplayName")), Text(reader, "Note"), ParseTime(reader.GetString(reader.GetOrdinal("CreatedAt"))), ParseTime(reader.GetString(reader.GetOrdinal("UpdatedAt"))));
+    private static SubjectCurrentState ReadSubjectCurrentState(SqliteDataReader reader) => new(reader.GetInt64(reader.GetOrdinal("SubjectId")), (PresenceState)reader.GetInt32(reader.GetOrdinal("CurrentState")), ParseTime(reader.GetString(reader.GetOrdinal("StateSince"))), ParseTime(reader.GetString(reader.GetOrdinal("LastObservedAt"))));
     private static NetworkDevice ReadDevice(SqliteDataReader reader)
     {
         var device = new NetworkDevice(reader.GetInt64(reader.GetOrdinal("Id")), reader.GetInt64(reader.GetOrdinal("RouterId")), reader.GetString(reader.GetOrdinal("MacAddress")), Text(reader, "OriginalName"), Text(reader, "OriginName"), Text(reader, "CustomName"), Text(reader, "Note"), Text(reader, "LastIp"), Text(reader, "ConnectionType"), Integer(reader, "Signal"), (PresenceState)reader.GetInt32(reader.GetOrdinal("CurrentState")), ParseTime(reader.GetString(reader.GetOrdinal("FirstSeenAt"))), ParseTime(reader.GetString(reader.GetOrdinal("LastSeenAt"))), Text(reader, "LastStateChangedAt") is { } changed ? ParseTime(changed) : null);

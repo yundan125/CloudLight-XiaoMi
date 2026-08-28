@@ -75,7 +75,7 @@ public sealed class SubjectPresenceTests
     }
 
     [Fact]
-    public async Task MonitoringGapDoesNotBecomeAConfirmedAggregateStateChange()
+    public async Task MonitoringGapDoesNotResetPersistedAggregateStateSince()
     {
         await WithSubject(async (repository, service, subject, a, _) =>
         {
@@ -83,11 +83,11 @@ public sealed class SubjectPresenceTests
             var gap = await repository.StartMonitoringGapAsync(At(11), "restart", CancellationToken.None); await repository.EndMonitoringGapAsync(gap, At(11).AddSeconds(10), CancellationToken.None);
             var firstFact = await service.GetCurrentFactAsync(subject.Id, At(12), CancellationToken.None); var secondFact = await service.GetCurrentFactAsync(subject.Id, At(12).AddMinutes(2), CancellationToken.None);
             var first = await service.GetSnapshotAsync(subject.Id, At(12), CancellationToken.None); var second = await service.GetSnapshotAsync(subject.Id, At(12).AddMinutes(2), CancellationToken.None);
-            Assert.Equal(PresenceState.Online, firstFact!.CurrentState); Assert.False(firstFact.StateSinceKnown); Assert.Null(firstFact.StateSince); Assert.Equal(TimeSpan.Zero, firstFact.ConfirmedDuration);
-            Assert.Equal(PresenceState.Online, secondFact!.CurrentState); Assert.False(secondFact.StateSinceKnown); Assert.Null(secondFact.StateSince); Assert.Null(first!.ConfirmedStateSince); Assert.Null(second!.ConfirmedStateSince); Assert.Null(second.LastStateChangedAt);
+            Assert.Equal(PresenceState.Online, firstFact!.CurrentState); Assert.True(firstFact.StateSinceKnown); Assert.Equal(started, firstFact.StateSince); Assert.Equal(TimeSpan.FromHours(2), firstFact.ConfirmedDuration);
+            Assert.Equal(PresenceState.Online, secondFact!.CurrentState); Assert.True(secondFact.StateSinceKnown); Assert.Equal(started, secondFact.StateSince); Assert.Equal(started, first!.ConfirmedStateSince); Assert.Equal(started, second!.ConfirmedStateSince); Assert.Equal(started, second.LastStateChangedAt);
             var timeline = await service.GetTimelineAsync(subject.Id, started, At(12), CancellationToken.None);
             var hidden = SubjectActivityBuilder.Build(timeline, includeUnknownPeriods: false); Assert.Single(hidden); Assert.Equal(new SubjectActivityItem(started, SubjectActivityType.Online), hidden[0]);
-            var shown = SubjectActivityBuilder.Build(timeline, includeUnknownPeriods: true); Assert.Equal([SubjectActivityType.Online, SubjectActivityType.UnknownPeriod, SubjectActivityType.Online], shown.Select(value => value.Type).ToArray());
+            var shown = SubjectActivityBuilder.Build(timeline, includeUnknownPeriods: true); Assert.Equal([SubjectActivityType.UnknownPeriod, SubjectActivityType.Online], shown.Select(value => value.Type).ToArray());
         }, aOnline: true);
     }
 
@@ -127,7 +127,7 @@ public sealed class SubjectPresenceTests
         {
             var from = At(10); var to = At(14); await repository.AddSessionAsync(new(0, a.Id, from, At(12), true, true), CancellationToken.None); await repository.AddSessionAsync(new(0, b.Id, At(11), At(13), true, true), CancellationToken.None);
             var gap = await repository.StartMonitoringGapAsync(At(11).AddMinutes(30), "test", CancellationToken.None); await repository.EndMonitoringGapAsync(gap, At(12), CancellationToken.None);
-            var statistics = await service.GetSubjectStatisticsAsync(subject.Id, from, to, CancellationToken.None); Assert.Equal(TimeSpan.FromHours(2.5), statistics.KnownOnlineDuration); Assert.Equal(TimeSpan.FromMinutes(30), statistics.UnknownDuration);
+            var statistics = await service.GetSubjectStatisticsAsync(subject.Id, from, to, CancellationToken.None); Assert.Equal(TimeSpan.FromHours(1.5), statistics.KnownOnlineDuration); Assert.Equal(TimeSpan.FromMinutes(30), statistics.UnknownDuration);
         });
     }
 

@@ -27,7 +27,12 @@ internal sealed record MigateSessionMaterial(
         ServiceToken, Ssecurity, createdAt ?? DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
 }
 
-public sealed class XiaomiCloudException(string message, bool authenticationExpired = false, Exception? inner = null) : Exception(message, inner)
+public sealed class XiaomiCloudException(
+    string message,
+    bool authenticationExpired = false,
+    Exception? inner = null,
+    int? xiaomiCode = null) : Exception(message, inner)
 {
     public bool AuthenticationExpired { get; } = authenticationExpired;
+    public int? XiaomiCode { get; } = xiaomiCode;
 }

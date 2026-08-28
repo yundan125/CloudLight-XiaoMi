@@ -26,8 +26,9 @@ public sealed class NotificationRuleService(IPresenceRepository repository, ISub
                     ? await repository.GetNotificationDeliveryAsync(pendingId, cancellationToken)
                     : null;
                 if (pending is { Status: NotificationDeliveryStatus.Canceled or NotificationDeliveryStatus.Delivered }) pending = null;
-                var currentEpisodeId = fact.StateSinceKnown && (fact.CurrentState is PresenceState.Online or PresenceState.Offline)
-                    ? EpisodeId(fact.CurrentState, fact.StateSince!.Value)
+                var notificationStateSince = fact.NotificationStateSince;
+                var currentEpisodeId = notificationStateSince is not null && (fact.CurrentState is PresenceState.Online or PresenceState.Offline)
+                    ? EpisodeId(fact.CurrentState, notificationStateSince.Value)
                     : null;
                 var currentStateChanged = !string.Equals(state.CurrentEpisodeId, currentEpisodeId, StringComparison.Ordinal);
 
@@ -36,7 +37,7 @@ public sealed class NotificationRuleService(IPresenceRepository repository, ISub
                     state = state with
                     {
                         CurrentEpisodeId = currentEpisodeId,
-                        StateSince = currentEpisodeId is null ? null : fact.StateSince,
+                        StateSince = notificationStateSince,
                         TriggeredForCurrentEpisode = false,
                         TriggeredAt = null,
                         PendingDelivery = pending is { Status: not NotificationDeliveryStatus.Delivered },
@@ -75,8 +76,11 @@ public sealed class NotificationRuleService(IPresenceRepository repository, ISub
                     requests.Add(ToRequest(pending));
 
                 var expectedState = rule.Condition == NotificationCondition.OnlineFor ? PresenceState.Online : PresenceState.Offline;
+                var notificationDuration = notificationStateSince is { } safeSince
+                    ? now > safeSince ? now - safeSince : TimeSpan.Zero
+                    : TimeSpan.Zero;
                 var thresholdReached = currentEpisodeId is not null &&
-                    fact.CurrentState == expectedState && fact.StateSinceKnown && fact.ConfirmedDuration >= TimeSpan.FromSeconds(rule.ThresholdSeconds);
+                    fact.CurrentState == expectedState && notificationDuration >= TimeSpan.FromSeconds(rule.ThresholdSeconds);
                 if (pending is null && currentDelivery is null && thresholdReached && !state.TriggeredForCurrentEpisode)
                 {
                     var message = NotificationTemplateRenderer.Render(rule, fact, now);
@@ -86,7 +90,7 @@ public sealed class NotificationRuleService(IPresenceRepository repository, ISub
                     state = state with
                     {
                         CurrentEpisodeId = currentEpisodeId,
-                        StateSince = fact.StateSince,
+                        StateSince = notificationStateSince,
                         TriggeredForCurrentEpisode = true,
                         TriggeredAt = now,
                         PendingDelivery = true,

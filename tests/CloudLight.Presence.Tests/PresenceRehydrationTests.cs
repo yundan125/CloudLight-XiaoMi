@@ -55,7 +55,7 @@ public sealed class PresenceRehydrationTests
     }
 
     [Fact]
-    public async Task ImportDoesNotCarryOnlineDurationAcrossMonitoringGap()
+    public async Task ImportPreservesOnlineStateSinceAcrossMonitoringGap()
     {
         var now = At(12); var onlineSince = now.AddHours(-6); var gapStart = now.AddHours(-2); var gapEnd = now.AddHours(-1); var sourceRoot = TemporaryRoot(); var targetRoot = TemporaryRoot(); var backup = TemporaryFile();
         try
@@ -65,7 +65,7 @@ public sealed class PresenceRehydrationTests
             var gap = await source.StartMonitoringGapAsync(gapStart, "导入测试", CancellationToken.None); await source.EndMonitoringGapAsync(gap, gapEnd, CancellationToken.None); await new PresenceDataTransferService(new AppPaths(sourceRoot)).ExportAsync(backup, CancellationToken.None);
 
             var target = await CreateRepositoryAsync(targetRoot); await new PresenceDataTransferService(new AppPaths(targetRoot)).ImportAsync(backup, CancellationToken.None); var importedSubject = Assert.Single(await target.GetSubjectsAsync(CancellationToken.None)); var service = new SubjectPresenceService(target, new PresenceStatisticsService(target)); var fact = await service.GetCurrentFactAsync(importedSubject.Id, now, CancellationToken.None); var timeline = await service.GetTimelineAsync(importedSubject.Id, onlineSince, now, CancellationToken.None);
-            Assert.Equal(PresenceState.Online, fact!.CurrentState); Assert.False(fact.StateSinceKnown); Assert.Null(fact.StateSince); Assert.Equal(TimeSpan.Zero, fact.ConfirmedDuration); Assert.Contains(timeline, value => value.State == PresenceState.Unknown && value.Start == gapStart && value.End == gapEnd);
+            Assert.Equal(PresenceState.Online, fact!.CurrentState); Assert.True(fact.StateSinceKnown); Assert.Equal(onlineSince, fact.StateSince); Assert.Equal(TimeSpan.FromHours(6), fact.ConfirmedDuration); Assert.Contains(timeline, value => value.State == PresenceState.Unknown && value.Start == gapStart && value.End == gapEnd);
         }
         finally { Delete(sourceRoot); Delete(targetRoot); Delete(backup); }
     }
@@ -109,14 +109,18 @@ public sealed class PresenceRehydrationTests
         finally { Delete(root); }
     }
 
-    [Fact]
-    public async Task RestartWithMonitoringGapDoesNotInventStateSince()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task RestartWithMonitoringGapAndSameStatePreservesStateSince(bool online)
     {
-        var root = TemporaryRoot(); var stateSince = At(6); var gapStart = At(8); var gapEnd = At(9); var now = At(12);
+        var root = TemporaryRoot(); var stateSince = At(6); var gapStart = At(8); var now = At(12);
         try
         {
-            var fixture = await CreateRuntimeFixtureAsync(root, PresenceState.Online, stateSince); var gap = await fixture.Repository.StartMonitoringGapAsync(gapStart, "restart", CancellationToken.None); await fixture.Repository.EndMonitoringGapAsync(gap, gapEnd, CancellationToken.None); var reopened = await CreateRepositoryAsync(root); await new PresenceStateMachine(reopened).ApplySnapshotAsync(fixture.Router.Id, [Observation(fixture.Device, true)], now, CancellationToken.None); var service = new SubjectPresenceService(reopened, new PresenceStatisticsService(reopened)); var fact = await service.GetCurrentFactAsync(fixture.Subject.Id, now, CancellationToken.None); var timeline = await service.GetTimelineAsync(fixture.Subject.Id, stateSince, now, CancellationToken.None);
-            Assert.Equal(PresenceState.Online, fact!.CurrentState); Assert.False(fact.StateSinceKnown); Assert.Null(fact.StateSince); Assert.Equal(TimeSpan.Zero, fact.ConfirmedDuration); Assert.Contains(timeline, value => value.State == PresenceState.Unknown && value.Start == gapStart && value.End == gapEnd);
+            var expected = online ? PresenceState.Online : PresenceState.Offline;
+            var fixture = await CreateRuntimeFixtureAsync(root, expected, stateSince); var gap = await fixture.Repository.StartMonitoringGapAsync(gapStart, "restart", CancellationToken.None); var reopened = await CreateRepositoryAsync(root); await new PresenceStateMachine(reopened).ApplySnapshotAsync(fixture.Router.Id, [Observation(fixture.Device, online)], now, CancellationToken.None); await reopened.EndMonitoringGapAsync(gap, now, CancellationToken.None); var service = new SubjectPresenceService(reopened, new PresenceStatisticsService(reopened)); var fact = await service.GetCurrentFactAsync(fixture.Subject.Id, now, CancellationToken.None); var timeline = await service.GetTimelineAsync(fixture.Subject.Id, stateSince, now, CancellationToken.None);
+            var persisted = await reopened.GetSubjectCurrentStateAsync(fixture.Subject.Id, CancellationToken.None);
+            Assert.Equal(expected, fact!.CurrentState); Assert.True(fact.StateSinceKnown); Assert.Equal(stateSince, fact.StateSince); Assert.Equal(TimeSpan.FromHours(6), fact.ConfirmedDuration); Assert.Equal(stateSince, persisted!.StateSince); Assert.Equal(now, persisted.LastObservedAt); Assert.Empty(await reopened.GetSubjectPresenceEventsAsync(fixture.Subject.Id, stateSince, now, CancellationToken.None)); Assert.Contains(timeline, value => value.State == PresenceState.Unknown && value.Start == gapStart && value.End == now);
         }
         finally { Delete(root); }
     }

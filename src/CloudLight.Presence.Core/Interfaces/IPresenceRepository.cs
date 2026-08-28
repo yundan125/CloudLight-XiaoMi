@@ -25,10 +25,18 @@ public interface IPresenceRepository
     Task SetSubjectDevicesAsync(long subjectId, IReadOnlyCollection<long> deviceIds, DateTimeOffset createdAt, CancellationToken cancellationToken);
     Task AddEventAsync(PresenceEvent presenceEvent, CancellationToken cancellationToken);
     Task<IReadOnlyList<PresenceEvent>> GetEventsAsync(long deviceId, CancellationToken cancellationToken);
+    Task<SubjectCurrentState?> GetSubjectCurrentStateAsync(long subjectId, CancellationToken cancellationToken);
+    Task<IReadOnlyList<SubjectCurrentState>> GetSubjectCurrentStatesAsync(IReadOnlyCollection<long> subjectIds, CancellationToken cancellationToken);
+    Task UpsertSubjectCurrentStateAsync(SubjectCurrentState state, CancellationToken cancellationToken);
+    Task AddSubjectPresenceEventAsync(SubjectPresenceEvent presenceEvent, CancellationToken cancellationToken);
+    Task<IReadOnlyList<SubjectPresenceEvent>> GetSubjectPresenceEventsAsync(long subjectId, DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken);
     Task AddSessionAsync(PresenceSession session, CancellationToken cancellationToken);
     Task CloseOpenSessionAsync(long deviceId, DateTimeOffset endedAt, CancellationToken cancellationToken);
+    Task CloseOpenSessionAtBoundaryAsync(long deviceId, DateTimeOffset endedAt, CancellationToken cancellationToken);
     Task<IReadOnlyList<PresenceSession>> GetSessionsAsync(long deviceId, CancellationToken cancellationToken);
     Task<IReadOnlyList<MonitoringGap>> GetMonitoringGapsAsync(DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken);
+    Task<IReadOnlyList<MonitoringGapSubjectBaseline>> GetMonitoringGapSubjectBaselinesAsync(long monitoringGapId, CancellationToken cancellationToken);
+    Task AddMonitoringGapSubjectBaselineAsync(MonitoringGapSubjectBaseline baseline, CancellationToken cancellationToken);
     Task<long> StartMonitoringGapAsync(DateTimeOffset startedAt, string reason, CancellationToken cancellationToken);
     Task EndMonitoringGapAsync(long gapId, DateTimeOffset endedAt, CancellationToken cancellationToken);
     Task CloseOpenMonitoringGapsAsync(DateTimeOffset endedAt, CancellationToken cancellationToken);

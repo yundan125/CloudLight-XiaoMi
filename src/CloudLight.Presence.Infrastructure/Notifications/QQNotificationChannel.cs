@@ -13,7 +13,7 @@ public sealed class QQNotificationChannel : INotificationChannel, IAsyncDisposab
 {
     private const string ApiBaseUrl = "https://api.sgroup.qq.com";
     private const string TokenEndpoint = "https://bots.qq.com/app/getAppAccessToken";
-    private const string UserAgent = "CloudLight-XiaoMi/1.2.1";
+    private const string UserAgent = "CloudLight-XiaoMi/2.1.0";
     private const int GroupAndC2CIntent = 1 << 25;
     private const int DefaultRequestTimeoutSeconds = 15;
     private const int DefaultConnectTimeoutSeconds = 20;

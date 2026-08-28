@@ -9,7 +9,7 @@ namespace CloudLight.Presence.App.ViewModels;
 public sealed class SubjectDetailViewModel : ObservableObject, IDisposable
 {
     private readonly IPresenceRepository _repository; private readonly ISubjectPresenceService _presence; private readonly PresenceMonitor _monitor; private readonly SemaphoreSlim _gate = new(1, 1); private readonly DispatcherTimer _timer;
-    private PresenceSubject _subject; private SubjectPresenceSnapshot? _snapshot; private string _displayName; private string? _note; private string _nameDraft; private string? _noteDraft; private bool _isNameEditing; private bool _isNoteEditing; private bool _showUnrecordedPeriods; private string _duration = "未知"; private string _saveStatus = ""; private DateTimeOffset _timelineFrom; private DateTimeOffset _timelineTo; private int _timelineDays = 1; private string _selectedRange = "24小时"; private IReadOnlyList<PresenceTimelineSegment> _historySource = [];
+    private PresenceSubject _subject; private SubjectPresenceSnapshot? _snapshot; private string _displayName; private string? _note; private string _nameDraft; private string? _noteDraft; private bool _isNameEditing; private bool _isNoteEditing; private bool _showUnrecordedPeriods; private string _duration = "未知"; private string _saveStatus = ""; private DateTimeOffset _timelineFrom; private DateTimeOffset _timelineTo; private int _timelineDays = 1; private string _selectedRange = "24小时"; private IReadOnlyList<PresenceTimelineSegment> _historySource = []; private IReadOnlyList<SubjectPresenceEvent> _detectedAfterGap = [];
     public SubjectDetailViewModel(IPresenceRepository repository, ISubjectPresenceService presence, PresenceMonitor monitor, PresenceSubject subject)
     {
         _repository = repository; _presence = presence; _monitor = monitor; _subject = subject; _displayName = subject.DisplayName; _note = subject.Note; _nameDraft = subject.DisplayName; _noteDraft = subject.Note;
@@ -25,7 +25,8 @@ public sealed class SubjectDetailViewModel : ObservableObject, IDisposable
     public PresenceState CurrentState => _snapshot?.CurrentState ?? PresenceState.Unknown; public string State => CurrentState switch { PresenceState.Online => "在线", PresenceState.Offline => "离线", _ => "未知" }; public string StateMark => CurrentState == PresenceState.Online ? "●" : CurrentState == PresenceState.Offline ? "○" : "◇"; public string StateColor => CurrentState == PresenceState.Online ? "#16A34A" : CurrentState == PresenceState.Offline ? "#64748B" : "#D97706"; public string CurrentConnection => CurrentState == PresenceState.Unknown ? "正在检测在线设备" : _snapshot?.ActiveDevice is null ? "当前没有在线设备" : $"当前：{_snapshot.ActiveDevice.ConnectionType ?? "连接方式未知"} · {(_snapshot.ActiveDevice.Signal is null ? "-" : $"{_snapshot.ActiveDevice.Signal} dBm")}";
     public string Duration { get => _duration; private set => Set(ref _duration, value); } public string SaveStatus { get => _saveStatus; private set => Set(ref _saveStatus, value); }
     public ObservableCollection<SubjectMemberViewModel> Members { get; } = []; public ObservableCollection<StatisticCardViewModel> Statistics { get; } = []; public ObservableCollection<PresenceTimelineSegment> Timeline { get; } = []; public ObservableCollection<HistoryItemViewModel> History { get; } = [];
-    public bool HasNoMembers => Members.Count == 0; public bool HasNoHistory => History.Count == 0;
+    public bool HasNoMembers => Members.Count == 0; public bool HasNoHistory => History.Count == 0; public bool HasDetectedAfterGapActivities => _detectedAfterGap.Count > 0;
+    public string DetectedAfterGapExplanation => "软件未运行或暂时无法监控期间状态可能已经发生变化；这里显示的是重新开始监控后首次检测到的时间。";
     public DateTimeOffset TimelineFrom { get => _timelineFrom; private set => Set(ref _timelineFrom, value); } public DateTimeOffset TimelineTo { get => _timelineTo; private set => Set(ref _timelineTo, value); } public int TimelineDays { get => _timelineDays; private set => Set(ref _timelineDays, value); } public string SelectedRange { get => _selectedRange; private set => Set(ref _selectedRange, value); }
     public AsyncRelayCommand Show24HoursCommand { get; } public AsyncRelayCommand Show3DaysCommand { get; } public AsyncRelayCommand Show7DaysCommand { get; } public AsyncRelayCommand Show30DaysCommand { get; } public AsyncRelayCommand SaveCommand { get; }
     public RelayCommand BeginNameEditCommand { get; } public RelayCommand CancelNameEditCommand { get; } public AsyncRelayCommand SaveNameCommand { get; } public RelayCommand BeginNoteEditCommand { get; } public RelayCommand CancelNoteEditCommand { get; } public AsyncRelayCommand SaveNoteCommand { get; }
@@ -46,12 +47,19 @@ public sealed class SubjectDetailViewModel : ObservableObject, IDisposable
     private async Task LoadTimelineCoreAsync(int days, string label)
     {
         var to = DateTimeOffset.UtcNow; var from = to.AddDays(-days); var values = await _presence.GetTimelineAsync(Subject.Id, from, to, CancellationToken.None); Timeline.Clear(); foreach (var value in values) Timeline.Add(value); TimelineFrom = from; TimelineTo = to; TimelineDays = days; SelectedRange = label;
-        _historySource = values; RebuildHistory();
+        _historySource = values; _detectedAfterGap = await _repository.GetSubjectPresenceEventsAsync(Subject.Id, from, to, CancellationToken.None); RebuildHistory();
     }
     private void RebuildHistory()
     {
-        var activities = SubjectActivityBuilder.Build(_historySource, ShowUnrecordedPeriods, 15);
-        History.Clear(); foreach (var value in activities) History.Add(value.Type switch { SubjectActivityType.Online => new(value.OccurredAtUtc.ToLocalTime(), "已上线", "#16803A", "●"), SubjectActivityType.Offline => new(value.OccurredAtUtc.ToLocalTime(), "已离线", "#64748B", "○"), _ => new(value.OccurredAtUtc.ToLocalTime(), "暂无监控数据", "#94A3B8", "◇") }); Raise(nameof(HasNoHistory));
+        var activities = SubjectActivityBuilder.Build(_historySource, ShowUnrecordedPeriods, _detectedAfterGap, 15);
+        History.Clear(); foreach (var value in activities) History.Add(value.Type switch
+        {
+            SubjectActivityType.Online => new(value.OccurredAtUtc.ToLocalTime(), "已上线", "#16803A", "●"),
+            SubjectActivityType.Offline => new(value.OccurredAtUtc.ToLocalTime(), "已离线", "#64748B", "○"),
+            SubjectActivityType.DetectedOnlineAfterGap => new(value.OccurredAtUtc.ToLocalTime(), "检测到已上线", "#16803A", "●"),
+            SubjectActivityType.DetectedOfflineAfterGap => new(value.OccurredAtUtc.ToLocalTime(), "检测到已离线", "#64748B", "○"),
+            _ => new(value.OccurredAtUtc.ToLocalTime(), "暂无监控数据", "#94A3B8", "◇")
+        }); Raise(nameof(HasNoHistory)); Raise(nameof(HasDetectedAfterGapActivities));
     }
     private async Task SaveAsync() { await _repository.UpdateSubjectAsync(Subject.Id, DisplayName, Note, DateTimeOffset.UtcNow, CancellationToken.None); SaveStatus = "已保存"; await ReloadAsync(); }
     public void BeginNameEdit() { NameDraft = DisplayName; IsNameEditing = true; }

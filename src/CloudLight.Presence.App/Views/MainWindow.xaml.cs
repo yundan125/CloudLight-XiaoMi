@@ -15,12 +15,15 @@ public partial class MainWindow : Window
 {
     private readonly MainViewModel _viewModel; private readonly IPresenceRepository _repository; private readonly ISubjectPresenceService _subjectPresence; private readonly PresenceMonitor _monitor; private readonly PresenceDataTransferService _transfer; private readonly StartupRegistrationService _startup;
     private readonly long _runId; private readonly NotificationRuntime _notificationRuntime; private readonly XiaomiConnectionAlertService _connectionAlerts; private readonly QQNotificationChannel _qqChannel; private readonly NotificationDispatcher _notificationDispatcher;
-    private readonly Forms.NotifyIcon _tray; private readonly Forms.ToolStripMenuItem _monitorItem; private readonly Forms.ToolStripMenuItem _startupItem; private readonly Forms.ToolStripMenuItem _minimizedItem; private bool _exiting; private SettingsWindow? _settingsWindow;
+    private readonly Forms.NotifyIcon _tray; private readonly Forms.ToolStripMenuItem _monitorItem; private readonly Forms.ToolStripMenuItem _startupItem; private readonly Forms.ToolStripMenuItem _minimizedItem; private bool _exiting; private SettingsWindow? _settingsWindow; private QqReminderWindow? _qqReminderWindow;
+    private int _xiaomiDetailNavigationRequest;
     private readonly AppPaths _paths;
     public MainWindow(MainViewModel viewModel, IPresenceRepository repository, ISubjectPresenceService subjectPresence, PresenceMonitor monitor, PresenceDataTransferService transfer, StartupRegistrationService startup, AppPaths paths, long runId, NotificationRuntime notificationRuntime, XiaomiConnectionAlertService connectionAlerts, QQNotificationChannel qqChannel, NotificationDispatcher notificationDispatcher)
     {
         InitializeComponent(); DataContext = viewModel; _viewModel = viewModel; _repository = repository; _subjectPresence = subjectPresence; _monitor = monitor; _transfer = transfer; _startup = startup; _paths = paths; _runId = runId; _notificationRuntime = notificationRuntime; _connectionAlerts = connectionAlerts; _qqChannel = qqChannel; _notificationDispatcher = notificationDispatcher;
         viewModel.OpenSubjectRequested += async (_, subject) => await OpenSubjectAsync(subject);
+        viewModel.OpenRouterPresenceRequested += (_, router) => _viewModel.ShowRouterPresence(router);
+        viewModel.OpenXiaomiAccountDeviceRequested += async (_, device) => await OpenXiaomiAccountDeviceAsync(device);
         _tray = new Forms.NotifyIcon { Icon = LoadTrayIcon(), Text = "CloudLight XiaoMi", Visible = true };
         var menu = new Forms.ContextMenuStrip(); menu.Items.Add("打开 CloudLight XiaoMi", null, (_, _) => ShowFromTray()); menu.Items.Add(new Forms.ToolStripSeparator());
         _monitorItem = new Forms.ToolStripMenuItem("暂停监控", null, async (_, _) => await ToggleMonitoringAsync()); menu.Items.Add(_monitorItem); menu.Items.Add(new Forms.ToolStripSeparator());
@@ -37,22 +40,104 @@ public partial class MainWindow : Window
         if (_viewModel.SelectedRouter is null) return; var vm = new SubjectDetailViewModel(_repository, _subjectPresence, _monitor, subject); vm.OpenDeviceRequested += async (_, device) => await OpenDeviceAsync(device); await vm.LoadAsync();
         var window = new SubjectDetailWindow(vm, _repository, _viewModel.SelectedRouter.Id, _viewModel.RefreshCardsAsync) { Owner = this }; window.Closed += (_, _) => vm.Dispose(); window.Show();
     }
+    private async Task OpenXiaomiAccountDeviceAsync(XiaomiAccountDevice device)
+    {
+        if (string.IsNullOrWhiteSpace(device.Did))
+        {
+            _viewModel.ShowDeviceList();
+            System.Windows.MessageBox.Show(this, "未找到可打开的 Xiaomi 设备。", "设备详情", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        var source = _viewModel.DeviceControlSource;
+        if (source is null)
+        {
+            _viewModel.ShowDeviceList();
+            System.Windows.MessageBox.Show(this, "当前 Xiaomi 会话暂时无法用于读取设备能力。", "设备详情", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var request = ++_xiaomiDetailNavigationRequest;
+        var detail = new XiaomiAccountDeviceDetailViewModel(device, source, new MiotChineseLocalizationService());
+        detail.ActionRequestHandler = HandleXiaomiActionRequestAsync;
+        try
+        {
+            await detail.LoadAsync();
+        }
+        catch (OperationCanceledException)
+        {
+            detail.Dispose();
+            return;
+        }
+        catch (Exception exception)
+        {
+            detail.Dispose();
+            if (request != _xiaomiDetailNavigationRequest) return;
+            _viewModel.ShowDeviceList();
+            System.Windows.MessageBox.Show(this, $"无法加载“{device.DisplayName}”的设备详情。\n\n{exception.Message}", "设备详情", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        if (request != _xiaomiDetailNavigationRequest)
+        {
+            detail.Dispose();
+            return;
+        }
+
+        // The detail context is fully constructed before the page state changes.
+        // A device-detail page therefore never has a null or partial context.
+        _viewModel.ShowXiaomiAccountDeviceDetail(detail);
+    }
+    private Task<XiaomiActionRequestResult?> HandleXiaomiActionRequestAsync(XiaomiActionViewModel action)
+    {
+        if (action.RequiresConfirmation)
+        {
+            var confirmation = System.Windows.MessageBox.Show(
+                this,
+                $"确定要执行“{action.DisplayName}”吗？\n\n{action.RiskWarning}",
+                "确认高风险操作",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning,
+                MessageBoxResult.No);
+            if (confirmation != MessageBoxResult.Yes)
+                return Task.FromResult<XiaomiActionRequestResult?>(null);
+        }
+
+        if (!action.HasInputArguments)
+            return Task.FromResult<XiaomiActionRequestResult?>(new XiaomiActionRequestResult([], true));
+
+        var dialog = new XiaomiActionDialog(action) { Owner = this };
+        return Task.FromResult<XiaomiActionRequestResult?>(dialog.ShowDialog() == true
+            ? new XiaomiActionRequestResult(dialog.Values, true)
+            : null);
+    }
+    private void DevicesClicked(object sender, RoutedEventArgs e) { _viewModel.ShowDeviceList(); Activate(); }
+    private void QqRemindersClicked(object sender, RoutedEventArgs e)
+    {
+        if (_viewModel.Notifications is null) { System.Windows.MessageBox.Show(this, "通知功能尚未初始化。", "QQ 提醒", MessageBoxButton.OK, MessageBoxImage.Information); return; }
+        if (_qqReminderWindow is { IsLoaded: true }) { _qqReminderWindow.Activate(); return; }
+        var window = new QqReminderWindow(_viewModel.Notifications) { Owner = this };
+        _qqReminderWindow = window;
+        window.Closed += (_, _) => { if (ReferenceEquals(_qqReminderWindow, window)) _qqReminderWindow = null; };
+        window.Show();
+    }
     private void SettingsClicked(object sender, RoutedEventArgs e) { if (_settingsWindow is { IsLoaded: true }) { _settingsWindow.Activate(); return; } if (_viewModel.Notifications is null) { System.Windows.MessageBox.Show(this, "通知功能尚未初始化。", "设置", MessageBoxButton.OK, MessageBoxImage.Information); return; } _settingsWindow = new SettingsWindow(_viewModel, _viewModel.Notifications, _transfer, _startup, _paths) { Owner = this }; _settingsWindow.Show(); }
     private async Task ToggleMonitoringAsync() { if (_monitor.IsRunning) await _viewModel.PauseAsync(); else await _viewModel.ResumeAsync(); RefreshTrayMenu(); }
     private void RefreshTrayMenu() { _monitorItem.Text = _monitor.IsRunning ? "暂停监控" : "开始监控"; _startupItem.Checked = _viewModel.CurrentSettings.StartWithWindows; _minimizedItem.Checked = _viewModel.CurrentSettings.StartMinimized; }
     private async Task TraySettingChangedAsync() { try { _startup.Apply(_startupItem.Checked); await _viewModel.SaveGeneralSettingsAsync(_startupItem.Checked, _minimizedItem.Checked); } catch (Exception exception) { _tray.ShowBalloonTip(1800, "设置未保存", exception.Message, Forms.ToolTipIcon.Error); RefreshTrayMenu(); } }
     private static System.Drawing.Icon LoadTrayIcon()
     {
-        var resource = System.Windows.Application.GetResourceStream(new Uri("pack://application:,,,/Assets/CloudLightPresence.ico")) ?? throw new InvalidOperationException("应用图标资源缺失。 ");
+        var resource = System.Windows.Application.GetResourceStream(new Uri("pack://application:,,,/CloudLight.XiaoMi;component/Assets/CloudLightPresence.ico")) ?? throw new InvalidOperationException("应用图标资源缺失。 ");
         using var source = new System.Drawing.Icon(resource.Stream); return (System.Drawing.Icon)source.Clone();
     }
     private async Task ExitAsync()
     {
         if (_exiting) return; _exiting = true;
+        _settingsWindow?.Close(); _qqReminderWindow?.Close();
         try { await _notificationRuntime.DisposeAsync(); } catch { }
         try { _connectionAlerts.Dispose(); } catch { }
         try { await _qqChannel.DisposeAsync(); } catch { }
-        _notificationDispatcher.Dispose(); _viewModel.Notifications?.Dispose();
+        _notificationDispatcher.Dispose(); _viewModel.Notifications?.Dispose(); _viewModel.Dispose();
         try { if (_monitor.IsRunning) await _monitor.StopAsync("软件退出", CancellationToken.None); } catch { }
         try { await _repository.EndApplicationRunAsync(_runId, DateTimeOffset.UtcNow, CancellationToken.None); } catch { }
         _tray.Visible = false; _tray.Icon?.Dispose(); _tray.Dispose(); Close(); System.Windows.Application.Current.Shutdown();

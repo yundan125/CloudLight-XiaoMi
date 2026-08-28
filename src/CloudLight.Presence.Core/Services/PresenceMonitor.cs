@@ -68,7 +68,6 @@ public sealed class PresenceMonitor(
 
     private async Task RunAsync(Router router, CancellationToken cancellationToken)
     {
-        await repository.CloseOpenMonitoringGapsAsync(DateTimeOffset.UtcNow, cancellationToken);
         _failures = 0; _cloudGapId = null;
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -106,6 +105,7 @@ public sealed class PresenceMonitor(
                 await repository.EndMonitoringGapAsync(_cloudGapId.Value, now, cancellationToken);
                 _cloudGapId = null;
             }
+            await repository.CloseOpenMonitoringGapsAsync(now, cancellationToken);
             _failures = 0;
             _lastSuccessfulCloudUpdate = now;
             Raise(new MonitorStatus(CloudConnectionState.Connected, now, null, _lastSuccessfulCloudUpdate, router.Name));
@@ -113,6 +113,7 @@ public sealed class PresenceMonitor(
         }
         catch (AuthenticationRequiredException exception)
         {
+            _cloudGapId ??= await repository.StartMonitoringGapAsync(DateTimeOffset.UtcNow, "需要重新登录 Xiaomi Cloud", cancellationToken);
             await repository.ResetCurrentObservedStateAsync(router.Id, cancellationToken);
             Raise(new MonitorStatus(CloudConnectionState.NeedsLogin, null, exception.Message));
             throw;
