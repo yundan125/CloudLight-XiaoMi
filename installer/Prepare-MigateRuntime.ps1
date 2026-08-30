@@ -54,3 +54,11 @@ if ($LASTEXITCODE -ne 0) {
 
 & (Join-Path $runtimePath 'python.exe') -c "import migate, requests, rich; print('private migate runtime ready')"
 if ($LASTEXITCODE -ne 0) { throw "Packaged Python runtime smoke test failed." }
+
+$sitePackages = Join-Path $runtimePath 'Lib\site-packages'
+Get-ChildItem -LiteralPath $sitePackages -Directory -Recurse |
+    Where-Object { $_.Name -in @('tests', '__pycache__') } |
+    Sort-Object FullName -Descending |
+    ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force }
+Get-ChildItem -LiteralPath $sitePackages -File -Recurse -Filter '*.pyc' |
+    Remove-Item -Force

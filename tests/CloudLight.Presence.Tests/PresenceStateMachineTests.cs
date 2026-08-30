@@ -66,7 +66,10 @@ public sealed class PresenceStateMachineTests : IAsyncLifetime
         Assert.Equal(observedAt, fact.StateSince);
         Assert.Equal(TimeSpan.FromMinutes(5), fact.ConfirmedDuration);
         Assert.Single(events, value => value.EventType == PresenceEventType.InitialObservation);
-        Assert.Empty(await _repository.GetSubjectPresenceEventsAsync(subject.Id, observedAt, observedAt.AddMinutes(5), CancellationToken.None));
+        var subjectEvents = await _repository.GetSubjectPresenceEventsAsync(subject.Id, observedAt, observedAt.AddMinutes(5), CancellationToken.None);
+        var baseline = Assert.Single(subjectEvents);
+        Assert.Equal(online ? SubjectPresenceEventType.InitialOnline : SubjectPresenceEventType.InitialOffline, baseline.EventType);
+        Assert.DoesNotContain(subjectEvents, value => value.EventType is SubjectPresenceEventType.ConfirmedOnline or SubjectPresenceEventType.ConfirmedOffline or SubjectPresenceEventType.DetectedOnlineAfterGap or SubjectPresenceEventType.DetectedOfflineAfterGap);
     }
 
     [Fact]

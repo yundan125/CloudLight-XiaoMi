@@ -1,10 +1,12 @@
 using System.Windows;
 using System.Windows.Controls;
+using CloudLight.Presence.App.Behaviors;
 using CloudLight.Presence.Core.Models;
+
 using Button = System.Windows.Controls.Button;
 using CheckBox = System.Windows.Controls.CheckBox;
-using Orientation = System.Windows.Controls.Orientation;
 using HorizontalAlignment = System.Windows.HorizontalAlignment;
+using Orientation = System.Windows.Controls.Orientation;
 
 namespace CloudLight.Presence.App.Views;
 
@@ -12,20 +14,57 @@ public static class SubjectDialogs
 {
     public static IReadOnlyCollection<long>? ManageDevices(Window owner, IReadOnlyList<NetworkDevice> devices, IReadOnlyCollection<long> selectedIds, string? description = null, string accept = "保存")
     {
-        var window = Dialog(owner, "管理关联设备"); window.Height = 540; var panel = Panel(); panel.Children.Add(Label(description ?? "选择要加入这个分组的设备；取消勾选即可移除。"));
-        var listPanel = new StackPanel(); var checks = new List<(CheckBox Check, long Id)>();
-        foreach (var device in devices) { var check = new CheckBox { Content = $"{device.DisplayName}   {device.MacAddress}   {device.ConnectionType ?? "未知"}", IsChecked = selectedIds.Contains(device.Id), Margin = new Thickness(0, 5, 0, 5) }; checks.Add((check, device.Id)); listPanel.Children.Add(check); }
-        panel.Children.Add(new ScrollViewer { Content = listPanel, Height = 350, VerticalScrollBarVisibility = ScrollBarVisibility.Auto }); panel.Children.Add(Buttons(window, accept)); window.Content = panel;
-        return window.ShowDialog() == true ? checks.Where(value => value.Check.IsChecked == true).Select(value => value.Id).ToArray() : null;
-    }
+        var window = DialogUi.CreateWindow(owner, "管理关联设备", 560, SystemParameters.WorkArea.Height * .8);
+        var panel = DialogUi.Panel();
+        panel.Children.Add(DialogUi.Title("管理关联设备"));
+        panel.Children.Add(DialogUi.Subtitle(description ?? "选择要加入这个 Presence 主体的设备；取消勾选即可移除。"));
 
-    private static Window Dialog(Window owner, string title) => new() { Owner = owner, Title = title, Width = 450, SizeToContent = SizeToContent.Height, MaxHeight = 620, WindowStartupLocation = WindowStartupLocation.CenterOwner, Background = System.Windows.Media.Brushes.White, ResizeMode = ResizeMode.NoResize };
-    private static StackPanel Panel() => new() { Margin = new Thickness(24) };
-    private static TextBlock Label(string text) => new() { Text = text, Margin = new Thickness(0, 10, 0, 6), TextWrapping = TextWrapping.Wrap };
-    private static StackPanel Buttons(Window window, string accept)
-    {
-        var row = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 20, 0, 0) };
-        var cancel = new Button { Content = "取消", MinWidth = 80, Margin = new Thickness(0, 0, 8, 0) }; cancel.Click += (_, _) => window.DialogResult = false;
-        var ok = new Button { Content = accept, MinWidth = 80, IsDefault = true }; ok.Click += (_, _) => window.DialogResult = true; row.Children.Add(cancel); row.Children.Add(ok); return row;
+        var checks = new List<(CheckBox Check, long Id)>();
+        var listPanel = new StackPanel();
+        foreach (var device in devices)
+        {
+            var check = new CheckBox
+            {
+                Content = $"{device.DisplayName}  ·  {device.MacAddress}\n{device.ConnectionType ?? "连接方式未知"} · {device.LastIp ?? "IP 未知"}",
+                IsChecked = selectedIds.Contains(device.Id),
+                Margin = new Thickness(0, 0, 0, 8)
+            };
+            checks.Add((check, device.Id));
+            listPanel.Children.Add(check);
+        }
+
+        var devicesCard = new StackPanel();
+        devicesCard.Children.Add(DialogUi.Section("路由器网络设备"));
+        devicesCard.Children.Add(DialogUi.Hint("主体至少需要保留一个关联设备。"));
+        if (devices.Count == 0)
+            devicesCard.Children.Add(DialogUi.EmptyState("还没有可关联的设备", "等待路由器完成一次 Presence 发现后再试。"));
+        else
+        {
+            var deviceScroll = new ScrollViewer
+            {
+                Content = listPanel,
+                MaxHeight = 360,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                CanContentScroll = false
+            };
+            NestedScrollBehavior.SetBubbleMouseWheelAtBoundary(deviceScroll, true);
+            devicesCard.Children.Add(deviceScroll);
+        }
+        panel.Children.Add(DialogUi.Card(devicesCard));
+
+        var actions = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
+        var cancel = DialogUi.Button("取消", "SecondaryButtonStyle");
+        cancel.IsCancel = true;
+        cancel.Click += (_, _) => window.DialogResult = false;
+        var ok = DialogUi.Button(accept, "PrimaryButtonStyle");
+        ok.IsDefault = true;
+        ok.Click += (_, _) => window.DialogResult = true;
+        actions.Children.Add(cancel);
+        actions.Children.Add(ok);
+        panel.Children.Add(actions);
+
+        window.Content = DialogUi.MainScroll(panel);
+        return window.ShowDialog() == true ? checks.Where(value => value.Check.IsChecked == true).Select(value => value.Id).ToArray() : null;
     }
 }

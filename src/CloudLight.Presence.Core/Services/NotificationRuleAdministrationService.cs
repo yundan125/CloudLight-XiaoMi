@@ -40,18 +40,29 @@ public sealed class NotificationRuleAdministrationService(IPresenceRepository re
         var triggerSemanticsChanged = current.SubjectId != normalized.SubjectId
             || current.Condition != normalized.Condition
             || current.ThresholdSeconds != normalized.ThresholdSeconds;
+        var isReenabled = !current.Enabled && normalized.Enabled;
+        var recipientsChanged = !current.RecipientIds
+            .Distinct()
+            .OrderBy(value => value)
+            .SequenceEqual(normalized.RecipientIds.Distinct().OrderBy(value => value));
+        var legacyTargetChanged = current.TargetType != normalized.TargetType
+            || !string.Equals(current.TargetId, normalized.TargetId, StringComparison.Ordinal);
 
         await repository.UpdateNotificationRuleAsync(normalized, cancellationToken);
-        if (triggerSemanticsChanged)
-            await ResetStateAsync(current.Id, now, cancellationToken);
+        if (triggerSemanticsChanged || isReenabled)
+            await ResetStateAsync(current.Id, normalized.SubjectId, now, cancellationToken);
         else if (!normalized.Enabled)
             await CancelPendingDeliveryAsync(current.Id, now, cancellationToken);
+        else if (recipientsChanged || legacyTargetChanged)
+            await CancelRemovedTargetDeliveriesAsync(normalized, now, cancellationToken);
     }
 
-    private async Task ResetStateAsync(long ruleId, DateTimeOffset now, CancellationToken cancellationToken)
+    private async Task ResetStateAsync(long ruleId, long subjectId, DateTimeOffset now, CancellationToken cancellationToken)
     {
         var state = await repository.GetNotificationRuleStateAsync(ruleId, cancellationToken);
-        if (state?.PendingDeliveryId is { } pendingId && await repository.GetNotificationDeliveryAsync(pendingId, cancellationToken) is { } delivery && delivery.Status is not NotificationDeliveryStatus.Delivered and not NotificationDeliveryStatus.Canceled)
+        foreach (var delivery in await repository.GetNotificationDeliveriesForRuleAsync(ruleId, cancellationToken))
+        {
+            if (delivery.Status is NotificationDeliveryStatus.Delivered or NotificationDeliveryStatus.Canceled) continue;
             await repository.UpdateNotificationDeliveryAsync(delivery with
             {
                 Status = NotificationDeliveryStatus.Canceled,
@@ -59,23 +70,75 @@ public sealed class NotificationRuleAdministrationService(IPresenceRepository re
                 LastAttemptAt = now,
                 NextAttemptAt = null
             }, cancellationToken);
+        }
 
-        await repository.UpsertNotificationRuleStateAsync(new NotificationRuleState(ruleId, null, null, false, null, false, null, null, now), cancellationToken);
+        await repository.ResetNotificationRuleStateAsync(ruleId, subjectId, now, cancellationToken);
     }
 
     private async Task CancelPendingDeliveryAsync(long ruleId, DateTimeOffset now, CancellationToken cancellationToken)
     {
         var state = await repository.GetNotificationRuleStateAsync(ruleId, cancellationToken);
-        if (state?.PendingDeliveryId is not { } pendingId) return;
-        var delivery = await repository.GetNotificationDeliveryAsync(pendingId, cancellationToken);
-        if (delivery is null || delivery.Status is NotificationDeliveryStatus.Delivered or NotificationDeliveryStatus.Canceled) return;
-        await repository.UpdateNotificationDeliveryAsync(delivery with
+        var deliveries = await repository.GetNotificationDeliveriesForRuleAsync(ruleId, cancellationToken);
+        var pending = deliveries.Where(delivery => delivery.Status is not (NotificationDeliveryStatus.Delivered or NotificationDeliveryStatus.Canceled)).ToArray();
+        foreach (var delivery in pending)
         {
-            Status = NotificationDeliveryStatus.Canceled,
-            Error = "自动提醒已关闭，旧投递已取消。",
-            LastAttemptAt = now,
-            NextAttemptAt = null
-        }, cancellationToken);
+            await repository.UpdateNotificationDeliveryAsync(delivery with
+            {
+                Status = NotificationDeliveryStatus.Canceled,
+                Error = "自动提醒已关闭，旧投递已取消。",
+                LastAttemptAt = now,
+                NextAttemptAt = null
+            }, cancellationToken);
+        }
+        if (state is null || pending.Length == 0) return;
         await repository.UpsertNotificationRuleStateAsync(state with { PendingDelivery = false, PendingDeliveryId = null, LastDeliveryError = null, UpdatedAt = now }, cancellationToken);
     }
+
+    private async Task CancelRemovedTargetDeliveriesAsync(NotificationRule rule, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        var recipientIds = rule.RecipientIds.Distinct().ToHashSet();
+        var deliveries = await repository.GetNotificationDeliveriesForRuleAsync(rule.Id, cancellationToken);
+        var stale = deliveries
+            .Where(delivery => delivery.Status is NotificationDeliveryStatus.Pending or NotificationDeliveryStatus.Failed)
+            .Where(delivery => !IsSelectedTarget(delivery, rule, recipientIds))
+            .ToArray();
+        foreach (var delivery in stale)
+        {
+            await repository.UpdateNotificationDeliveryAsync(delivery with
+            {
+                Status = NotificationDeliveryStatus.Canceled,
+                Error = "规则接收人已移除，投递已取消。",
+                LastAttemptAt = now,
+                NextAttemptAt = null
+            }, cancellationToken);
+        }
+
+        if (stale.Length == 0) return;
+        var state = await repository.GetNotificationRuleStateAsync(rule.Id, cancellationToken);
+        if (state?.PendingDeliveryId is not { } pendingId || stale.All(value => value.Id != pendingId)) return;
+
+        var staleIds = stale.Select(value => value.Id).ToHashSet();
+        var replacement = deliveries
+            .Where(value => !staleIds.Contains(value.Id))
+            .Where(value => value.Status is NotificationDeliveryStatus.Pending or NotificationDeliveryStatus.Failed)
+            .OrderBy(value => value.Id)
+            .FirstOrDefault();
+        await repository.UpsertNotificationRuleStateAsync(state with
+        {
+            PendingDelivery = replacement is not null,
+            PendingDeliveryId = replacement?.Id,
+            LastDeliveryError = replacement?.Error,
+            UpdatedAt = now
+        }, cancellationToken);
+    }
+
+    private static bool IsSelectedTarget(
+        NotificationDelivery delivery,
+        NotificationRule rule,
+        IReadOnlySet<long> recipientIds) =>
+        recipientIds.Count > 0
+            ? delivery.RecipientId is { } recipientId && recipientIds.Contains(recipientId)
+            : delivery.RecipientId is null
+              && delivery.TargetType == rule.TargetType
+              && string.Equals(delivery.TargetId, rule.TargetId, StringComparison.Ordinal);
 }

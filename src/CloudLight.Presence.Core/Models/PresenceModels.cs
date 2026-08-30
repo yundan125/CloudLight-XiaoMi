@@ -3,7 +3,16 @@ namespace CloudLight.Presence.Core.Models;
 public enum PresenceState { Unknown = 0, Online = 1, Offline = 2 }
 public enum PresenceEventType { Online = 1, Offline = 2, InitialObservation = 3 }
 public enum PresenceSource { Polling = 1 }
-public enum SubjectPresenceEventType { DetectedOnlineAfterGap = 1, DetectedOfflineAfterGap = 2 }
+public enum SubjectPresenceEventType
+{
+    // Keep the existing persisted values stable for prior monitoring-gap activity.
+    DetectedOnlineAfterGap = 1,
+    DetectedOfflineAfterGap = 2,
+    InitialOnline = 3,
+    InitialOffline = 4,
+    ConfirmedOnline = 5,
+    ConfirmedOffline = 6
+}
 public enum SubjectActivityType
 {
     Online = 1,
@@ -12,7 +21,13 @@ public enum SubjectActivityType
     DetectedOnlineAfterGap = 4,
     DetectedOfflineAfterGap = 5
 }
-public enum NotificationCondition { OnlineFor = 1, OfflineFor = 2 }
+public enum NotificationCondition
+{
+    OnlineFor = 1,
+    OfflineFor = 2,
+    DetectedOnline = 3,
+    DetectedOffline = 4
+}
 public enum NotificationChannelType { QQ = 1 }
 public enum NotificationTargetType { Private = 1, Group = 2 }
 public enum NotificationDeliveryStatus { Pending = 1, Delivered = 2, Failed = 3, Canceled = 4 }
@@ -30,6 +45,32 @@ public enum NotificationConnectionState
     GatewayFailed,
     Stopping
 }
+
+/// <summary>
+/// A saved QQ OpenID.  OpenIDs remain ordinary local data so they can be
+/// edited and reused; presentation code is responsible for masking them.
+/// </summary>
+public sealed record NotificationRecipient(
+    long Id,
+    string Note,
+    string OpenId,
+    NotificationTargetType TargetType,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset UpdatedAt)
+{
+    public string DisplayName => string.IsNullOrWhiteSpace(Note) ? $"QQ {TargetTypeText}" : Note;
+    public string TargetTypeText => TargetType == NotificationTargetType.Group ? "群聊" : "私聊";
+}
+
+/// <summary>
+/// A resolved notification target used by system notifications and legacy
+/// compatibility paths.
+/// </summary>
+public sealed record NotificationRecipientTarget(
+    long? RecipientId,
+    NotificationTargetType TargetType,
+    string TargetId,
+    string? DisplayName = null);
 
 public sealed record Router(
     long Id,
@@ -87,7 +128,16 @@ public sealed record SubjectPresenceEvent(
     long SubjectId,
     SubjectPresenceEventType EventType,
     DateTimeOffset ObservedAt,
-    long MonitoringGapId);
+    long? MonitoringGapId,
+    DateTimeOffset? StateSince = null)
+{
+    /// <summary>
+    /// The effective boundary used by the confirmed subject timeline.  A
+    /// confirmed offline transition may be persisted after its grace window,
+    /// while still starting at the first all-offline observation.
+    /// </summary>
+    public DateTimeOffset EffectiveAt => StateSince ?? ObservedAt;
+}
 
 public sealed record PresenceSession(
     long Id,
@@ -122,7 +172,8 @@ public sealed record SubjectCurrentState(
     long SubjectId,
     PresenceState CurrentState,
     DateTimeOffset StateSince,
-    DateTimeOffset LastObservedAt);
+    DateTimeOffset LastObservedAt,
+    DateTimeOffset? PendingOfflineSince = null);
 
 public sealed record PresenceSubject(
     long Id,
@@ -172,7 +223,14 @@ public sealed record NotificationRule(
     string TargetId,
     string MessageTemplate,
     DateTimeOffset CreatedAt,
-    DateTimeOffset UpdatedAt);
+    DateTimeOffset UpdatedAt)
+{
+    /// <summary>
+    /// Saved recipients for the rule.  Empty means the legacy TargetType /
+    /// TargetId pair is still in use.
+    /// </summary>
+    public IReadOnlyList<long> RecipientIds { get; init; } = [];
+}
 
 public sealed record NotificationRuleState(
     long RuleId,
@@ -183,7 +241,8 @@ public sealed record NotificationRuleState(
     bool PendingDelivery,
     long? PendingDeliveryId,
     string? LastDeliveryError,
-    DateTimeOffset UpdatedAt);
+    DateTimeOffset UpdatedAt,
+    long? LastProcessedSubjectEventId = null);
 
 public sealed record NotificationDelivery(
     long Id,
@@ -201,7 +260,8 @@ public sealed record NotificationDelivery(
     int SentParts,
     int TotalParts,
     DateTimeOffset? LastAttemptAt,
-    DateTimeOffset? NextAttemptAt);
+    DateTimeOffset? NextAttemptAt,
+    long? RecipientId = null);
 
 public sealed record SystemNotificationDelivery(
     long Id,
@@ -218,7 +278,8 @@ public sealed record SystemNotificationDelivery(
     int SentParts,
     int TotalParts,
     DateTimeOffset? LastAttemptAt,
-    DateTimeOffset? NextAttemptAt);
+    DateTimeOffset? NextAttemptAt,
+    long? RecipientId = null);
 
 public sealed record ConnectionAlertState(
     string? FailureEpisodeId,
@@ -233,12 +294,16 @@ public sealed record ConnectionAlertSettings(
     bool RecoveryEnabled = true,
     bool UseDefaultTarget = true,
     NotificationTargetType TargetType = NotificationTargetType.Private,
-    string TargetId = "");
+    string TargetId = "")
+{
+    public IReadOnlyList<long> RecipientIds { get; init; } = [];
+}
 
 public sealed record ConnectionAlertConfiguration(
     ConnectionAlertSettings Settings,
     NotificationTargetType DefaultTargetType,
-    string DefaultTargetId);
+    string DefaultTargetId,
+    IReadOnlyList<NotificationRecipientTarget>? DefaultTargets = null);
 
 public sealed record NotificationRequest(
     long DeliveryId,

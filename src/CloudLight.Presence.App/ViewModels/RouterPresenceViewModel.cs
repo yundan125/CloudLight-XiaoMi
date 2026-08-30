@@ -30,6 +30,10 @@ public sealed class RouterPresenceViewModel : ObservableObject, IDisposable
     public RelayCommand ShowOnlineCommand => _main.ShowOnlineCommand;
     public RelayCommand ShowOfflineCommand => _main.ShowOfflineCommand;
     public RelayCommand ShowUnknownCommand => _main.ShowUnknownCommand;
+    public bool IsPresenceAllFilterActive => _main.IsPresenceAllFilterActive;
+    public bool IsPresenceOnlineFilterActive => _main.IsPresenceOnlineFilterActive;
+    public bool IsPresenceOfflineFilterActive => _main.IsPresenceOfflineFilterActive;
+    public bool IsPresenceUnknownFilterActive => _main.IsPresenceUnknownFilterActive;
     public int AllCount => _main.AllCount;
     public int OnlineCount => _main.OnlineCount;
     public int OfflineCount => _main.OfflineCount;
@@ -69,6 +73,18 @@ public sealed class RouterPresenceViewModel : ObservableObject, IDisposable
                 break;
             case nameof(MainViewModel.UnknownCount):
                 Raise(nameof(UnknownCount));
+                break;
+            case nameof(MainViewModel.IsPresenceAllFilterActive):
+                Raise(nameof(IsPresenceAllFilterActive));
+                break;
+            case nameof(MainViewModel.IsPresenceOnlineFilterActive):
+                Raise(nameof(IsPresenceOnlineFilterActive));
+                break;
+            case nameof(MainViewModel.IsPresenceOfflineFilterActive):
+                Raise(nameof(IsPresenceOfflineFilterActive));
+                break;
+            case nameof(MainViewModel.IsPresenceUnknownFilterActive):
+                Raise(nameof(IsPresenceUnknownFilterActive));
                 break;
             case nameof(MainViewModel.SearchText):
                 Raise(nameof(SearchText));

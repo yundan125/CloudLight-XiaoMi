@@ -13,7 +13,7 @@ public sealed class QQNotificationChannel : INotificationChannel, IAsyncDisposab
 {
     private const string ApiBaseUrl = "https://api.sgroup.qq.com";
     private const string TokenEndpoint = "https://bots.qq.com/app/getAppAccessToken";
-    private const string UserAgent = "CloudLight-XiaoMi/2.1.0";
+    private const string UserAgent = "CloudLight-XiaoMi/2.1.1";
     private const int GroupAndC2CIntent = 1 << 25;
     private const int DefaultRequestTimeoutSeconds = 15;
     private const int DefaultConnectTimeoutSeconds = 20;
@@ -325,7 +325,8 @@ public sealed class QQNotificationChannel : INotificationChannel, IAsyncDisposab
         finally
         {
             linked.Cancel();
-            try { await heartbeat; } catch { }
+            try { await heartbeat; }
+            catch (Exception exception) { LogError("heartbeat_cleanup", SafeError(exception.Message)); }
             socket.Abort(); socket.Dispose();
             lock (_sync) { if (ReferenceEquals(_socket, socket)) _socket = null; }
         }

@@ -5,30 +5,33 @@ using CloudLight.Presence.Core.Interfaces;
 
 namespace CloudLight.Presence.App.Views;
 
-public partial class SubjectDetailWindow : Window
+public partial class SubjectDetailWindow : System.Windows.Controls.UserControl
 {
     private readonly SubjectDetailViewModel _viewModel; private readonly IPresenceRepository _repository; private readonly long _routerId; private readonly Func<Task> _changed;
+    public event EventHandler? Deleted;
     public SubjectDetailWindow(SubjectDetailViewModel viewModel, IPresenceRepository repository, long routerId, Func<Task> changed) { InitializeComponent(); DataContext = viewModel; _viewModel = viewModel; _repository = repository; _routerId = routerId; _changed = changed; viewModel.SubjectChanged += async (_, _) => await _changed(); }
     private async void ManageClicked(object sender, RoutedEventArgs e)
     {
-        var devices = await _repository.GetDevicesAsync(_routerId, CancellationToken.None); var selected = _viewModel.Members.Select(value => value.Device.Id).ToArray(); var result = SubjectDialogs.ManageDevices(this, devices, selected); if (result is null) return;
+        if (OwnerWindow is not { } owner) return;
+        var devices = await _repository.GetDevicesAsync(_routerId, CancellationToken.None); var selected = _viewModel.Members.Select(value => value.Device.Id).ToArray(); var result = SubjectDialogs.ManageDevices(owner, devices, selected); if (result is null) return;
         await _repository.SetSubjectDevicesAsync(_viewModel.Subject.Id, result, DateTimeOffset.UtcNow, CancellationToken.None); await _viewModel.ReloadAsync(); await _changed();
     }
     private async void SplitClicked(object sender, RoutedEventArgs e)
     {
+        if (OwnerWindow is not { } owner) return;
         var devices = await _repository.GetDevicesAsync(_routerId, CancellationToken.None);
         var selected = _viewModel.Members.Select(value => value.Device.Id).ToArray();
         if (selected.Length < 2)
         {
-            System.Windows.MessageBox.Show(this, "当前主体只有一个设备，不需要拆分。", "拆分主体", MessageBoxButton.OK, MessageBoxImage.Information);
+            CloudLightDialogs.Info(owner, "拆分主体", "当前主体只有一个设备，不需要拆分。");
             return;
         }
 
-        var result = SubjectDialogs.ManageDevices(this, devices, selected, "选择要保留在当前主体中的设备；取消勾选的设备会成为新的独立主体，当前主体及其自动提醒会保留。至少保留一个设备。", "拆分");
+        var result = SubjectDialogs.ManageDevices(owner, devices, selected, "选择要保留在当前主体中的设备；取消勾选的设备会成为新的独立主体，当前主体及其自动提醒会保留。至少保留一个设备。", "拆分");
         if (result is null || result.Count == selected.Length) return;
         if (result.Count == 0)
         {
-            System.Windows.MessageBox.Show(this, "拆分时至少要为当前主体保留一个设备。", "拆分主体", MessageBoxButton.OK, MessageBoxImage.Warning);
+            CloudLightDialogs.Info(owner, "无法拆分主体", "拆分时至少要为当前主体保留一个设备。", warning: true);
             return;
         }
 
@@ -37,10 +40,12 @@ public partial class SubjectDetailWindow : Window
     }
     private async void DeleteClicked(object sender, RoutedEventArgs e)
     {
+        if (OwnerWindow is not { } owner) return;
         var message = $"解散“{_viewModel.DisplayName}”？\n\n关联的设备会分别恢复为独立主体；当前主体及其自动提醒会被删除，不会删除设备或历史记录。";
-        if (System.Windows.MessageBox.Show(this, message, "解散主体", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
-        await _repository.DeleteSubjectAsync(_viewModel.Subject.Id, CancellationToken.None); await _changed(); Close();
+        if (!CloudLightDialogs.Confirm(owner, "解散主体", message, danger: true, accept: "解散")) return;
+        await _repository.DeleteSubjectAsync(_viewModel.Subject.Id, CancellationToken.None); await _changed(); Deleted?.Invoke(this, EventArgs.Empty);
     }
+    private Window? OwnerWindow => Window.GetWindow(this) ?? System.Windows.Application.Current?.MainWindow;
     private void WindowSizeChanged(object sender, SizeChangedEventArgs e)
     {
         var stacked = e.NewSize.Width < 820;

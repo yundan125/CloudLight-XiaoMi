@@ -199,7 +199,7 @@ public sealed class CurrentObservationTests
         Assert.True(fact.StateSinceKnown);
         Assert.Equal(At(6), fact.StateSince);
         Assert.Equal(At(6), persisted!.StateSince);
-        Assert.Empty(await fixture.Repository.GetSubjectPresenceEventsAsync(fixture.Subject.Id, At(0), At(12), CancellationToken.None));
+        Assert.DoesNotContain(await fixture.Repository.GetSubjectPresenceEventsAsync(fixture.Subject.Id, At(0), At(12), CancellationToken.None), value => value.EventType is SubjectPresenceEventType.ConfirmedOnline or SubjectPresenceEventType.ConfirmedOffline or SubjectPresenceEventType.DetectedOnlineAfterGap or SubjectPresenceEventType.DetectedOfflineAfterGap);
     }
 
     private static async Task<SubjectPresenceFact?> CurrentFactAsync(Fixture fixture) =>

@@ -14,12 +14,14 @@ using CloudLight.Presence.Core.Presence;
 using CloudLight.Presence.Core.Services;
 using CloudLight.Presence.Infrastructure.Database;
 using CloudLight.Presence.Infrastructure.Notifications;
+using CloudLight.Presence.Infrastructure.SecureStorage;
 using CloudLight.Presence.Infrastructure.Settings;
 using Xunit;
 using Xunit.Abstractions;
 
 namespace CloudLight.Presence.Tests;
 
+[Collection("Wpf UI")]
 public sealed class MainWindowNavigationUiTests
 {
     private readonly ITestOutputHelper _output;
@@ -42,6 +44,7 @@ public sealed class MainWindowNavigationUiTests
         var root = Path.Combine(Path.GetTempPath(), "CloudLight-MainWindow-Ui-Tests", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
         MainViewModel? viewModel = null;
+        NotificationSettingsViewModel? notifications = null;
         NotificationRuntime? notificationRuntime = null;
         XiaomiConnectionAlertService? connectionAlerts = null;
         QQNotificationChannel? qqChannel = null;
@@ -77,6 +80,8 @@ public sealed class MainWindowNavigationUiTests
             var monitor = new PresenceMonitor(source, repository, new PresenceStateMachine(repository));
             var subjects = new SubjectPresenceService(repository, new PresenceStatisticsService(repository));
             qqChannel = new QQNotificationChannel(paths.LogsDirectory);
+            notifications = new NotificationSettingsViewModel(repository, new JsonSettingsStore(paths), new DpapiQqSecretStore(paths), qqChannel);
+            notifications.LoadAsync(CancellationToken.None).GetAwaiter().GetResult();
             dispatcher = new NotificationDispatcher(repository, [qqChannel]);
             notificationRuntime = new NotificationRuntime(monitor, new NotificationRuleService(repository, subjects), dispatcher);
             connectionAlerts = new XiaomiConnectionAlertService(
@@ -85,7 +90,7 @@ public sealed class MainWindowNavigationUiTests
                 dispatcher,
                 _ => Task.FromResult(new ConnectionAlertConfiguration(new ConnectionAlertSettings(), NotificationTargetType.Private, "")),
                 subscribe: false);
-            viewModel = new MainViewModel(repository, subjects, source, monitor, new JsonSettingsStore(paths), accountDeviceSource: source);
+            viewModel = new MainViewModel(repository, subjects, source, monitor, new JsonSettingsStore(paths), notifications, source);
             viewModel.Routers.Add(router);
             viewModel.SelectedRouter = router;
             window = new MainWindow(
@@ -116,11 +121,58 @@ public sealed class MainWindowNavigationUiTests
             Assert.Equal(Visibility.Collapsed, detailView.Visibility);
             Assert.Equal(Visibility.Collapsed, presenceView.Visibility);
             Assert.Single(Application.Current!.Windows.Cast<Window>());
+            AssertActiveSidebar(window, "OverviewNavButton");
+            AssertSingleActiveFilter(window, viewModel, viewModel.ShowAllCommand);
+
+            var devicesExpanded = viewModel.IsDevicesExpanded;
+            InvokeButton(Assert.IsType<Button>(FindVisualChildByName(window, "ToggleDevicesButton")));
+            PumpDispatcher();
+            Assert.NotEqual(devicesExpanded, viewModel.IsDevicesExpanded);
+            InvokeButton(Assert.IsType<Button>(FindVisualChildByName(window, "ToggleDevicesButton")));
+            PumpDispatcher();
+            Assert.Equal(devicesExpanded, viewModel.IsDevicesExpanded);
+
+            var auxiliaryHost = Assert.IsType<ContentControl>(FindVisualChildByName(window, "AuxiliaryPageHost"));
+            InvokeButton(Assert.IsType<Button>(FindVisualChildByName(window, "QqNavButton")));
+            PumpDispatcher();
+            window.UpdateLayout();
+            Assert.Equal(MainPage.QqReminder, viewModel.CurrentPage);
+            Assert.IsType<QqReminderWindow>(auxiliaryHost.Content);
+            Assert.Single(Application.Current!.Windows.Cast<Window>());
+            AssertActiveSidebar(window, "QqNavButton");
+
+            InvokeButton(Assert.IsType<Button>(FindVisualChildByName(window, "SettingsNavButton")));
+            PumpDispatcher();
+            window.UpdateLayout();
+            Assert.Equal(MainPage.Settings, viewModel.CurrentPage);
+            Assert.IsType<SettingsWindow>(auxiliaryHost.Content);
+            Assert.Single(Application.Current!.Windows.Cast<Window>());
+            AssertActiveSidebar(window, "SettingsNavButton");
+
+            InvokeButton(Assert.IsType<Button>(FindVisualChildByName(window, "AboutNavButton")));
+            PumpDispatcher();
+            window.UpdateLayout();
+            Assert.Equal(MainPage.About, viewModel.CurrentPage);
+            Assert.IsType<AboutView>(auxiliaryHost.Content);
+            Assert.Single(Application.Current!.Windows.Cast<Window>());
+            AssertActiveSidebar(window, "AboutNavButton");
+
+            InvokeButton(Assert.IsType<Button>(FindVisualChildByName(window, "DevicesNavButton")));
+            PumpDispatcher();
+            window.UpdateLayout();
+            AssertActiveSidebar(window, "OverviewNavButton");
 
             viewModel.RefreshAccountDevicesAsync(CancellationToken.None).GetAwaiter().GetResult();
             viewModel.RefreshCardsAsync().GetAwaiter().GetResult();
+            Assert.DoesNotContain(viewModel.SidebarDevices, item => item.Kind == SidebarDeviceKind.PresenceSubject);
+            Assert.DoesNotContain(viewModel.SidebarGroups, group => string.Equals(group.Title, "Presence", StringComparison.Ordinal));
+            Assert.Contains(viewModel.SidebarDevices, item => item.Kind == SidebarDeviceKind.Router && item.Name == router.Name);
+            Assert.Contains(viewModel.SidebarDevices, item => item.Kind == SidebarDeviceKind.XiaomiAccountDevice && item.Name == plug.Name);
             viewModel.ShowOfflineCommand.Execute(null);
             PumpDispatcher();
+            AssertSingleActiveFilter(window, viewModel, viewModel.ShowOfflineCommand);
+
+            AssertDeviceListVisible(viewModel, deviceListPage, detailView, presenceView, plug.Did);
 
             Assert.Single(viewModel.AccountDevicesView.Cast<XiaomiAccountDeviceCardViewModel>(), card => card.Device.Did == plug.Did);
             Assert.Single(viewModel.AccountDevices, card => card.Device.Did == plug.Did).OpenCommand.Execute(null);
@@ -134,12 +186,19 @@ public sealed class MainWindowNavigationUiTests
             Assert.Equal(Visibility.Visible, detailView.Visibility);
             Assert.Equal(Visibility.Collapsed, presenceView.Visibility);
             Assert.Single(Application.Current!.Windows.Cast<Window>());
+            AssertActiveSidebar(window, identity: plug.Did);
+
+            viewModel.RefreshAccountDevicesAsync(CancellationToken.None).GetAwaiter().GetResult();
+            PumpDispatcher();
+            window.UpdateLayout();
+            AssertActiveSidebar(window, identity: plug.Did);
 
             var detailBack = Assert.Single(FindVisualChildren<Button>(detailView), button => Equals(button.Content, "返回设备"));
             VerifyAndInvokeReturnButton(diagnostics, "Xiaomi plug", window, viewModel, detailBack);
             PumpDispatcher();
             window.UpdateLayout();
             AssertDeviceListVisible(viewModel, deviceListPage, detailView, presenceView, plug.Did);
+            AssertActiveSidebar(window, "OverviewNavButton");
 
             Assert.Single(viewModel.AccountDevices, card => card.Device.Did == band.Did).OpenCommand.Execute(null);
             PumpDispatcher();
@@ -148,12 +207,21 @@ public sealed class MainWindowNavigationUiTests
             Assert.Equal("小米手环10 · 设备详情 · CloudLight XiaoMi", window.Title);
             Assert.Equal(band.Did, viewModel.CurrentXiaomiAccountDeviceDetail!.Device.Did);
             Assert.Equal(Visibility.Visible, detailView.Visibility);
+            AssertActiveSidebar(window, identity: band.Did);
+
+            source.RemoveDevice(band.Did);
+            viewModel.RefreshAccountDevicesAsync(CancellationToken.None).GetAwaiter().GetResult();
+            PumpDispatcher();
+            window.UpdateLayout();
+            AssertDeviceListVisible(viewModel, deviceListPage, detailView, presenceView, plug.Did);
+            AssertActiveSidebar(window, "OverviewNavButton");
 
             var bandBack = Assert.Single(FindVisualChildren<Button>(detailView), button => Equals(button.Content, "返回设备"));
             VerifyAndInvokeReturnButton(diagnostics, "Xiaomi band", window, viewModel, bandBack);
             PumpDispatcher();
             window.UpdateLayout();
             AssertDeviceListVisible(viewModel, deviceListPage, detailView, presenceView, plug.Did);
+            AssertActiveSidebar(window, "OverviewNavButton");
 
             Assert.Single(viewModel.AccountDevices, card => card.Device.Did == routerDevice.Did).RouterPresenceCommand.Execute(null);
             PumpDispatcher();
@@ -166,17 +234,53 @@ public sealed class MainWindowNavigationUiTests
             Assert.Equal(Visibility.Collapsed, deviceListPage.Visibility);
             Assert.Equal(Visibility.Collapsed, detailView.Visibility);
             Assert.Equal(Visibility.Visible, presenceView.Visibility);
+            AssertActiveSidebar(window, identity: router.Id.ToString(System.Globalization.CultureInfo.InvariantCulture));
             var presenceCard = Assert.Single(viewModel.Cards);
             Assert.StartsWith("离线 ", presenceCard.Duration);
             Assert.DoesNotContain("持续时间未知", presenceCard.Duration);
             viewModel.ShowOnlineCommand.Execute(null);
+            AssertSingleActiveFilter(window, viewModel, viewModel.ShowOnlineCommand);
             Assert.Single(Application.Current!.Windows.Cast<Window>());
 
-            var presenceBack = Assert.Single(FindVisualChildren<Button>(presenceView), button => Equals(button.Content, "返回设备"));
+            var presenceBack = Assert.Single(FindVisualChildren<Button>(presenceView), button => Equals(button.Content, "← 设备总览"));
             VerifyAndInvokeReturnButton(diagnostics, "Router Presence", window, viewModel, presenceBack);
             PumpDispatcher();
             window.UpdateLayout();
             AssertDeviceListVisible(viewModel, deviceListPage, detailView, presenceView, plug.Did);
+            AssertActiveSidebar(window, "OverviewNavButton");
+
+            var subjectDetail = new SubjectDetailViewModel(repository, subjects, monitor, subject);
+            subjectDetail.LoadAsync().GetAwaiter().GetResult();
+            viewModel.ShowSubjectDetail(subjectDetail);
+            PumpDispatcher();
+            window.UpdateLayout();
+            Assert.Equal(MainPage.SubjectDetail, viewModel.CurrentPage);
+            AssertActiveSidebar(window, identity: router.Id.ToString(System.Globalization.CultureInfo.InvariantCulture));
+
+            var networkDetail = new DeviceDetailViewModel(repository, new PresenceStatisticsService(repository), monitor, networkDevice);
+            networkDetail.LoadAsync().GetAwaiter().GetResult();
+            viewModel.ShowNetworkDeviceDetail(networkDetail);
+            PumpDispatcher();
+            window.UpdateLayout();
+            Assert.Equal(MainPage.NetworkDeviceDetail, viewModel.CurrentPage);
+            AssertActiveSidebar(window, identity: router.Id.ToString(System.Globalization.CultureInfo.InvariantCulture));
+
+            viewModel.ShowDeviceList();
+            PumpDispatcher();
+            window.UpdateLayout();
+            AssertActiveSidebar(window, "OverviewNavButton");
+
+            viewModel.ShowRouterPresence(router);
+            PumpDispatcher();
+            window.UpdateLayout();
+            AssertActiveSidebar(window, identity: router.Id.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            viewModel.Routers.Clear();
+            viewModel.RefreshSidebarAsync(CancellationToken.None).GetAwaiter().GetResult();
+            PumpDispatcher();
+            window.UpdateLayout();
+            AssertDeviceListVisible(viewModel, deviceListPage, detailView, presenceView, plug.Did);
+            Assert.Null(viewModel.SelectedRouter);
+            AssertActiveSidebar(window, "OverviewNavButton");
 
             Trace.Flush();
             diagnostics.Add($"WPF Binding Error count: {bindingListener.Messages.Count}");
@@ -188,6 +292,7 @@ public sealed class MainWindowNavigationUiTests
             PresentationTraceSources.DataBindingSource.Switch.Level = originalBindingLevel;
             CloseWindowForTest(window);
             DisposeTrayIcon(window);
+            notifications?.Dispose();
             viewModel?.Dispose();
             connectionAlerts?.Dispose();
             notificationRuntime?.DisposeAsync().AsTask().GetAwaiter().GetResult();
@@ -213,13 +318,41 @@ public sealed class MainWindowNavigationUiTests
         Assert.Single(Application.Current!.Windows.Cast<Window>());
     }
 
+    private static void AssertActiveSidebar(MainWindow window, string? buttonName = null, string? identity = null)
+    {
+        var active = FindVisualChildren<Button>(window)
+            .Where(button => button.Name is "OverviewNavButton" or "QqNavButton" or "SettingsNavButton" or "AboutNavButton"
+                || button.DataContext is SidebarDeviceItemViewModel)
+            .Where(button => button.Tag is true)
+            .ToArray();
+        var selected = Assert.Single(active);
+        if (buttonName is not null) Assert.Equal(buttonName, selected.Name);
+        if (identity is not null) Assert.Equal(identity, Assert.IsType<SidebarDeviceItemViewModel>(selected.DataContext).Identity);
+    }
+
+    private static void AssertSingleActiveFilter(MainWindow window, MainViewModel viewModel, RelayCommand expected)
+    {
+        var commands = new[] { viewModel.ShowAllCommand, viewModel.ShowOnlineCommand, viewModel.ShowOfflineCommand, viewModel.ShowUnknownCommand };
+        var filters = FindVisualChildren<Button>(window)
+            .Where(button => button.IsVisible && commands.Contains(button.Command))
+            .ToArray();
+        Assert.Equal(4, filters.Length);
+        Assert.Single(filters, button => ReferenceEquals(button.Command, expected) && button.Tag is true);
+        Assert.All(filters.Where(button => !ReferenceEquals(button.Command, expected)), button => Assert.NotEqual(true, button.Tag));
+    }
+
     private static void AddMainWindowResources(Application application)
     {
         application.Resources["BooleanToVisibility"] = new BooleanToVisibilityConverter();
+        application.Resources["ButtonStyle"] = new Style(typeof(Button));
         application.Resources["SecondaryButton"] = new Style(typeof(Button));
+        application.Resources["SecondaryButtonStyle"] = new Style(typeof(Button));
+        application.Resources["DeleteButton"] = new Style(typeof(Button));
         application.Resources["FilterButton"] = new Style(typeof(Button));
         application.Resources["SurfaceCard"] = new Style(typeof(Border));
         application.Resources["SectionTitle"] = new Style(typeof(TextBlock));
+        application.Resources["MutedTextStyle"] = new Style(typeof(TextBlock));
+        application.Resources["EmptyStateCardStyle"] = new Style(typeof(Border));
     }
 
     private static void VerifyAndInvokeReturnButton(
@@ -245,6 +378,13 @@ public sealed class MainWindowNavigationUiTests
         PumpDispatcher();
 
         diagnostics.Add($"{page} CurrentPage after: {viewModel.CurrentPage}");
+    }
+
+    private static void InvokeButton(Button button)
+    {
+        var peer = new ButtonAutomationPeer(button);
+        var invoke = Assert.IsAssignableFrom<IInvokeProvider>(peer.GetPattern(PatternInterface.Invoke));
+        invoke.Invoke();
     }
 
     private static XiaomiAccountDevice AccountDevice(
@@ -351,12 +491,14 @@ public sealed class MainWindowNavigationUiTests
 
     private sealed class UiSource(IReadOnlyList<XiaomiAccountDevice> devices) : IXiaomiPresenceSource, IXiaomiAccountDeviceSource, IXiaomiDeviceControlSource
     {
+        private readonly List<XiaomiAccountDevice> _devices = devices.ToList();
         public bool HasStoredLogin => true;
         public Task LoginAsync(CancellationToken cancellationToken) => Task.CompletedTask;
         public Task RestoreAsync(CancellationToken cancellationToken) => Task.CompletedTask;
         public Task<IReadOnlyList<XiaomiRouterDevice>> DiscoverRoutersAsync(CancellationToken cancellationToken) => Task.FromResult<IReadOnlyList<XiaomiRouterDevice>>([]);
         public Task<IReadOnlyList<ObservedNetworkDevice>> GetDevicesAsync(string partnerId, CancellationToken cancellationToken) => Task.FromResult<IReadOnlyList<ObservedNetworkDevice>>([]);
-        public Task<IReadOnlyList<XiaomiAccountDevice>> DiscoverAccountDevicesAsync(CancellationToken cancellationToken) => Task.FromResult(devices);
+        public Task<IReadOnlyList<XiaomiAccountDevice>> DiscoverAccountDevicesAsync(CancellationToken cancellationToken) => Task.FromResult<IReadOnlyList<XiaomiAccountDevice>>(_devices.ToArray());
+        public void RemoveDevice(string did) => _devices.RemoveAll(value => value.Did == did);
         public Task<XiaomiPowerStateResult> ReadPowerStateAsync(XiaomiAccountDevice device, XiaomiPowerCapability capability, CancellationToken cancellationToken) => Task.FromResult(new XiaomiPowerStateResult(true, true));
         public Task<XiaomiPowerStateResult> SetPowerStateAsync(XiaomiAccountDevice device, XiaomiPowerCapability capability, bool value, CancellationToken cancellationToken) => Task.FromResult(new XiaomiPowerStateResult(true, value));
         public Task<XiaomiDeviceDefinition?> GetDeviceDefinitionAsync(XiaomiAccountDevice device, CancellationToken cancellationToken) => Task.FromResult(device.Definition);

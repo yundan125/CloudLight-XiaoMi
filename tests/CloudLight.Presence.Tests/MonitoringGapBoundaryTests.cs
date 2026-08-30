@@ -258,7 +258,7 @@ public sealed class MonitoringGapBoundaryTests
         var fact = await new SubjectPresenceService(fixture.Repository, new PresenceStatisticsService(fixture.Repository))
             .GetCurrentFactAsync(fixture.Subject.Id, At(15), CancellationToken.None);
 
-        var detected = Assert.Single(events);
+        var detected = Assert.Single(events, value => value.EventType is SubjectPresenceEventType.DetectedOnlineAfterGap or SubjectPresenceEventType.DetectedOfflineAfterGap);
         Assert.Equal(SubjectPresenceEventType.DetectedOfflineAfterGap, detected.EventType);
         Assert.Equal(At(14), detected.ObservedAt);
         var gap = Assert.Single(await fixture.Repository.GetMonitoringGapsAsync(At(0), At(16), CancellationToken.None));
@@ -283,7 +283,7 @@ public sealed class MonitoringGapBoundaryTests
         var fact = await new SubjectPresenceService(fixture.Repository, new PresenceStatisticsService(fixture.Repository))
             .GetCurrentFactAsync(fixture.Subject.Id, At(15), CancellationToken.None);
 
-        var detected = Assert.Single(events);
+        var detected = Assert.Single(events, value => value.EventType is SubjectPresenceEventType.DetectedOnlineAfterGap or SubjectPresenceEventType.DetectedOfflineAfterGap);
         Assert.Equal(SubjectPresenceEventType.DetectedOnlineAfterGap, detected.EventType);
         Assert.Equal(At(14), detected.ObservedAt);
         Assert.True(fact!.StateSinceKnown);
@@ -306,10 +306,10 @@ public sealed class MonitoringGapBoundaryTests
         var fact = await new SubjectPresenceService(fixture.Repository, new PresenceStatisticsService(fixture.Repository))
             .GetCurrentFactAsync(fixture.Subject.Id, At(15), CancellationToken.None);
 
-        Assert.Empty(await fixture.Repository.GetSubjectPresenceEventsAsync(fixture.Subject.Id, At(0), At(16), CancellationToken.None));
+        Assert.DoesNotContain(await fixture.Repository.GetSubjectPresenceEventsAsync(fixture.Subject.Id, At(0), At(16), CancellationToken.None), value => value.EventType is SubjectPresenceEventType.ConfirmedOnline or SubjectPresenceEventType.ConfirmedOffline or SubjectPresenceEventType.DetectedOnlineAfterGap or SubjectPresenceEventType.DetectedOfflineAfterGap);
         Assert.Equal(online ? PresenceState.Online : PresenceState.Offline, fact!.CurrentState);
         Assert.True(fact.StateSinceKnown);
-        Assert.Equal(At(0), fact.StateSince);
+        Assert.Equal(online ? At(10) : At(0), fact.StateSince);
     }
 
     [Fact]
@@ -330,7 +330,7 @@ public sealed class MonitoringGapBoundaryTests
             CancellationToken.None);
 
         var events = await fixture.Repository.GetSubjectPresenceEventsAsync(fixture.Subject.Id, At(0), At(16), CancellationToken.None);
-        var detected = Assert.Single(events);
+        var detected = Assert.Single(events, value => value.EventType is SubjectPresenceEventType.DetectedOnlineAfterGap or SubjectPresenceEventType.DetectedOfflineAfterGap);
         Assert.Equal(SubjectPresenceEventType.DetectedOfflineAfterGap, detected.EventType);
     }
 
@@ -367,7 +367,7 @@ public sealed class MonitoringGapBoundaryTests
             At(14),
             CancellationToken.None);
 
-        var detected = Assert.Single(await fixture.Repository.GetSubjectPresenceEventsAsync(fixture.Subject.Id, At(0), At(16), CancellationToken.None));
+        var detected = Assert.Single(await fixture.Repository.GetSubjectPresenceEventsAsync(fixture.Subject.Id, At(0), At(16), CancellationToken.None), value => value.EventType is SubjectPresenceEventType.DetectedOnlineAfterGap or SubjectPresenceEventType.DetectedOfflineAfterGap);
         Assert.Equal(SubjectPresenceEventType.DetectedOfflineAfterGap, detected.EventType);
         Assert.Equal(At(14), detected.ObservedAt);
     }
@@ -390,11 +390,11 @@ public sealed class MonitoringGapBoundaryTests
 
         Assert.Empty(await service.EvaluateAsync(At(14).AddSeconds(59), CancellationToken.None));
         var request = Assert.Single(await service.EvaluateAsync(At(15), CancellationToken.None));
-        Assert.Equal($"{(int)PresenceState.Offline}:{At(14).UtcTicks}", request.EpisodeId);
+        Assert.Equal($"state:{(int)PresenceState.Offline}:{At(14).UtcTicks}", request.EpisodeId);
     }
 
     [Fact]
-    public async Task SameStateAcrossGapDoesNotUseRecoveredVisualDurationForQqThreshold()
+    public async Task SameStateAcrossGapKeepsConfirmedDurationForQqThreshold()
     {
         await using var fixture = await CreateFixtureAsync(PresenceState.Online);
         await AddOnlineEvidenceAsync(fixture, At(10));
@@ -409,11 +409,10 @@ public sealed class MonitoringGapBoundaryTests
         var fact = await presence.GetCurrentFactAsync(fixture.Subject.Id, At(14).AddMinutes(30), CancellationToken.None);
         var service = new NotificationRuleService(fixture.Repository, presence);
 
-        Assert.Equal(At(0), fact!.StateSince);
-        Assert.Equal(TimeSpan.FromHours(14.5), fact.ConfirmedDuration);
-        Assert.Empty(await service.EvaluateAsync(At(14).AddMinutes(30), CancellationToken.None));
-        var request = Assert.Single(await service.EvaluateAsync(At(15), CancellationToken.None));
-        Assert.Equal($"{(int)PresenceState.Online}:{At(14).UtcTicks}", request.EpisodeId);
+        Assert.Equal(At(10), fact!.StateSince);
+        Assert.Equal(TimeSpan.FromHours(4.5), fact.ConfirmedDuration);
+        var request = Assert.Single(await service.EvaluateAsync(At(14).AddMinutes(30), CancellationToken.None));
+        Assert.Equal($"state:{(int)PresenceState.Online}:{At(10).UtcTicks}", request.EpisodeId);
     }
 
     private static async Task AddOnlineEvidenceAsync(Fixture fixture, DateTimeOffset at)

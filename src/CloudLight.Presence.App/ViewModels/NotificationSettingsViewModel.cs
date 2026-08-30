@@ -1,5 +1,8 @@
 using System.Collections.ObjectModel;
 using System.Windows;
+using System.Windows.Media;
+using WpfBrush = System.Windows.Media.Brush;
+using WpfBrushes = System.Windows.Media.Brushes;
 using CloudLight.Presence.Core.Interfaces;
 using CloudLight.Presence.Core.Models;
 using CloudLight.Presence.Core.Services;
@@ -35,9 +38,11 @@ public sealed class NotificationSettingsViewModel : ObservableObject, IDisposabl
     }
 
     public ObservableCollection<NotificationRuleItemViewModel> Rules { get; } = [];
+    public ObservableCollection<NotificationRecipientItemViewModel> Recipients { get; } = [];
     public ObservableCollection<NotificationDeliveryItemViewModel> RecentDeliveries { get; } = [];
     public ObservableCollection<SystemNotificationDeliveryItemViewModel> RecentSystemDeliveries { get; } = [];
     public bool HasRules => Rules.Count > 0;
+    public bool HasRecipients => Recipients.Count > 0;
     public bool HasRecentDeliveries => RecentDeliveries.Count > 0;
     public bool HasRecentSystemDeliveries => RecentSystemDeliveries.Count > 0;
     public bool HasAnyRecentDeliveries => HasRecentDeliveries || HasRecentSystemDeliveries;
@@ -61,6 +66,19 @@ public sealed class NotificationSettingsViewModel : ObservableObject, IDisposabl
     public string QqStatusDetail => string.IsNullOrWhiteSpace(_qqStatus.LastError)
         ? _qqStatus.ConnectionState == NotificationConnectionState.Connected ? "QQ 通知通道正在工作。" : "配置 QQ Bot 后即可发送通知。"
         : _qqStatus.LastError!;
+    public WpfBrush QqStatusBrush => _qqStatus.ConnectionState switch
+    {
+        NotificationConnectionState.Connected => WpfBrushes.SeaGreen,
+        NotificationConnectionState.AuthenticationFailed or NotificationConnectionState.GatewayFailed => WpfBrushes.Firebrick,
+        NotificationConnectionState.Authenticating or NotificationConnectionState.Connecting or NotificationConnectionState.Identifying or NotificationConnectionState.Reconnecting => WpfBrushes.RoyalBlue,
+        _ => WpfBrushes.SlateGray
+    };
+    public WpfBrush QqStatusBackgroundBrush => _qqStatus.ConnectionState switch
+    {
+        NotificationConnectionState.Connected => WpfBrushes.Honeydew,
+        NotificationConnectionState.AuthenticationFailed or NotificationConnectionState.GatewayFailed => WpfBrushes.MistyRose,
+        _ => WpfBrushes.AliceBlue
+    };
     public string OperationStatus { get => _operationStatus; set => Set(ref _operationStatus, value); }
 
     public async Task LoadAsync(CancellationToken cancellationToken)
@@ -71,6 +89,11 @@ public sealed class NotificationSettingsViewModel : ObservableObject, IDisposabl
             var settings = await _settings.LoadAsync(cancellationToken);
             _qqSettings = settings.Qq ?? new QqNotificationSettings();
             _connectionAlerts = settings.ConnectionAlerts ?? new ConnectionAlertSettings();
+            var migrated = await MigrateLegacyRecipientSettingsAsync(_qqSettings, _connectionAlerts, cancellationToken);
+            _qqSettings = migrated.Qq;
+            _connectionAlerts = migrated.ConnectionAlerts;
+            if (migrated.Changed)
+                await _settings.SaveAsync(settings with { Qq = _qqSettings, ConnectionAlerts = _connectionAlerts }, cancellationToken);
             _secretConfigured = _secretStore.Exists;
             RaiseQqProperties();
             await ReloadListsAsync(cancellationToken);
@@ -83,6 +106,7 @@ public sealed class NotificationSettingsViewModel : ObservableObject, IDisposabl
         await _loadGate.WaitAsync(cancellationToken);
         try
         {
+            settings = await NormalizeDefaultRecipientsAsync(settings, cancellationToken);
             var secret = string.IsNullOrWhiteSpace(secretDraft)
                 ? settings.Enabled ? await _secretStore.LoadAsync(cancellationToken) : null
                 : secretDraft.Trim();
@@ -108,8 +132,8 @@ public sealed class NotificationSettingsViewModel : ObservableObject, IDisposabl
         await _loadGate.WaitAsync(cancellationToken);
         try
         {
-            var normalized = settings with { TargetId = settings.TargetId.Trim() };
-            if (!normalized.UseDefaultTarget && (normalized.TargetId.Length == 0 || normalized.TargetId.Length > 256 || normalized.TargetId.Any(char.IsWhiteSpace)))
+            var normalized = await NormalizeConnectionAlertRecipientsAsync(settings with { TargetId = settings.TargetId.Trim() }, cancellationToken);
+            if (!normalized.UseDefaultTarget && normalized.RecipientIds.Count == 0 && (normalized.TargetId.Length == 0 || normalized.TargetId.Length > 256 || normalized.TargetId.Any(char.IsWhiteSpace)))
                 throw new ArgumentException("请输入有效的 QQ 用户或群聊 OpenID。", nameof(settings));
             var current = await _settings.LoadAsync(cancellationToken);
             await _settings.SaveAsync(current with { ConnectionAlerts = normalized }, cancellationToken);
@@ -133,8 +157,124 @@ public sealed class NotificationSettingsViewModel : ObservableObject, IDisposabl
         OperationStatus = "测试消息已发送。";
     }
 
+    public async Task SendTestMessageAsync(long recipientId, CancellationToken cancellationToken)
+    {
+        var recipient = await _repository.GetNotificationRecipientAsync(recipientId, cancellationToken)
+            ?? throw new InvalidOperationException("所选接收人不存在，请刷新后重试。");
+        await SendTestMessageAsync(recipient.TargetType, recipient.OpenId, cancellationToken);
+    }
+
+    public async Task<NotificationRecipientItemViewModel?> SaveRecipientAsync(NotificationRecipientDraft draft, long? recipientId, CancellationToken cancellationToken)
+    {
+        await _loadGate.WaitAsync(cancellationToken);
+        try
+        {
+            var now = DateTimeOffset.UtcNow;
+            var recipient = new NotificationRecipient(recipientId ?? 0, draft.Note.Trim(), draft.OpenId.Trim(), draft.TargetType, now, now);
+            if (recipientId is null)
+                recipient = await _repository.CreateNotificationRecipientAsync(recipient, cancellationToken);
+            else
+            {
+                await _repository.UpdateNotificationRecipientAsync(recipient, cancellationToken);
+                recipient = await _repository.GetNotificationRecipientAsync(recipientId.Value, cancellationToken) ?? recipient;
+            }
+            await ReloadListsAsync(cancellationToken);
+            OperationStatus = recipientId is null ? "QQ 接收人已添加。" : "QQ 接收人已更新。";
+            return Recipients.FirstOrDefault(value => value.Recipient.Id == recipient.Id);
+        }
+        finally { _loadGate.Release(); }
+    }
+
+    public async Task DeleteRecipientAsync(long recipientId, CancellationToken cancellationToken)
+    {
+        await _loadGate.WaitAsync(cancellationToken);
+        try
+        {
+            await _repository.DeleteNotificationRecipientAsync(recipientId, cancellationToken);
+            await ReloadListsAsync(cancellationToken);
+            OperationStatus = "QQ 接收人已删除。";
+        }
+        finally { _loadGate.Release(); }
+    }
+
+    public async Task<int> GetRecipientUsageCountAsync(long recipientId, CancellationToken cancellationToken) =>
+        await _repository.GetNotificationRecipientUsageCountAsync(recipientId, cancellationToken);
+
+    public NotificationRecipientItemViewModel? SaveRecipientFromDialog(NotificationRecipientDraft draft)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(draft.OpenId) || draft.OpenId.Any(char.IsWhiteSpace))
+                throw new ArgumentException("请输入有效的 OpenID。", nameof(draft));
+            if (string.IsNullOrWhiteSpace(draft.Note))
+                throw new ArgumentException("请输入接收人备注。", nameof(draft));
+
+            var now = DateTimeOffset.UtcNow;
+            var recipient = Task.Run(() => _repository.CreateNotificationRecipientAsync(
+                new NotificationRecipient(0, draft.Note.Trim(), draft.OpenId.Trim(), draft.TargetType, now, now),
+                CancellationToken.None)).GetAwaiter().GetResult();
+            var item = new NotificationRecipientItemViewModel(recipient);
+            void AddToList()
+            {
+                var existing = Recipients.FirstOrDefault(value => value.Id == item.Id);
+                if (existing is null) Recipients.Insert(0, item);
+                Raise(nameof(HasRecipients));
+            }
+            var dispatcher = System.Windows.Application.Current?.Dispatcher;
+            if (dispatcher is null || dispatcher.CheckAccess()) AddToList();
+            else dispatcher.Invoke(AddToList);
+            OperationStatus = "QQ 接收人已添加。";
+            return item;
+        }
+        catch (Exception exception)
+        {
+            OperationStatus = $"接收人未保存：{exception.Message}";
+            return null;
+        }
+    }
+
     public async Task<IReadOnlyList<PresenceSubject>> GetSubjectsAsync(CancellationToken cancellationToken) =>
         await _repository.GetSubjectsAsync(cancellationToken);
+
+    public async Task<IReadOnlyList<NotificationSubjectOption>> GetNotificationSubjectOptionsAsync(CancellationToken cancellationToken)
+    {
+        var subjects = await _repository.GetSubjectsAsync(cancellationToken);
+        var routers = (await _repository.GetRoutersAsync(cancellationToken)).ToDictionary(value => value.Id, value => value.Name);
+        var entries = new List<(PresenceSubject Subject, IReadOnlyList<NetworkDevice> Devices)>();
+        foreach (var subject in subjects)
+            entries.Add((subject, await _repository.GetSubjectDevicesAsync(subject.Id, cancellationToken)));
+
+        var labels = new Dictionary<long, string>();
+        foreach (var group in entries.GroupBy(value => value.Subject.DisplayName, StringComparer.OrdinalIgnoreCase))
+        {
+            if (group.Count() == 1)
+            {
+                var only = group.Single();
+                labels[only.Subject.Id] = only.Subject.DisplayName;
+                continue;
+            }
+
+            foreach (var entry in group)
+            {
+                var deviceCount = entry.Devices.Count;
+                var routerNames = entry.Devices
+                    .Select(value => routers.GetValueOrDefault(value.RouterId))
+                    .Where(value => !string.IsNullOrWhiteSpace(value))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+                var label = deviceCount > 1
+                    ? $"{entry.Subject.DisplayName} · {deviceCount}台设备"
+                    : deviceCount == 1 && routerNames.Length == 1
+                        ? $"{entry.Subject.DisplayName} · {routerNames[0]} · 1台设备"
+                        : $"{entry.Subject.DisplayName} · {deviceCount}台设备 · 主体{entry.Subject.Id}";
+                labels[entry.Subject.Id] = label;
+            }
+        }
+
+        return entries
+            .Select(value => new NotificationSubjectOption(value.Subject, labels[value.Subject.Id]))
+            .ToArray();
+    }
 
     public async Task SaveRuleAsync(NotificationRule rule, CancellationToken cancellationToken)
     {
@@ -201,17 +341,87 @@ public sealed class NotificationSettingsViewModel : ObservableObject, IDisposabl
     {
         var subjects = await _repository.GetSubjectsAsync(cancellationToken);
         var names = subjects.ToDictionary(value => value.Id, value => value.DisplayName);
+        var recipients = await _repository.GetNotificationRecipientsAsync(cancellationToken);
+        Recipients.Clear();
+        foreach (var recipient in recipients) Recipients.Add(new NotificationRecipientItemViewModel(recipient));
+        var recipientNames = recipients.ToDictionary(value => (value.TargetType, value.OpenId), value => value.DisplayName);
         var rules = await _repository.GetNotificationRulesAsync(enabledOnly: false, cancellationToken);
         Rules.Clear();
-        foreach (var rule in rules) Rules.Add(new NotificationRuleItemViewModel(rule, names.GetValueOrDefault(rule.SubjectId, "未知主体")));
+        foreach (var rule in rules)
+        {
+            var ruleRecipients = await _repository.GetNotificationRuleRecipientsAsync(rule.Id, cancellationToken);
+            Rules.Add(new NotificationRuleItemViewModel(rule, names.GetValueOrDefault(rule.SubjectId, "未知主体"), ruleRecipients));
+        }
         var deliveries = await _repository.GetRecentNotificationDeliveriesAsync(30, cancellationToken);
         RecentDeliveries.Clear();
         foreach (var delivery in deliveries)
-            RecentDeliveries.Add(new NotificationDeliveryItemViewModel(delivery, delivery.SubjectId is { } subjectId ? names.GetValueOrDefault(subjectId, "未知主体") : "系统通知"));
+        {
+            var recipientName = delivery.RecipientId is { } recipientId
+                ? recipients.FirstOrDefault(value => value.Id == recipientId)?.DisplayName
+                : recipientNames.GetValueOrDefault((delivery.TargetType, delivery.TargetId));
+            RecentDeliveries.Add(new NotificationDeliveryItemViewModel(delivery, delivery.SubjectId is { } subjectId ? names.GetValueOrDefault(subjectId, "未知主体") : "系统通知", recipientName));
+        }
         RecentSystemDeliveries.Clear();
         foreach (var delivery in await _repository.GetRecentSystemNotificationDeliveriesAsync(30, cancellationToken))
-            RecentSystemDeliveries.Add(new SystemNotificationDeliveryItemViewModel(delivery));
-        Raise(nameof(HasRules)); Raise(nameof(HasRecentDeliveries)); Raise(nameof(HasRecentSystemDeliveries)); Raise(nameof(HasAnyRecentDeliveries));
+        {
+            var recipientName = delivery.RecipientId is { } recipientId
+                ? recipients.FirstOrDefault(value => value.Id == recipientId)?.DisplayName
+                : recipientNames.GetValueOrDefault((delivery.TargetType, delivery.TargetId));
+            RecentSystemDeliveries.Add(new SystemNotificationDeliveryItemViewModel(delivery, recipientName));
+        }
+        Raise(nameof(HasRules)); Raise(nameof(HasRecipients)); Raise(nameof(HasRecentDeliveries)); Raise(nameof(HasRecentSystemDeliveries)); Raise(nameof(HasAnyRecentDeliveries));
+    }
+
+    private async Task<QqNotificationSettings> NormalizeDefaultRecipientsAsync(QqNotificationSettings settings, CancellationToken cancellationToken)
+    {
+        var ids = settings.DefaultRecipientIds.Distinct().ToArray();
+        if (ids.Length == 0 && !string.IsNullOrWhiteSpace(settings.DefaultTargetId))
+        {
+            var now = DateTimeOffset.UtcNow;
+            var created = await _repository.CreateNotificationRecipientAsync(new NotificationRecipient(0, "默认接收人", settings.DefaultTargetId.Trim(), settings.DefaultTargetType, now, now), cancellationToken);
+            ids = [created.Id];
+            settings = settings with { DefaultTargetType = created.TargetType, DefaultTargetId = created.OpenId };
+        }
+        var recipients = new List<NotificationRecipient>();
+        foreach (var id in ids)
+        {
+            var recipient = await _repository.GetNotificationRecipientAsync(id, cancellationToken) ?? throw new ArgumentException("默认接收人不存在，请重新选择。", nameof(settings));
+            recipients.Add(recipient);
+        }
+        if (recipients.Count > 0)
+            settings = settings with { DefaultRecipientIds = recipients.Select(value => value.Id).ToArray(), DefaultTargetType = recipients[0].TargetType, DefaultTargetId = recipients[0].OpenId };
+        return settings;
+    }
+
+    private async Task<ConnectionAlertSettings> NormalizeConnectionAlertRecipientsAsync(ConnectionAlertSettings settings, CancellationToken cancellationToken)
+    {
+        var ids = settings.RecipientIds.Distinct().ToArray();
+        if (ids.Length == 0 && !settings.UseDefaultTarget && !string.IsNullOrWhiteSpace(settings.TargetId))
+        {
+            var now = DateTimeOffset.UtcNow;
+            var created = await _repository.CreateNotificationRecipientAsync(new NotificationRecipient(0, "连接提醒接收人", settings.TargetId.Trim(), settings.TargetType, now, now), cancellationToken);
+            ids = [created.Id];
+            settings = settings with { TargetType = created.TargetType, TargetId = created.OpenId };
+        }
+        var recipients = new List<NotificationRecipient>();
+        foreach (var id in ids)
+        {
+            var recipient = await _repository.GetNotificationRecipientAsync(id, cancellationToken) ?? throw new ArgumentException("连接提醒接收人不存在，请重新选择。", nameof(settings));
+            recipients.Add(recipient);
+        }
+        return recipients.Count == 0
+            ? settings with { RecipientIds = [] }
+            : settings with { RecipientIds = recipients.Select(value => value.Id).ToArray(), TargetType = recipients[0].TargetType, TargetId = recipients[0].OpenId };
+    }
+
+    private async Task<(QqNotificationSettings Qq, ConnectionAlertSettings ConnectionAlerts, bool Changed)> MigrateLegacyRecipientSettingsAsync(QqNotificationSettings qq, ConnectionAlertSettings alerts, CancellationToken cancellationToken)
+    {
+        var originalQqIds = qq.DefaultRecipientIds;
+        var originalAlertIds = alerts.RecipientIds;
+        qq = await NormalizeDefaultRecipientsAsync(qq, cancellationToken);
+        alerts = await NormalizeConnectionAlertRecipientsAsync(alerts, cancellationToken);
+        var changed = !originalQqIds.SequenceEqual(qq.DefaultRecipientIds) || !originalAlertIds.SequenceEqual(alerts.RecipientIds);
+        return (qq, alerts, changed);
     }
 
     private void QqStatusChanged(object? sender, NotificationChannelStatus status)
@@ -230,28 +440,66 @@ public sealed class NotificationSettingsViewModel : ObservableObject, IDisposabl
     private void RaiseQqProperties()
     {
         Raise(nameof(QqSettings)); Raise(nameof(ConnectionAlerts)); Raise(nameof(QqStatus)); Raise(nameof(QqConfigured)); Raise(nameof(QqSecretConfigured));
-        Raise(nameof(QqSecretText)); Raise(nameof(QqStatusText)); Raise(nameof(QqStatusDetail));
+        Raise(nameof(QqSecretText)); Raise(nameof(QqStatusText)); Raise(nameof(QqStatusDetail)); Raise(nameof(QqStatusBrush)); Raise(nameof(QqStatusBackgroundBrush));
     }
 }
 
-public sealed class NotificationRuleItemViewModel(NotificationRule rule, string subjectName)
+public sealed record NotificationSubjectOption(PresenceSubject Subject, string Label)
+{
+    public long Id => Subject.Id;
+}
+
+public sealed record NotificationRecipientDraft(
+    string Note,
+    string OpenId,
+    NotificationTargetType TargetType);
+
+public sealed class NotificationRecipientItemViewModel(NotificationRecipient recipient)
+{
+    public NotificationRecipient Recipient { get; } = recipient;
+    public long Id => Recipient.Id;
+    public string Note => Recipient.DisplayName;
+    public string OpenId => Recipient.OpenId;
+    public string MaskedOpenId => NotificationSettingsViewModelFormatting.MaskTarget(Recipient.OpenId);
+    public string TargetTypeText => Recipient.TargetTypeText;
+    public string Summary => $"{TargetTypeText} · {MaskedOpenId}";
+}
+
+public sealed class NotificationRuleItemViewModel(
+    NotificationRule rule,
+    string subjectName,
+    IReadOnlyList<NotificationRecipient> recipients)
 {
     public NotificationRule Rule { get; } = rule;
     public string SubjectName { get; } = subjectName;
+    public IReadOnlyList<NotificationRecipient> Recipients { get; } = recipients;
     public string EnabledText => Rule.Enabled ? "已开启" : "已关闭";
     public string ToggleText => Rule.Enabled ? "关闭" : "开启";
-    public string ConditionText => Rule.Condition == NotificationCondition.OnlineFor ? "连续在线" : "连续离线";
+    public string ConditionText => Rule.Condition switch
+    {
+        NotificationCondition.OnlineFor => "连续在线",
+        NotificationCondition.OfflineFor => "连续离线",
+        NotificationCondition.DetectedOnline => "检测到上线",
+        NotificationCondition.DetectedOffline => "检测到离线",
+        _ => "未知条件"
+    };
     public string DurationText => NotificationSettingsViewModelFormatting.FormatThreshold(Rule.ThresholdSeconds);
-    public string TargetText => $"QQ {Rule.TargetType switch { NotificationTargetType.Private => "私聊", _ => "群聊" }} {NotificationSettingsViewModelFormatting.MaskTarget(Rule.TargetId)}";
-    public string Summary => $"{SubjectName} · {ConditionText} {DurationText} · 发送到 {TargetText}";
+    public string TargetText => Recipients.Count > 0
+        ? string.Join("、", Recipients.Select(value => value.DisplayName))
+        : $"QQ {Rule.TargetType switch { NotificationTargetType.Private => "私聊", _ => "群聊" }} {NotificationSettingsViewModelFormatting.MaskTarget(Rule.TargetId)}";
+    public string Summary => Rule.Condition is NotificationCondition.OnlineFor or NotificationCondition.OfflineFor
+        ? $"{SubjectName} · {ConditionText} {DurationText} · 发送到 {TargetText}"
+        : $"{SubjectName} · {ConditionText} · 发送到 {TargetText}";
     public string MessagePreview => string.IsNullOrWhiteSpace(Rule.MessageTemplate) ? "使用默认通知内容" : Rule.MessageTemplate.Replace('\n', ' ');
 }
 
-public sealed class NotificationDeliveryItemViewModel(NotificationDelivery delivery, string subjectName)
+public sealed class NotificationDeliveryItemViewModel(NotificationDelivery delivery, string subjectName, string? recipientName = null)
 {
     public string CreatedText => delivery.CreatedAt.ToLocalTime().ToString("MM-dd HH:mm");
     public string SubjectName { get; } = subjectName;
-    public string TargetText => $"QQ {delivery.TargetType switch { NotificationTargetType.Private => "私聊", _ => "群聊" }} {NotificationSettingsViewModelFormatting.MaskTarget(delivery.TargetId)}";
+    public string TargetText => string.IsNullOrWhiteSpace(recipientName)
+        ? $"QQ {delivery.TargetType switch { NotificationTargetType.Private => "私聊", _ => "群聊" }} {NotificationSettingsViewModelFormatting.MaskTarget(delivery.TargetId)}"
+        : recipientName!;
     public string MessageText => delivery.Message.Replace('\n', ' ');
     public string StatusText => delivery.Status switch
     {
@@ -269,12 +517,14 @@ public sealed class NotificationDeliveryItemViewModel(NotificationDelivery deliv
     public string ErrorText => string.IsNullOrWhiteSpace(delivery.Error) ? "" : delivery.Error!;
 }
 
-public sealed class SystemNotificationDeliveryItemViewModel(SystemNotificationDelivery delivery)
+public sealed class SystemNotificationDeliveryItemViewModel(SystemNotificationDelivery delivery, string? recipientName = null)
 {
     public string CreatedText => delivery.CreatedAt.ToLocalTime().ToString("MM-dd HH:mm");
     public string SubjectName => delivery.Kind == SystemNotificationKind.XiaomiConnectionFailure ? "Xiaomi 连接异常" : "Xiaomi 连接恢复";
     public string MessageText => delivery.Message.Replace('\n', ' ');
-    public string TargetText => $"QQ {delivery.TargetType switch { NotificationTargetType.Private => "私聊", _ => "群聊" }} {NotificationSettingsViewModelFormatting.MaskTarget(delivery.TargetId)}";
+    public string TargetText => string.IsNullOrWhiteSpace(recipientName)
+        ? $"QQ {delivery.TargetType switch { NotificationTargetType.Private => "私聊", _ => "群聊" }} {NotificationSettingsViewModelFormatting.MaskTarget(delivery.TargetId)}"
+        : recipientName!;
     public string StatusText => delivery.Status switch { NotificationDeliveryStatus.Delivered => "已发送", NotificationDeliveryStatus.Failed => "发送失败，等待重试", NotificationDeliveryStatus.Canceled => "已取消", _ => "等待发送" };
     public string StatusColor => delivery.Status switch { NotificationDeliveryStatus.Delivered => "#16803A", NotificationDeliveryStatus.Failed => "#B45309", _ => "#64748B" };
     public string ErrorText => string.IsNullOrWhiteSpace(delivery.Error) ? "" : delivery.Error!;

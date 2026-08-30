@@ -22,13 +22,15 @@ public static class SubjectActivityBuilder
             ? CoalesceAdjacent(timeline)
             : CoalesceKnownStatesAcrossUnknownPeriods(timeline);
 
+        // Subject transition records are authoritative whenever available.
+        // Suppress the matching timeline boundary so an initial baseline never
+        // appears as a fabricated "已上线/已离线" activity, and confirmed
+        // transitions are represented exactly once.
+        var eventBoundaries = detectedAfterGap.Select(value => value.EffectiveAt).ToHashSet();
         var activities = normalized
+            .Where(segment => !eventBoundaries.Contains(segment.Start))
             .Select(segment => new SubjectActivityItem(segment.Start, ToActivityType(segment.State)))
-            .Concat(detectedAfterGap.Select(value => new SubjectActivityItem(
-                value.ObservedAt,
-                value.EventType == SubjectPresenceEventType.DetectedOnlineAfterGap
-                    ? SubjectActivityType.DetectedOnlineAfterGap
-                    : SubjectActivityType.DetectedOfflineAfterGap)))
+            .Concat(detectedAfterGap.Select(ToActivityItem).Where(value => value is not null).Select(value => value!))
             .GroupBy(value => (value.OccurredAtUtc, value.Type))
             .Select(group => group.First())
             .OrderByDescending(value => value.OccurredAtUtc)
@@ -105,5 +107,14 @@ public static class SubjectActivityBuilder
         PresenceState.Online => SubjectActivityType.Online,
         PresenceState.Offline => SubjectActivityType.Offline,
         _ => SubjectActivityType.UnknownPeriod
+    };
+
+    private static SubjectActivityItem? ToActivityItem(SubjectPresenceEvent value) => value.EventType switch
+    {
+        SubjectPresenceEventType.ConfirmedOnline => new SubjectActivityItem(value.EffectiveAt, SubjectActivityType.Online),
+        SubjectPresenceEventType.ConfirmedOffline => new SubjectActivityItem(value.EffectiveAt, SubjectActivityType.Offline),
+        SubjectPresenceEventType.DetectedOnlineAfterGap => new SubjectActivityItem(value.ObservedAt, SubjectActivityType.DetectedOnlineAfterGap),
+        SubjectPresenceEventType.DetectedOfflineAfterGap => new SubjectActivityItem(value.ObservedAt, SubjectActivityType.DetectedOfflineAfterGap),
+        _ => null
     };
 }

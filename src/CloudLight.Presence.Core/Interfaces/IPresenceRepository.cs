@@ -28,7 +28,11 @@ public interface IPresenceRepository
     Task<SubjectCurrentState?> GetSubjectCurrentStateAsync(long subjectId, CancellationToken cancellationToken);
     Task<IReadOnlyList<SubjectCurrentState>> GetSubjectCurrentStatesAsync(IReadOnlyCollection<long> subjectIds, CancellationToken cancellationToken);
     Task UpsertSubjectCurrentStateAsync(SubjectCurrentState state, CancellationToken cancellationToken);
+    Task RecordSubjectStateAndEventAsync(SubjectCurrentState state, SubjectPresenceEvent presenceEvent, CancellationToken cancellationToken);
     Task AddSubjectPresenceEventAsync(SubjectPresenceEvent presenceEvent, CancellationToken cancellationToken);
+    Task<SubjectPresenceEvent?> GetSubjectPresenceEventAsync(long eventId, CancellationToken cancellationToken);
+    Task<IReadOnlyList<SubjectPresenceEvent>> GetSubjectPresenceEventsAfterIdAsync(long subjectId, long afterEventId, CancellationToken cancellationToken);
+    Task<long?> GetLatestSubjectPresenceEventIdAsync(long subjectId, CancellationToken cancellationToken);
     Task<IReadOnlyList<SubjectPresenceEvent>> GetSubjectPresenceEventsAsync(long subjectId, DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken);
     Task AddSessionAsync(PresenceSession session, CancellationToken cancellationToken);
     Task CloseOpenSessionAsync(long deviceId, DateTimeOffset endedAt, CancellationToken cancellationToken);
@@ -49,10 +53,22 @@ public interface IPresenceRepository
     Task<NotificationRule> CreateNotificationRuleAsync(NotificationRule rule, CancellationToken cancellationToken);
     Task UpdateNotificationRuleAsync(NotificationRule rule, CancellationToken cancellationToken);
     Task DeleteNotificationRuleAsync(long ruleId, CancellationToken cancellationToken);
+    Task<IReadOnlyList<NotificationRecipient>> GetNotificationRecipientsAsync(CancellationToken cancellationToken);
+    Task<NotificationRecipient?> GetNotificationRecipientAsync(long recipientId, CancellationToken cancellationToken);
+    Task<NotificationRecipient> CreateNotificationRecipientAsync(NotificationRecipient recipient, CancellationToken cancellationToken);
+    Task UpdateNotificationRecipientAsync(NotificationRecipient recipient, CancellationToken cancellationToken);
+    Task DeleteNotificationRecipientAsync(long recipientId, CancellationToken cancellationToken);
+    Task<int> GetNotificationRecipientUsageCountAsync(long recipientId, CancellationToken cancellationToken);
+    Task<IReadOnlyList<NotificationRecipient>> GetNotificationRuleRecipientsAsync(long ruleId, CancellationToken cancellationToken);
+    Task SetNotificationRuleRecipientsAsync(long ruleId, IReadOnlyCollection<long> recipientIds, CancellationToken cancellationToken);
     Task<NotificationRuleState?> GetNotificationRuleStateAsync(long ruleId, CancellationToken cancellationToken);
     Task UpsertNotificationRuleStateAsync(NotificationRuleState state, CancellationToken cancellationToken);
+    Task ResetNotificationRuleStateAsync(long ruleId, long subjectId, DateTimeOffset updatedAt, CancellationToken cancellationToken);
+    Task EnsureNotificationRuleEventWatermarksAsync(CancellationToken cancellationToken);
     Task<NotificationDelivery?> GetNotificationDeliveryAsync(long deliveryId, CancellationToken cancellationToken);
     Task<NotificationDelivery?> GetNotificationDeliveryForEpisodeAsync(long ruleId, string episodeId, CancellationToken cancellationToken);
+    Task<IReadOnlyList<NotificationDelivery>> GetNotificationDeliveriesForEpisodeAsync(long ruleId, string episodeId, CancellationToken cancellationToken);
+    Task<IReadOnlyList<NotificationDelivery>> GetNotificationDeliveriesForRuleAsync(long ruleId, CancellationToken cancellationToken);
     Task<NotificationDelivery> CreateNotificationDeliveryAsync(NotificationDelivery delivery, CancellationToken cancellationToken);
     Task UpdateNotificationDeliveryAsync(NotificationDelivery delivery, CancellationToken cancellationToken);
     Task<IReadOnlyList<NotificationDelivery>> GetPendingNotificationDeliveriesAsync(DateTimeOffset now, CancellationToken cancellationToken);
@@ -64,6 +80,7 @@ public interface IPresenceRepository
     Task UpdateSystemNotificationDeliveryAsync(SystemNotificationDelivery delivery, CancellationToken cancellationToken);
     Task<IReadOnlyList<SystemNotificationDelivery>> GetPendingSystemNotificationDeliveriesAsync(DateTimeOffset now, CancellationToken cancellationToken);
     Task<IReadOnlyList<SystemNotificationDelivery>> GetRecentSystemNotificationDeliveriesAsync(int limit, CancellationToken cancellationToken);
+    Task ReconcileSubjectIdentityAsync(CancellationToken cancellationToken);
     Task MergeSubjectsAsync(long sourceSubjectId, long targetSubjectId, DateTimeOffset updatedAt, CancellationToken cancellationToken);
 }
 
@@ -103,6 +120,16 @@ public interface INotificationDispatcher
     Task DispatchAsync(NotificationRequest request, CancellationToken cancellationToken);
     Task DispatchSystemAsync(SystemNotificationDelivery delivery, CancellationToken cancellationToken);
     Task RetryPendingAsync(DateTimeOffset now, CancellationToken cancellationToken);
+}
+
+/// <summary>
+/// A deliberately small, credential-free diagnostic sink for automatic
+/// notification work. Implementations must never throw back into the runtime.
+/// </summary>
+public interface INotificationDiagnostics
+{
+    Task RecordAsync(string stage, Exception exception, long? ruleId, long? deliveryId, CancellationToken cancellationToken);
+    Task RecordDeliveryCreatedAsync(NotificationRule rule, SubjectPresenceFact fact, SubjectPresenceEvent presenceEvent, NotificationDelivery delivery, CancellationToken cancellationToken);
 }
 
 public interface ISecureSessionStore

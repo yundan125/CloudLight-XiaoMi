@@ -3,61 +3,88 @@ using CloudLight.Presence.Core.Models;
 
 namespace CloudLight.Presence.Core.Services;
 
+/// <summary>
+/// Builds every subject-facing presence view from the persisted, confirmed
+/// subject history. Raw MAC state remains evidence only; it never gets to
+/// define a separate card, timeline, or notification boundary.
+/// </summary>
 public sealed class SubjectPresenceService(IPresenceRepository repository, IPresenceStatisticsService deviceStatistics) : ISubjectPresenceService
 {
-    public TimeSpan OfflineGracePeriod { get; } = TimeSpan.FromSeconds(30);
+    public static readonly TimeSpan DefaultOfflineGracePeriod = TimeSpan.FromSeconds(30);
+    public TimeSpan OfflineGracePeriod => DefaultOfflineGracePeriod;
 
     public async Task<SubjectPresenceSnapshot?> GetSnapshotAsync(long subjectId, DateTimeOffset now, CancellationToken cancellationToken)
     {
         var fact = await GetCurrentFactAsync(subjectId, now, cancellationToken);
-        return fact is null ? null : new(fact.Subject, fact.Members, fact.CurrentState, LegacyStateChangedAt(fact), fact.ActiveDevice,
-            fact.StateSince, fact.LastOnlineTime, fact.LastOfflineTime, fact.RouterName);
+        return fact is null ? null : new(fact.Subject, fact.Members, fact.CurrentState, fact.StateSinceKnown ? fact.StateSince : null,
+            fact.ActiveDevice, fact.StateSince, fact.LastOnlineTime, fact.LastOfflineTime, fact.RouterName);
     }
 
     public async Task<SubjectPresenceFact?> GetCurrentFactAsync(long subjectId, DateTimeOffset now, CancellationToken cancellationToken)
     {
         var subject = await repository.GetSubjectAsync(subjectId, cancellationToken);
         if (subject is null) return null;
+
         var members = await repository.GetSubjectDevicesAsync(subjectId, cancellationToken);
         var active = members.Where(value => value.CurrentObservedState == PresenceState.Online)
-            .OrderByDescending(value => value.Signal ?? int.MinValue).ThenByDescending(value => value.LastSeenAt).FirstOrDefault();
+            .OrderByDescending(value => value.Signal ?? int.MinValue)
+            .ThenByDescending(value => value.LastSeenAt)
+            .FirstOrDefault();
         var routerName = await GetRouterNameAsync(members, cancellationToken);
         if (members.Count == 0)
             return new(subject, members, PresenceState.Unknown, null, false, TimeSpan.Zero, null, null, active, routerName);
 
-        var currentState = Aggregate(members.Select(value => value.CurrentObservedState));
+        var gapFrom = now == DateTimeOffset.MinValue ? now : now.AddTicks(-1);
+        var gapTo = now == DateTimeOffset.MaxValue ? now : now.AddTicks(1);
+        if ((await repository.GetMonitoringGapsAsync(gapFrom, gapTo, cancellationToken))
+            .Any(value => value.StartedAt <= now && (value.EndedAt is null || value.EndedAt > now)))
+            return new(subject, members, PresenceState.Unknown, null, false, TimeSpan.Zero, null, null, null, routerName);
+
+        var observedState = Aggregate(members.Select(value => value.CurrentObservedState));
+        // A new monitoring run deliberately clears per-MAC observations to
+        // Unknown before its first successful router snapshot. Do not expose
+        // a stale confirmed state (or evaluate a reminder) during that
+        // interval. Once an Online observation exists it is reliable enough
+        // to win immediately; only an all-offline observation needs the
+        // persisted Online + pending-offline grace protection.
+        if (observedState == PresenceState.Unknown)
+            return new(subject, members, PresenceState.Unknown, null, false, TimeSpan.Zero, null, null, active, routerName);
+
+        var persisted = await repository.GetSubjectCurrentStateAsync(subjectId, cancellationToken);
+        var currentState = observedState == PresenceState.Online
+            ? PresenceState.Online
+            : persisted is { CurrentState: PresenceState.Online, PendingOfflineSince: not null }
+                ? PresenceState.Online
+                : PresenceState.Offline;
+        if (currentState is not (PresenceState.Online or PresenceState.Offline))
+            return new(subject, members, PresenceState.Unknown, null, false, TimeSpan.Zero, null, null, active, routerName);
+
         var from = members.Min(value => value.FirstSeenAt);
         var timeline = await GetTimelineAsync(subjectId, from, now, cancellationToken);
-        if (currentState == PresenceState.Unknown)
-            return new(subject, members, PresenceState.Unknown, null, false, TimeSpan.Zero,
-                LastBoundary(timeline, PresenceState.Online, timeline.Count),
-                LastBoundary(timeline, PresenceState.Offline, timeline.Count), active, routerName);
+        var currentSegment = timeline.LastOrDefault(value => value.State == currentState && value.End == now);
 
-        var historicalCurrent = timeline.LastOrDefault();
-        var currentIndex = historicalCurrent is null ? 0 : timeline.Count - 1;
-        var persistedCurrent = await repository.GetSubjectCurrentStateAsync(subjectId, cancellationToken);
-        var stateSince = persistedCurrent?.CurrentState == currentState
-            ? persistedCurrent.StateSince
-            : historicalCurrent?.State == currentState
-                ? await ResolveConfirmedStateSinceAsync(members, historicalCurrent, now, cancellationToken)
-                : ResolveMemberFallbackStateSince(members, currentState);
+        // Before the first post-upgrade snapshot writes a canonical baseline,
+        // safely prefer the existing grace-normalized legacy boundary. The
+        // state machine persists that same boundary on its first snapshot.
+        var stateSince = persisted?.CurrentState == currentState
+            ? persisted.StateSince
+            : currentSegment?.Start;
         var stateSinceKnown = stateSince is not null;
-        var duration = stateSince is { } confirmedSince ? NonNegative(now - confirmedSince) : TimeSpan.Zero;
-        DateTimeOffset? notificationStateSince = stateSince is { } value
-            ? await ResolveNotificationStateSinceAsync(persistedCurrent, value, now, cancellationToken)
-            : null;
+        var duration = stateSince is { } since ? NonNegative(now - since) : TimeSpan.Zero;
         return new(subject, members, currentState, stateSince, stateSinceKnown, duration,
-            LastBoundary(timeline, PresenceState.Online, currentIndex),
-            LastBoundary(timeline, PresenceState.Offline, currentIndex), active, routerName, notificationStateSince);
+            LastBoundary(timeline, PresenceState.Online, timeline.Count),
+            LastBoundary(timeline, PresenceState.Offline, timeline.Count),
+            active, routerName,
+            // Continuous rules deliberately use the exact confirmed state
+            // boundary. Monitoring gaps that later reconcile to the same
+            // state are continuous by product definition.
+            stateSince);
     }
 
     public async Task<PresenceStatistics> GetSubjectStatisticsAsync(long subjectId, DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken)
     {
         var timeline = await GetTimelineAsync(subjectId, from, to, cancellationToken);
-        var online = Sum(timeline, PresenceState.Online);
-        var offline = Sum(timeline, PresenceState.Offline);
-        var unknown = Sum(timeline, PresenceState.Unknown);
-        return new(from, to, online, offline, unknown);
+        return new(from, to, Sum(timeline, PresenceState.Online), Sum(timeline, PresenceState.Offline), Sum(timeline, PresenceState.Unknown));
     }
 
     public async Task<IReadOnlyList<PresenceTimelineSegment>> GetTimelineAsync(long subjectId, DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken)
@@ -65,30 +92,121 @@ public sealed class SubjectPresenceService(IPresenceRepository repository, IPres
         if (to <= from) return [];
         var members = await repository.GetSubjectDevicesAsync(subjectId, cancellationToken);
         if (members.Count == 0) return [new(from, to, PresenceState.Unknown)];
+
+        var events = await repository.GetSubjectPresenceEventsAsync(subjectId, DateTimeOffset.MinValue, DateTimeOffset.MaxValue, cancellationToken);
+        var seeds = events.Where(IsConfirmedHistoryEvent).OrderBy(value => value.EffectiveAt).ThenBy(value => value.ObservedAt).ThenBy(value => value.Id).ToArray();
+        if (seeds.Length == 0)
+            return await GetLegacyTimelineAsync(subjectId, from, to, cancellationToken);
+
+        var transitions = events.Where(IsTimelineEvent).OrderBy(value => value.EffectiveAt).ThenBy(value => value.ObservedAt).ThenBy(value => value.Id).ToArray();
+
+        var canonicalStart = seeds[0].EffectiveAt;
+        if (canonicalStart <= from)
+            return await BuildConfirmedTimelineAsync(transitions, from, to, cancellationToken);
+
+        var prefixEnd = canonicalStart < to ? canonicalStart : to;
+        var result = new List<PresenceTimelineSegment>();
+        if (prefixEnd > from)
+            result.AddRange(await GetLegacyTimelineAsync(subjectId, from, prefixEnd, cancellationToken));
+        if (canonicalStart < to)
+            result.AddRange(await BuildConfirmedTimelineAsync(transitions, canonicalStart, to, cancellationToken));
+        return Coalesce(result);
+    }
+
+    /// <summary>
+    /// Compatibility path for pre-confirmation-history data only. It is also
+    /// used once by the state machine to seed a conservative post-upgrade
+    /// baseline, after which subject views stop applying this derived grace.
+    /// </summary>
+    internal async Task<IReadOnlyList<PresenceTimelineSegment>> GetLegacyTimelineAsync(long subjectId, DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken)
+    {
+        if (to <= from) return [];
+        var members = await repository.GetSubjectDevicesAsync(subjectId, cancellationToken);
+        if (members.Count == 0) return [new(from, to, PresenceState.Unknown)];
+
         var timelines = new List<IReadOnlyList<PresenceTimelineSegment>>(members.Count);
         foreach (var member in members)
             timelines.Add(await deviceStatistics.GetTimelineAsync(member.Id, from, to, cancellationToken));
 
         var boundaries = new SortedSet<DateTimeOffset> { from, to };
-        foreach (var segment in timelines.SelectMany(value => value)) { boundaries.Add(segment.Start); boundaries.Add(segment.End); }
+        foreach (var segment in timelines.SelectMany(value => value))
+        {
+            boundaries.Add(segment.Start);
+            boundaries.Add(segment.End);
+        }
+
         var points = boundaries.ToArray();
         var raw = new List<PresenceTimelineSegment>();
         for (var index = 0; index < points.Length - 1; index++)
         {
-            var start = points[index]; var end = points[index + 1];
-            var states = timelines.Select(value => StateAt(value, start, end)).ToArray();
-            var state = Aggregate(states);
-            Append(raw, start, end, state);
+            var start = points[index];
+            var end = points[index + 1];
+            Append(raw, start, end, Aggregate(timelines.Select(value => StateAt(value, start, end))));
         }
 
-        ApplyOfflineGrace(raw, to);
+        ApplyLegacyOfflineGrace(raw, to);
         return Coalesce(raw);
     }
 
-    private void ApplyOfflineGrace(List<PresenceTimelineSegment> raw, DateTimeOffset to)
+    private async Task<IReadOnlyList<PresenceTimelineSegment>> BuildConfirmedTimelineAsync(
+        IReadOnlyList<SubjectPresenceEvent> confirmed,
+        DateTimeOffset from,
+        DateTimeOffset to,
+        CancellationToken cancellationToken)
     {
-        // A short all-offline interval adjacent to an online interval is a band-switch grace period.
-        // It remains a derived online interval; MAC-level sessions/events are never changed.
+        var gaps = (await repository.GetMonitoringGapsAsync(DateTimeOffset.MinValue, DateTimeOffset.MaxValue, cancellationToken))
+            .ToDictionary(value => value.Id);
+        var events = confirmed.Where(value => value.EffectiveAt <= to).ToArray();
+        var prior = events.LastOrDefault(value => value.EffectiveAt <= from);
+        PresenceState? currentState = prior is null ? null : StateFor(prior);
+        var cursor = from;
+        var result = new List<PresenceTimelineSegment>();
+
+        foreach (var transition in events.Where(value => value.EffectiveAt > from && value.EffectiveAt < to))
+        {
+            AppendIntervalBeforeTransition(result, currentState, cursor, transition, gaps);
+            cursor = transition.EffectiveAt;
+            currentState = StateFor(transition);
+        }
+
+        if (currentState is { } state)
+            Append(result, cursor, to, state);
+        else
+            Append(result, cursor, to, PresenceState.Unknown);
+        return Coalesce(result);
+    }
+
+    private static void AppendIntervalBeforeTransition(
+        List<PresenceTimelineSegment> result,
+        PresenceState? currentState,
+        DateTimeOffset cursor,
+        SubjectPresenceEvent transition,
+        IReadOnlyDictionary<long, MonitoringGap> gaps)
+    {
+        var transitionAt = transition.EffectiveAt;
+        if (transitionAt <= cursor) return;
+        if (currentState is not { } state)
+        {
+            Append(result, cursor, transitionAt, PresenceState.Unknown);
+            return;
+        }
+
+        if (IsDetectedAfterGap(transition.EventType) && transition.MonitoringGapId is { } gapId && gaps.TryGetValue(gapId, out var gap))
+        {
+            var unknownStart = Max(cursor, gap.StartedAt);
+            if (unknownStart > cursor) Append(result, cursor, unknownStart, state);
+            if (transitionAt > unknownStart) Append(result, unknownStart, transitionAt, PresenceState.Unknown);
+            return;
+        }
+
+        Append(result, cursor, transitionAt, state);
+    }
+
+    private void ApplyLegacyOfflineGrace(List<PresenceTimelineSegment> raw, DateTimeOffset to)
+    {
+        // Old installs have only MAC-level history. This is intentionally a
+        // one-time compatibility interpretation; new confirmed subject events
+        // never pass through this second grace path.
         for (var index = 0; index < raw.Count; index++)
         {
             var segment = raw[index];
@@ -100,8 +218,27 @@ public sealed class SubjectPresenceService(IPresenceRepository repository, IPres
         }
     }
 
+    private static bool IsConfirmedHistoryEvent(SubjectPresenceEvent value) => value.EventType is
+        SubjectPresenceEventType.InitialOnline or
+        SubjectPresenceEventType.InitialOffline or
+        SubjectPresenceEventType.ConfirmedOnline or
+        SubjectPresenceEventType.ConfirmedOffline;
+
+    private static bool IsTimelineEvent(SubjectPresenceEvent value) => StateFor(value) is PresenceState.Online or PresenceState.Offline;
+
+    public static bool IsDetectedAfterGap(SubjectPresenceEventType value) => value is
+        SubjectPresenceEventType.DetectedOnlineAfterGap or SubjectPresenceEventType.DetectedOfflineAfterGap;
+
+    internal static PresenceState StateFor(SubjectPresenceEvent value) => value.EventType switch
+    {
+        SubjectPresenceEventType.InitialOnline or SubjectPresenceEventType.ConfirmedOnline or SubjectPresenceEventType.DetectedOnlineAfterGap => PresenceState.Online,
+        SubjectPresenceEventType.InitialOffline or SubjectPresenceEventType.ConfirmedOffline or SubjectPresenceEventType.DetectedOfflineAfterGap => PresenceState.Offline,
+        _ => PresenceState.Unknown
+    };
+
     private static PresenceState StateAt(IReadOnlyList<PresenceTimelineSegment> values, DateTimeOffset start, DateTimeOffset end) =>
         values.FirstOrDefault(value => value.Start < end && value.End > start)?.State ?? PresenceState.Unknown;
+
     public static PresenceState Aggregate(IEnumerable<PresenceState> states)
     {
         var values = states as PresenceState[] ?? states.ToArray();
@@ -109,101 +246,33 @@ public sealed class SubjectPresenceService(IPresenceRepository repository, IPres
         if (values.Contains(PresenceState.Unknown)) return PresenceState.Unknown;
         return PresenceState.Offline;
     }
+
     private static void Append(List<PresenceTimelineSegment> values, DateTimeOffset start, DateTimeOffset end, PresenceState state)
     {
-        if (values.Count > 0 && values[^1].State == state && values[^1].End == start) values[^1] = values[^1] with { End = end };
-        else values.Add(new(start, end, state));
+        if (end <= start) return;
+        if (values.Count > 0 && values[^1].State == state && values[^1].End == start)
+            values[^1] = values[^1] with { End = end };
+        else
+            values.Add(new PresenceTimelineSegment(start, end, state));
     }
+
     private static IReadOnlyList<PresenceTimelineSegment> Coalesce(IEnumerable<PresenceTimelineSegment> source)
     {
         var result = new List<PresenceTimelineSegment>();
         foreach (var value in source) Append(result, value.Start, value.End, value.State);
         return result;
     }
+
     private static TimeSpan Sum(IEnumerable<PresenceTimelineSegment> values, PresenceState state) =>
         TimeSpan.FromTicks(values.Where(value => value.State == state).Sum(value => (value.End - value.Start).Ticks));
-    private async Task<DateTimeOffset?> ResolveConfirmedStateSinceAsync(IReadOnlyList<NetworkDevice> members, PresenceTimelineSegment current, DateTimeOffset now, CancellationToken cancellationToken)
-    {
-        var candidates = new List<DateTimeOffset>();
-        foreach (var member in members)
-        {
-            var relevant = current.State switch
-            {
-                PresenceState.Online => member.CurrentObservedState == PresenceState.Online,
-                PresenceState.Offline => member.CurrentObservedState == PresenceState.Offline,
-                _ => false
-            };
-            if (!relevant) continue;
-
-            if (member.LastStateChangedAt is { } lastChangedAt)
-                candidates.Add(lastChangedAt);
-
-            var sessions = await repository.GetSessionsAsync(member.Id, cancellationToken);
-            foreach (var session in sessions)
-            {
-                if (current.State == PresenceState.Online && session.StartKnown && session.EndedAt is null)
-                    candidates.Add(session.StartedAt);
-                if (current.State == PresenceState.Offline && session.EndKnown && session.EndedAt is { } endedAt)
-                    candidates.Add(endedAt);
-            }
-
-            var events = await repository.GetEventsAsync(member.Id, cancellationToken);
-            foreach (var value in events)
-            {
-                if ((current.State == PresenceState.Online && value.EventType == PresenceEventType.Online) ||
-                    (current.State == PresenceState.Offline && value.EventType == PresenceEventType.Offline))
-                    candidates.Add(value.ObservedAt);
-            }
-        }
-
-        if (candidates.Count == 0) return null;
-        var valid = candidates
-            .Where(value => value <= now)
-            .Distinct()
-            .ToArray();
-        if (valid.Length == 0) return null;
-        return current.State == PresenceState.Online ? valid.Min() : valid.Max();
-    }
-
-    private static DateTimeOffset? ResolveMemberFallbackStateSince(
-        IReadOnlyList<NetworkDevice> members,
-        PresenceState currentState)
-    {
-        var candidates = members
-            .Where(member => member.CurrentObservedState == currentState)
-            .Select(member => member.LastStateChangedAt ?? member.LastSeenAt)
-            .ToArray();
-        if (candidates.Length == 0) return null;
-        return currentState == PresenceState.Online ? candidates.Min() : candidates.Max();
-    }
-
-    private async Task<DateTimeOffset?> ResolveNotificationStateSinceAsync(
-        SubjectCurrentState? persistedCurrent,
-        DateTimeOffset stateSince,
-        DateTimeOffset now,
-        CancellationToken cancellationToken)
-    {
-        if (persistedCurrent is null) return stateSince;
-        var gaps = await repository.GetMonitoringGapsAsync(stateSince, now, cancellationToken);
-        // Until a successful snapshot at or after the end of every gap, a
-        // restored visual duration is not safe notification evidence.
-        if (gaps.Any(gap => gap.StartedAt > stateSince &&
-                            (gap.EndedAt is null || gap.EndedAt > persistedCurrent.LastObservedAt)))
-            return null;
-        var latestGapEnd = gaps
-            .Where(gap => gap.StartedAt > stateSince && gap.EndedAt is { } endedAt && endedAt <= persistedCurrent.LastObservedAt)
-            .Select(gap => gap.EndedAt!.Value)
-            .DefaultIfEmpty(stateSince)
-            .Max();
-        return latestGapEnd > stateSince ? latestGapEnd : stateSince;
-    }
 
     private async Task<string?> GetRouterNameAsync(IReadOnlyList<NetworkDevice> members, CancellationToken cancellationToken)
     {
         var routerIds = members.Select(value => value.RouterId).Distinct().ToArray();
         if (routerIds.Length == 0) return null;
         var routers = await repository.GetRoutersAsync(cancellationToken);
-        var names = routers.Where(value => routerIds.Contains(value.Id)).Select(value => value.Name).Where(value => !string.IsNullOrWhiteSpace(value)).Distinct().ToArray();
+        var names = routers.Where(value => routerIds.Contains(value.Id)).Select(value => value.Name)
+            .Where(value => !string.IsNullOrWhiteSpace(value)).Distinct().ToArray();
         return names.Length == 0 ? null : string.Join("、", names);
     }
 
@@ -215,8 +284,5 @@ public sealed class SubjectPresenceService(IPresenceRepository repository, IPres
     }
 
     private static TimeSpan NonNegative(TimeSpan value) => value < TimeSpan.Zero ? TimeSpan.Zero : value;
-    private static DateTimeOffset? LegacyStateChangedAt(SubjectPresenceFact fact)
-    {
-        return fact.StateSinceKnown ? fact.StateSince : null;
-    }
+    private static DateTimeOffset Max(DateTimeOffset left, DateTimeOffset right) => left > right ? left : right;
 }

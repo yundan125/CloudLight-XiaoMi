@@ -34,7 +34,23 @@ public sealed class DeviceDetailViewModel : ObservableObject, IDisposable
     public string? CustomName { get => _customName; set => Set(ref _customName, value); } public string? Note { get => _note; set => Set(ref _note, value); }
     public string SaveStatus { get => _saveStatus; private set => Set(ref _saveStatus, value); }
     public DateTimeOffset TimelineFrom { get => _timelineFrom; private set => Set(ref _timelineFrom, value); } public DateTimeOffset TimelineTo { get => _timelineTo; private set => Set(ref _timelineTo, value); }
-    public int TimelineDays { get => _timelineDays; private set => Set(ref _timelineDays, value); } public string SelectedRange { get => _selectedRange; private set => Set(ref _selectedRange, value); }
+    public int TimelineDays
+    {
+        get => _timelineDays;
+        private set
+        {
+            if (!Set(ref _timelineDays, value)) return;
+            Raise(nameof(Is24HoursSelected));
+            Raise(nameof(Is3DaysSelected));
+            Raise(nameof(Is7DaysSelected));
+            Raise(nameof(Is30DaysSelected));
+        }
+    }
+    public bool Is24HoursSelected => TimelineDays == 1;
+    public bool Is3DaysSelected => TimelineDays == 3;
+    public bool Is7DaysSelected => TimelineDays == 7;
+    public bool Is30DaysSelected => TimelineDays == 30;
+    public string SelectedRange { get => _selectedRange; private set => Set(ref _selectedRange, value); }
     public AsyncRelayCommand Show24HoursCommand { get; } public AsyncRelayCommand Show3DaysCommand { get; } public AsyncRelayCommand Show7DaysCommand { get; } public AsyncRelayCommand Show30DaysCommand { get; } public AsyncRelayCommand SaveCommand { get; }
 
     public async Task LoadAsync()

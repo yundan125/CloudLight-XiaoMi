@@ -9,6 +9,7 @@ public sealed class XiaomiConnectionAlertService : IDisposable
     private readonly IPresenceRepository _repository;
     private readonly INotificationDispatcher _dispatcher;
     private readonly Func<CancellationToken, Task<ConnectionAlertConfiguration>> _configurationProvider;
+    private readonly INotificationDiagnostics _diagnostics;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private bool _disposed;
 
@@ -17,9 +18,10 @@ public sealed class XiaomiConnectionAlertService : IDisposable
         IPresenceRepository repository,
         INotificationDispatcher dispatcher,
         Func<CancellationToken, Task<ConnectionAlertConfiguration>> configurationProvider,
-        bool subscribe = true)
+        bool subscribe = true,
+        INotificationDiagnostics? diagnostics = null)
     {
-        _monitor = monitor; _repository = repository; _dispatcher = dispatcher; _configurationProvider = configurationProvider;
+        _monitor = monitor; _repository = repository; _dispatcher = dispatcher; _configurationProvider = configurationProvider; _diagnostics = diagnostics ?? NullNotificationDiagnostics.Instance;
         if (subscribe) _monitor.StatusChanged += MonitorStatusChanged;
     }
 
@@ -45,33 +47,39 @@ public sealed class XiaomiConnectionAlertService : IDisposable
                     state = state with { LastSuccessfulCloudUpdateAt = status.LastSuccessfulCloudUpdate ?? state.LastSuccessfulCloudUpdateAt, UpdatedAt = now };
                 }
 
-                SystemNotificationDelivery? delivery = null;
                 var configuration = await _configurationProvider(cancellationToken);
-                if (!state.FailureAlertSent && configuration.Settings.Enabled && TryResolveTarget(configuration, out var targetType, out var targetId))
+                var deliveries = new List<SystemNotificationDelivery>();
+                if (!state.FailureAlertSent && configuration.Settings.Enabled)
                 {
-                    delivery = await _repository.CreateSystemNotificationDeliveryAsync(new SystemNotificationDelivery(
-                        0, SystemNotificationKind.XiaomiConnectionFailure, episode, now, NotificationDeliveryStatus.Pending, null,
-                        NotificationChannelType.QQ, targetType, targetId, FailureMessage(status.RouterName, state.LastSuccessfulCloudUpdateAt, now), null, 0, 0, null, now), cancellationToken);
-                    state = state with { FailureAlertSent = true, UpdatedAt = now };
+                    foreach (var target in await ResolveTargetsAsync(configuration, cancellationToken))
+                    {
+                        deliveries.Add(await _repository.CreateSystemNotificationDeliveryAsync(new SystemNotificationDelivery(
+                            0, SystemNotificationKind.XiaomiConnectionFailure, episode, now, NotificationDeliveryStatus.Pending, null,
+                            NotificationChannelType.QQ, target.TargetType, target.TargetId, FailureMessage(status.RouterName, state.LastSuccessfulCloudUpdateAt, now), null, 0, 0, null, now, target.RecipientId), cancellationToken));
+                    }
+                    if (deliveries.Count > 0) state = state with { FailureAlertSent = true, UpdatedAt = now };
                 }
                 await _repository.UpsertConnectionAlertStateAsync(state with { UpdatedAt = now }, cancellationToken);
-                if (delivery is not null) await _dispatcher.DispatchSystemAsync(delivery, cancellationToken);
+                foreach (var delivery in deliveries) await _dispatcher.DispatchSystemAsync(delivery, cancellationToken);
                 return;
             }
 
             if (state?.FailureEpisodeId is not { Length: > 0 } episodeId) return;
             var connectedAt = DateTimeOffset.UtcNow;
-            SystemNotificationDelivery? recovery = null;
+            var recoveries = new List<SystemNotificationDelivery>();
             var recoveryConfiguration = await _configurationProvider(cancellationToken);
-            if (!state.RecoveryAlertSent && recoveryConfiguration.Settings.RecoveryEnabled && TryResolveTarget(recoveryConfiguration, out var recoveryTargetType, out var recoveryTargetId))
+            if (!state.RecoveryAlertSent && recoveryConfiguration.Settings.RecoveryEnabled)
             {
-                recovery = await _repository.CreateSystemNotificationDeliveryAsync(new SystemNotificationDelivery(
-                    0, SystemNotificationKind.XiaomiConnectionRecovery, episodeId, connectedAt, NotificationDeliveryStatus.Pending, null,
-                    NotificationChannelType.QQ, recoveryTargetType, recoveryTargetId, RecoveryMessage(status.RouterName, connectedAt), null, 0, 0, null, connectedAt), cancellationToken);
-                state = state with { RecoveryAlertSent = true };
+                foreach (var target in await ResolveTargetsAsync(recoveryConfiguration, cancellationToken))
+                {
+                    recoveries.Add(await _repository.CreateSystemNotificationDeliveryAsync(new SystemNotificationDelivery(
+                        0, SystemNotificationKind.XiaomiConnectionRecovery, episodeId, connectedAt, NotificationDeliveryStatus.Pending, null,
+                        NotificationChannelType.QQ, target.TargetType, target.TargetId, RecoveryMessage(status.RouterName, connectedAt), null, 0, 0, null, connectedAt, target.RecipientId), cancellationToken));
+                }
+                if (recoveries.Count > 0) state = state with { RecoveryAlertSent = true };
             }
             await _repository.UpsertConnectionAlertStateAsync(state with { FailureEpisodeId = null, FailureStartedAt = null, LastSuccessfulCloudUpdateAt = status.LastSuccessfulCloudUpdate ?? state.LastSuccessfulCloudUpdateAt, FailureAlertSent = false, RecoveryAlertSent = false, UpdatedAt = connectedAt }, cancellationToken);
-            if (recovery is not null) await _dispatcher.DispatchSystemAsync(recovery, cancellationToken);
+            foreach (var recovery in recoveries) await _dispatcher.DispatchSystemAsync(recovery, cancellationToken);
         }
         finally { _gate.Release(); }
     }
@@ -86,15 +94,41 @@ public sealed class XiaomiConnectionAlertService : IDisposable
 
     private async void MonitorStatusChanged(object? sender, MonitorStatus status)
     {
-        try { await ProcessStatusAsync(status, CancellationToken.None); } catch { }
+        try
+        {
+            await ProcessStatusAsync(status, CancellationToken.None);
+        }
+        catch (Exception exception)
+        {
+            await _diagnostics.RecordAsync("system_alert", exception, null, null, CancellationToken.None);
+        }
     }
 
-    private static bool TryResolveTarget(ConnectionAlertConfiguration configuration, out NotificationTargetType targetType, out string targetId)
+    private async Task<IReadOnlyList<NotificationRecipientTarget>> ResolveTargetsAsync(ConnectionAlertConfiguration configuration, CancellationToken cancellationToken)
     {
-        targetType = configuration.Settings.UseDefaultTarget ? configuration.DefaultTargetType : configuration.Settings.TargetType;
-        targetId = (configuration.Settings.UseDefaultTarget ? configuration.DefaultTargetId : configuration.Settings.TargetId).Trim();
-        return targetId.Length > 0 && targetId.Length <= 256 && !targetId.Any(char.IsWhiteSpace);
+        if (configuration.Settings.UseDefaultTarget)
+        {
+            if (configuration.DefaultTargets is { Count: > 0 }) return configuration.DefaultTargets;
+            return IsValidTarget(configuration.DefaultTargetId)
+                ? [new(null, configuration.DefaultTargetType, configuration.DefaultTargetId.Trim())]
+                : [];
+        }
+
+        if (configuration.Settings.RecipientIds.Count > 0)
+        {
+            var result = new List<NotificationRecipientTarget>();
+            foreach (var recipientId in configuration.Settings.RecipientIds.Distinct())
+                if (await _repository.GetNotificationRecipientAsync(recipientId, cancellationToken) is { } recipient)
+                    result.Add(new(recipient.Id, recipient.TargetType, recipient.OpenId, recipient.DisplayName));
+            if (result.Count > 0) return result;
+        }
+
+        return IsValidTarget(configuration.Settings.TargetId)
+            ? [new(null, configuration.Settings.TargetType, configuration.Settings.TargetId.Trim())]
+            : [];
     }
+
+    private static bool IsValidTarget(string value) => value.Trim() is { Length: > 0 and <= 256 } target && !target.Any(char.IsWhiteSpace);
 
     private static string FailureMessage(string? routerName, DateTimeOffset? lastSuccessfulUpdate, DateTimeOffset now) =>
         $"CloudLight XiaoMi 无法连接 Xiaomi 服务。\n\n路由器：{Value(routerName, "当前路由器")}\n最后成功更新：{NotificationTemplateRenderer.FormatTime(lastSuccessfulUpdate)}\n异常时间：{NotificationTemplateRenderer.FormatTime(now)}\n\n设备在线状态可能暂时无法更新。";

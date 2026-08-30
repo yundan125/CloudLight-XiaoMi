@@ -21,7 +21,14 @@ public sealed record QqNotificationSettings(
     string ProxyMode = "environment",
     string ProxyUrl = "",
     NotificationTargetType DefaultTargetType = NotificationTargetType.Private,
-    string DefaultTargetId = "");
+    string DefaultTargetId = "")
+{
+    /// <summary>
+    /// IDs of saved QQ recipients used for system/default notifications.
+    /// DefaultTargetType/DefaultTargetId remain for importing older settings.
+    /// </summary>
+    public IReadOnlyList<long> DefaultRecipientIds { get; init; } = [];
+}
 
 public sealed class JsonSettingsStore(IAppDataPaths paths)
 {
@@ -31,8 +38,19 @@ public sealed class JsonSettingsStore(IAppDataPaths paths)
     {
         if (!File.Exists(paths.SettingsPath)) return new PresenceSettings();
         await using var stream = File.OpenRead(paths.SettingsPath);
-        return await JsonSerializer.DeserializeAsync<PresenceSettings>(stream, Options, cancellationToken)
+        var value = await JsonSerializer.DeserializeAsync<PresenceSettings>(stream, Options, cancellationToken)
             ?? new PresenceSettings();
+
+        // System.Text.Json materializes IReadOnlyList<T> as List<T>.  Normalize
+        // the new collection-valued settings so older record equality checks and
+        // callers see the same stable shape as settings created in memory.
+        var qq = value.Qq ?? new QqNotificationSettings();
+        var connectionAlerts = value.ConnectionAlerts ?? new ConnectionAlertSettings();
+        return value with
+        {
+            Qq = qq with { DefaultRecipientIds = (qq.DefaultRecipientIds ?? []).ToArray() },
+            ConnectionAlerts = connectionAlerts with { RecipientIds = (connectionAlerts.RecipientIds ?? []).ToArray() }
+        };
     }
 
     public async Task SaveAsync(PresenceSettings settings, CancellationToken cancellationToken)

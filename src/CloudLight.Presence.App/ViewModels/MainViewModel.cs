@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Reflection;
 using System.Windows.Data;
 using System.Windows.Threading;
 using CloudLight.Presence.Core.Interfaces;
@@ -13,7 +14,19 @@ public enum MainPage
 {
     XiaomiDeviceList = 0,
     RouterPresence = 1,
-    XiaomiAccountDeviceDetail = 2
+    XiaomiAccountDeviceDetail = 2,
+    QqReminder = 3,
+    Settings = 4,
+    About = 5,
+    SubjectDetail = 6,
+    NetworkDeviceDetail = 7
+}
+
+public enum SidebarDeviceKind
+{
+    Router,
+    PresenceSubject,
+    XiaomiAccountDevice
 }
 
 public sealed class MainViewModel : ObservableObject, IDisposable
@@ -38,9 +51,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private string _searchText = "";
     private string _accountSearchText = "";
     private PresenceSettings _currentSettings = new();
-    private MainPage _currentPage = MainPage.XiaomiDeviceList;
+    private NavigationTarget _currentNavigationTarget = NavigationTarget.Overview;
+    private bool _isDevicesExpanded = true;
     private RouterPresenceViewModel? _currentRouterPresence;
     private XiaomiAccountDeviceDetailViewModel? _currentXiaomiAccountDeviceDetail;
+    private SubjectDetailViewModel? _currentSubjectDetail;
+    private DeviceDetailViewModel? _currentNetworkDeviceDetail;
     // Detail capability requests can still be completing when a user goes
     // back or opens another device.  Keep retired instances alive until the
     // app shuts down so their gates are never disposed while in use.
@@ -78,6 +94,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         ShowOfflineCommand = new RelayCommand(() => SetFilter("离线"));
         ShowUnknownCommand = new RelayCommand(() => SetFilter("未知"));
         ReturnToDevicesCommand = new RelayCommand(ShowDeviceList);
+        ToggleDevicesCommand = new RelayCommand(() => IsDevicesExpanded = !IsDevicesExpanded);
+        ShowDeviceListCommand = new RelayCommand(ShowDeviceList);
+        ShowQqReminderCommand = new RelayCommand(ShowQqReminderPage);
+        ShowSettingsCommand = new RelayCommand(ShowSettingsPage);
+        ShowAboutCommand = new RelayCommand(ShowAboutPage);
 
         _monitor.StatusChanged += OnStatusChanged;
         _monitor.SnapshotApplied += (_, _) => RunOnUi(RefreshCardsAsync);
@@ -114,6 +135,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public ObservableCollection<PresenceCardViewModel> Cards { get; } = [];
     public ObservableCollection<PresenceCardViewModel> Devices => Cards;
     public ObservableCollection<XiaomiAccountDeviceCardViewModel> AccountDevices { get; } = [];
+    public ObservableCollection<SidebarNavigationGroupViewModel> SidebarGroups { get; } = [];
+    public ObservableCollection<SidebarDeviceItemViewModel> SidebarDevices { get; } = [];
     public ICollectionView CardsView { get; }
     public ICollectionView AccountDevicesView { get; }
 
@@ -125,6 +148,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public RelayCommand ShowOfflineCommand { get; }
     public RelayCommand ShowUnknownCommand { get; }
     public RelayCommand ReturnToDevicesCommand { get; }
+    public RelayCommand ToggleDevicesCommand { get; }
+    public RelayCommand ShowDeviceListCommand { get; }
+    public RelayCommand ShowQqReminderCommand { get; }
+    public RelayCommand ShowSettingsCommand { get; }
+    public RelayCommand ShowAboutCommand { get; }
     public NotificationSettingsViewModel? Notifications { get; }
 
     public event EventHandler<PresenceSubject>? OpenSubjectRequested;
@@ -139,6 +167,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             if (!Set(ref _selectedRouter, value)) return;
             StartCommand.Refresh();
             Raise(nameof(RouterSummary));
+            Raise(nameof(RouterName));
+            Raise(nameof(RouterModel));
             Raise(nameof(Diagnostics));
         }
     }
@@ -165,26 +195,74 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public string AccountConnectionText => LoginRequired ? "需要登录" : "已连接";
     public IXiaomiDeviceControlSource? DeviceControlSource => _accountDeviceSource as IXiaomiDeviceControlSource;
     public string RouterSummary => SelectedRouter is null ? "尚未选择路由器" : $"{SelectedRouter.Name} · {SelectedRouter.MiotModel}";
-    public MainPage CurrentPage
+    public string RouterName => SelectedRouter?.Name ?? "尚未选择路由器";
+    public string RouterModel => SelectedRouter?.MiotModel ?? "未选择型号";
+    public NavigationTarget CurrentNavigationTarget
     {
-        get => _currentPage;
+        get => _currentNavigationTarget;
         private set
         {
-            if (value == MainPage.RouterPresence && CurrentRouterPresence is null)
-                value = MainPage.XiaomiDeviceList;
-            if (value == MainPage.XiaomiAccountDeviceDetail && CurrentXiaomiAccountDeviceDetail is null)
-                value = MainPage.XiaomiDeviceList;
-            if (!Set(ref _currentPage, value)) return;
+            value = NormalizeNavigationTarget(value);
+            if (!Set(ref _currentNavigationTarget, value)) return;
+            Raise(nameof(CurrentPage));
             Raise(nameof(IsXiaomiDeviceListPage));
             Raise(nameof(IsRouterPresencePage));
             Raise(nameof(IsXiaomiAccountDeviceDetailPage));
+            Raise(nameof(IsQqReminderPage));
+            Raise(nameof(IsSettingsPage));
+            Raise(nameof(IsAboutPage));
+            Raise(nameof(IsSubjectDetailPage));
+            Raise(nameof(IsNetworkDeviceDetailPage));
+            Raise(nameof(IsOverviewActive));
+            Raise(nameof(IsQqReminderActive));
+            Raise(nameof(IsSettingsActive));
+            Raise(nameof(IsAboutActive));
+            RaiseFilterStates();
+            Raise(nameof(ActiveSidebarNavigationTarget));
             Raise(nameof(MainWindowTitle));
+            foreach (var item in SidebarDevices) item.RefreshActiveState();
         }
     }
 
+    public MainPage CurrentPage => CurrentNavigationTarget.PageKind;
     public bool IsXiaomiDeviceListPage => CurrentPage == MainPage.XiaomiDeviceList;
     public bool IsRouterPresencePage => CurrentPage == MainPage.RouterPresence;
     public bool IsXiaomiAccountDeviceDetailPage => CurrentPage == MainPage.XiaomiAccountDeviceDetail;
+    public bool IsQqReminderPage => CurrentPage == MainPage.QqReminder;
+    public bool IsSettingsPage => CurrentPage == MainPage.Settings;
+    public bool IsAboutPage => CurrentPage == MainPage.About;
+    public bool IsSubjectDetailPage => CurrentPage == MainPage.SubjectDetail;
+    public bool IsNetworkDeviceDetailPage => CurrentPage == MainPage.NetworkDeviceDetail;
+    public bool IsOverviewActive => CurrentNavigationTarget.IsOverview;
+    public bool IsQqReminderActive => CurrentNavigationTarget.PageKind == MainPage.QqReminder;
+    public bool IsSettingsActive => CurrentNavigationTarget.PageKind == MainPage.Settings;
+    public bool IsAboutActive => CurrentNavigationTarget.PageKind == MainPage.About;
+    public bool IsPresenceAllFilterActive => _presenceFilter == "全部";
+    public bool IsPresenceOnlineFilterActive => _presenceFilter == "在线";
+    public bool IsPresenceOfflineFilterActive => _presenceFilter == "离线";
+    public bool IsPresenceUnknownFilterActive => _presenceFilter == "未知";
+    public bool IsAccountAllFilterActive => _accountFilter == "全部";
+    public bool IsAccountOnlineFilterActive => _accountFilter == "在线";
+    public bool IsAccountOfflineFilterActive => _accountFilter == "离线";
+    public bool IsAccountUnknownFilterActive => _accountFilter == "未知";
+    public NavigationTarget ActiveSidebarNavigationTarget => CurrentNavigationTarget switch
+    {
+        { ParentEntityType: NavigationEntityType.Router, ParentEntityId: not null }
+            when CurrentNavigationTarget.EntityType is NavigationEntityType.PresenceSubject or NavigationEntityType.NetworkDevice
+            => new(MainPage.RouterPresence, NavigationEntityType.Router, CurrentNavigationTarget.ParentEntityId),
+        _ => CurrentNavigationTarget
+    };
+    public bool IsDevicesExpanded
+    {
+        get => _isDevicesExpanded;
+        set
+        {
+            if (!Set(ref _isDevicesExpanded, value)) return;
+            Raise(nameof(DevicesToggleGlyph));
+        }
+    }
+    public string DevicesToggleGlyph => IsDevicesExpanded ? "⌄" : "›";
+    public bool HasSidebarDevices => SidebarDevices.Count > 0;
     public RouterPresenceViewModel? CurrentRouterPresence
     {
         get => _currentRouterPresence;
@@ -208,12 +286,38 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
+    public SubjectDetailViewModel? CurrentSubjectDetail
+    {
+        get => _currentSubjectDetail;
+        private set
+        {
+            if (!Set(ref _currentSubjectDetail, value)) return;
+            Raise(nameof(MainWindowTitle));
+        }
+    }
+
+    public DeviceDetailViewModel? CurrentNetworkDeviceDetail
+    {
+        get => _currentNetworkDeviceDetail;
+        private set
+        {
+            if (!Set(ref _currentNetworkDeviceDetail, value)) return;
+            Raise(nameof(MainWindowTitle));
+        }
+    }
+
     public string MainWindowTitle => CurrentPage switch
     {
         MainPage.RouterPresence => $"{CurrentRouterPresence?.Router.Name ?? SelectedRouter?.Name ?? "路由器"} · 路由器 Presence · CloudLight XiaoMi",
         MainPage.XiaomiAccountDeviceDetail => CurrentXiaomiAccountDeviceDetail?.WindowTitle ?? "设备详情 · CloudLight XiaoMi",
+        MainPage.SubjectDetail => CurrentSubjectDetail is null ? "主体详情 · CloudLight XiaoMi" : $"{CurrentSubjectDetail.DisplayName} · Presence · CloudLight XiaoMi",
+        MainPage.NetworkDeviceDetail => CurrentNetworkDeviceDetail is null ? "网络设备详情 · CloudLight XiaoMi" : $"{CurrentNetworkDeviceDetail.Title} · Presence · CloudLight XiaoMi",
+        MainPage.QqReminder => "QQ 提醒 · CloudLight XiaoMi",
+        MainPage.Settings => "设置 · CloudLight XiaoMi",
+        MainPage.About => "关于 · CloudLight XiaoMi",
         _ => "CloudLight XiaoMi"
     };
+    public string ApplicationVersionText => typeof(MainViewModel).Assembly.GetName().Version?.ToString(3) ?? "development";
     public string Diagnostics => $"Xiaomi 账号      {(LoginRequired ? "需要登录" : "已登录")}\n" +
                                  $"登录状态         {(LoginRequired ? "需要更新" : "正常")}\n" +
                                  $"当前路由器       {SelectedRouter?.Name ?? "未选择"}\n" +
@@ -339,6 +443,40 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         foreach (var value in values) Cards.Add(value);
         CardsView.Refresh();
         RaisePresenceCounts();
+        await RefreshSidebarAsync(CancellationToken.None);
+    }
+
+    public async Task RefreshSidebarAsync(CancellationToken cancellationToken)
+    {
+        // A refresh may rebuild the router collection with new instances. Keep
+        // the selected router only when its stable database identity is still
+        // present; otherwise detail targets must fall back to the overview.
+        if (SelectedRouter is { } selectedRouter && Routers.All(value => value.Id != selectedRouter.Id))
+            SelectedRouter = null;
+
+        // Presence subjects are content of the selected router, not global navigation.
+        // Keep the sidebar focused on the small set of destinations users open directly.
+        var group = new SidebarNavigationGroupViewModel("设备");
+        if (Routers.Count > 0)
+        {
+            foreach (var router in Routers.OrderBy(value => value.Name, StringComparer.CurrentCultureIgnoreCase))
+                group.Items.Add(SidebarDeviceItemViewModel.ForRouter(this, router, () => OpenRouterPresenceRequested?.Invoke(this, router)));
+        }
+
+        var accountDevices = AccountDevices
+            .Select(value => value.Device)
+            .Where(value => !value.IsRouter)
+            .OrderBy(value => value.DisplayName, StringComparer.CurrentCultureIgnoreCase)
+            .ToArray();
+        foreach (var device in accountDevices)
+            group.Items.Add(SidebarDeviceItemViewModel.ForXiaomiDevice(this, device, () => OpenXiaomiAccountDeviceRequested?.Invoke(this, device)));
+
+        SidebarGroups.Clear();
+        SidebarDevices.Clear();
+        if (group.Items.Count > 0) SidebarGroups.Add(group);
+        foreach (var item in group.Items) SidebarDevices.Add(item);
+        Raise(nameof(HasSidebarDevices));
+        await EnsureCurrentNavigationTargetIsValidAsync(cancellationToken);
     }
 
     public async Task SaveGeneralSettingsAsync(bool startWithWindows, bool startMinimized)
@@ -387,6 +525,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _monitor.StatusChanged -= OnStatusChanged;
         CurrentRouterPresence?.Dispose();
         CurrentXiaomiAccountDeviceDetail?.Dispose();
+        CurrentSubjectDetail?.Dispose();
+        CurrentNetworkDeviceDetail?.Dispose();
         foreach (var detail in _retiredXiaomiAccountDeviceDetails) detail.Dispose();
         _retiredXiaomiAccountDeviceDetails.Clear();
     }
@@ -394,28 +534,121 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public void ShowRouterPresence(Router router)
     {
         ArgumentNullException.ThrowIfNull(router);
-        if (CurrentRouterPresence is null || CurrentRouterPresence.Router.Id != router.Id)
-        {
-            var previous = CurrentRouterPresence;
-            CurrentRouterPresence = new RouterPresenceViewModel(this, router);
-            previous?.Dispose();
-        }
-        CurrentPage = MainPage.RouterPresence;
+        SelectedRouter = router;
+        ClearNavigationContexts();
+        CurrentRouterPresence = new RouterPresenceViewModel(this, router);
+        IsDevicesExpanded = true;
+        CurrentNavigationTarget = NavigationTarget.RouterPresence(router.Id);
     }
 
     public void ShowXiaomiAccountDeviceDetail(XiaomiAccountDeviceDetailViewModel detail)
     {
         ArgumentNullException.ThrowIfNull(detail);
-        if (CurrentXiaomiAccountDeviceDetail is { } previous && !ReferenceEquals(previous, detail))
-        {
-            previous.ActionRequestHandler = null;
-            _retiredXiaomiAccountDeviceDetails.Add(previous);
-        }
+        ClearNavigationContexts();
         CurrentXiaomiAccountDeviceDetail = detail;
-        CurrentPage = MainPage.XiaomiAccountDeviceDetail;
+        IsDevicesExpanded = true;
+        CurrentNavigationTarget = NavigationTarget.XiaomiAccountDeviceDetail(detail.Device.Did);
     }
 
-    public void ShowDeviceList() => CurrentPage = MainPage.XiaomiDeviceList;
+    public void ShowSubjectDetail(SubjectDetailViewModel detail)
+    {
+        ArgumentNullException.ThrowIfNull(detail);
+        var routerId = SelectedRouter?.Id ?? CurrentRouterPresence?.Router.Id;
+        ClearNavigationContexts();
+        CurrentSubjectDetail = detail;
+        IsDevicesExpanded = true;
+        CurrentNavigationTarget = NavigationTarget.SubjectDetail(detail.Subject.Id, routerId);
+    }
+
+    public void ShowNetworkDeviceDetail(DeviceDetailViewModel detail)
+    {
+        ArgumentNullException.ThrowIfNull(detail);
+        ClearNavigationContexts();
+        CurrentNetworkDeviceDetail = detail;
+        IsDevicesExpanded = true;
+        CurrentNavigationTarget = NavigationTarget.NetworkDeviceDetail(detail.Device.Id, detail.Device.RouterId);
+    }
+
+    public void ShowQqReminderPage()
+    {
+        ClearNavigationContexts();
+        CurrentNavigationTarget = NavigationTarget.Utility(MainPage.QqReminder);
+    }
+
+    public void ShowSettingsPage()
+    {
+        ClearNavigationContexts();
+        CurrentNavigationTarget = NavigationTarget.Utility(MainPage.Settings);
+    }
+
+    public void ShowAboutPage()
+    {
+        ClearNavigationContexts();
+        CurrentNavigationTarget = NavigationTarget.Utility(MainPage.About);
+    }
+
+    public void ShowDeviceList()
+    {
+        ClearNavigationContexts();
+        IsDevicesExpanded = true;
+        CurrentNavigationTarget = NavigationTarget.Overview;
+    }
+
+    private void ClearNavigationContexts()
+    {
+        if (CurrentRouterPresence is { } routerPresence)
+        {
+            CurrentRouterPresence = null;
+            routerPresence.Dispose();
+        }
+        if (CurrentXiaomiAccountDeviceDetail is { } xiaomiDetail)
+        {
+            CurrentXiaomiAccountDeviceDetail = null;
+            xiaomiDetail.ActionRequestHandler = null;
+            _retiredXiaomiAccountDeviceDetails.Add(xiaomiDetail);
+        }
+        if (CurrentSubjectDetail is { } subject)
+        {
+            subject.Dispose();
+            CurrentSubjectDetail = null;
+        }
+        if (CurrentNetworkDeviceDetail is { } device)
+        {
+            device.Dispose();
+            CurrentNetworkDeviceDetail = null;
+        }
+    }
+
+    private NavigationTarget NormalizeNavigationTarget(NavigationTarget target) => target.PageKind switch
+    {
+        MainPage.RouterPresence when CurrentRouterPresence is null => NavigationTarget.Overview,
+        MainPage.XiaomiAccountDeviceDetail when CurrentXiaomiAccountDeviceDetail is null => NavigationTarget.Overview,
+        MainPage.SubjectDetail when CurrentSubjectDetail is null => NavigationTarget.Overview,
+        MainPage.NetworkDeviceDetail when CurrentNetworkDeviceDetail is null => NavigationTarget.Overview,
+        _ => target
+    };
+
+    private async Task EnsureCurrentNavigationTargetIsValidAsync(CancellationToken cancellationToken)
+    {
+        var target = CurrentNavigationTarget;
+        var valid = target switch
+        {
+            { EntityType: NavigationEntityType.Router, EntityId: not null } => Routers.Any(value => value.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) == target.EntityId),
+            { EntityType: NavigationEntityType.XiaomiAccountDevice, EntityId: not null } => AccountDevices.Any(value => string.Equals(value.Device.Did, target.EntityId, StringComparison.Ordinal)),
+            { ParentEntityType: NavigationEntityType.Router, ParentEntityId: not null } => Routers.Any(value => value.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) == target.ParentEntityId),
+            _ => true
+        };
+
+        if (valid && target.EntityType == NavigationEntityType.PresenceSubject && target.EntityId is { } subjectId
+            && long.TryParse(subjectId, out var parsedSubjectId))
+            valid = await _repository.GetSubjectAsync(parsedSubjectId, cancellationToken) is not null;
+
+        if (valid && target.EntityType == NavigationEntityType.NetworkDevice && target.EntityId is { } deviceId
+            && long.TryParse(deviceId, out var parsedDeviceId))
+            valid = await _repository.GetDeviceAsync(parsedDeviceId, cancellationToken) is not null;
+
+        if (!valid) ShowDeviceList();
+    }
 
     private async Task LoginAsync()
     {
@@ -491,6 +724,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             Routers.Add(await _repository.UpsertRouterAsync(
                 new Router(0, value.MiotDid, value.MiotModel, value.PartnerId, value.Name, value.HomeId, value.RoomId, now, now),
                 cancellationToken));
+        if (SelectedRouter is { } selectedRouter && Routers.All(value => value.Id != selectedRouter.Id))
+            SelectedRouter = null;
+        await RefreshSidebarAsync(cancellationToken);
         Raise(nameof(HasMultipleRouters));
 
         if (Routers.Count == 0)
@@ -568,6 +804,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         Raise(nameof(AccountDevicesLastUpdateText));
         Raise(nameof(HasAccountDevices));
         RaiseAccountCounts();
+        await RefreshSidebarAsync(cancellationToken);
         Raise(nameof(Diagnostics));
     }
 
@@ -640,8 +877,21 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         if (CurrentPage == MainPage.RouterPresence) _presenceFilter = filter;
         else _accountFilter = filter;
+        RaiseFilterStates();
         CardsView.Refresh();
         AccountDevicesView.Refresh();
+    }
+
+    private void RaiseFilterStates()
+    {
+        Raise(nameof(IsPresenceAllFilterActive));
+        Raise(nameof(IsPresenceOnlineFilterActive));
+        Raise(nameof(IsPresenceOfflineFilterActive));
+        Raise(nameof(IsPresenceUnknownFilterActive));
+        Raise(nameof(IsAccountAllFilterActive));
+        Raise(nameof(IsAccountOnlineFilterActive));
+        Raise(nameof(IsAccountOfflineFilterActive));
+        Raise(nameof(IsAccountUnknownFilterActive));
     }
 
     private void OnStatusChanged(object? sender, MonitorStatus status) => RunOnUi(async () =>
@@ -757,4 +1007,50 @@ public sealed class PresenceCardViewModel : ObservableObject
 
     private string FormatDuration() =>
         PresenceDurationFormatter.Format(CurrentState, _changedAt, DateTimeOffset.UtcNow);
+}
+
+public sealed class SidebarNavigationGroupViewModel(string title)
+{
+    public string Title { get; } = title;
+    public ObservableCollection<SidebarDeviceItemViewModel> Items { get; } = [];
+}
+
+public sealed class SidebarDeviceItemViewModel : ObservableObject
+{
+    private readonly MainViewModel _owner;
+    private SidebarDeviceItemViewModel(
+        MainViewModel owner,
+        SidebarDeviceKind kind,
+        string identity,
+        string name,
+        string secondaryText,
+        NavigationTarget target,
+        Action open)
+    {
+        _owner = owner;
+        Kind = kind;
+        Identity = identity;
+        Name = name;
+        SecondaryText = secondaryText;
+        Target = target;
+        OpenCommand = new RelayCommand(open);
+    }
+
+    public SidebarDeviceKind Kind { get; }
+    public string Identity { get; }
+    public string Name { get; }
+    public string SecondaryText { get; }
+    public RelayCommand OpenCommand { get; }
+    public NavigationTarget Target { get; }
+    public bool IsActive => _owner.ActiveSidebarNavigationTarget == Target;
+    internal void RefreshActiveState() => Raise(nameof(IsActive));
+
+    public static SidebarDeviceItemViewModel ForRouter(MainViewModel owner, Router router, Action open) =>
+        new(owner, SidebarDeviceKind.Router, router.Id.ToString(System.Globalization.CultureInfo.InvariantCulture), router.Name, router.MiotModel, NavigationTarget.RouterPresence(router.Id), open);
+
+    public static SidebarDeviceItemViewModel ForSubject(MainViewModel owner, PresenceSubject subject, Action open) =>
+        new(owner, SidebarDeviceKind.PresenceSubject, subject.Id.ToString(System.Globalization.CultureInfo.InvariantCulture), subject.DisplayName, "Presence 主体", NavigationTarget.SubjectDetail(subject.Id, owner.SelectedRouter?.Id), open);
+
+    public static SidebarDeviceItemViewModel ForXiaomiDevice(MainViewModel owner, XiaomiAccountDevice device, Action open) =>
+        new(owner, SidebarDeviceKind.XiaomiAccountDevice, device.Did, device.DisplayName, device.Model ?? "米家设备", NavigationTarget.XiaomiAccountDeviceDetail(device.Did), open);
 }

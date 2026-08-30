@@ -22,7 +22,7 @@ public sealed class NotificationRuleTests
         {
             var offlineAt = fixture.Start.AddHours(2);
             await fixture.ApplyAsync(true, fixture.Start.AddHours(1));
-            await fixture.ApplyAsync(false, offlineAt);
+            await fixture.ApplyAndConfirmOfflineAsync(offlineAt);
             var rule = await fixture.Repository.CreateNotificationRuleAsync(Rule(fixture.Subject.Id, NotificationCondition.OfflineFor, 14 * 60 * 60), CancellationToken.None);
             var service = new NotificationRuleService(fixture.Repository, fixture.Presence);
             var channel = new FakeChannel(true); using var dispatcher = new NotificationDispatcher(fixture.Repository, [channel]);
@@ -52,7 +52,7 @@ public sealed class NotificationRuleTests
             var rule = await fixture.Repository.CreateNotificationRuleAsync(Rule(fixture.Subject.Id, NotificationCondition.OnlineFor, 2 * 60 * 60), CancellationToken.None);
             var service = new NotificationRuleService(fixture.Repository, fixture.Presence); var channel = new FakeChannel(true); using var dispatcher = new NotificationDispatcher(fixture.Repository, [channel]);
             var first = await service.EvaluateAsync(onlineAt.AddHours(2), CancellationToken.None); Assert.Single(first); await dispatcher.DispatchAsync(first[0], CancellationToken.None);
-            await fixture.ApplyAsync(false, onlineAt.AddHours(3)); Assert.Empty(await service.EvaluateAsync(onlineAt.AddHours(3).AddMinutes(1), CancellationToken.None));
+            await fixture.ApplyAndConfirmOfflineAsync(onlineAt.AddHours(3)); Assert.Empty(await service.EvaluateAsync(onlineAt.AddHours(3).AddMinutes(1), CancellationToken.None));
             await fixture.ApplyAsync(true, onlineAt.AddHours(4));
             var second = await service.EvaluateAsync(onlineAt.AddHours(6), CancellationToken.None); Assert.Single(second); Assert.NotEqual(first[0].EpisodeId, second[0].EpisodeId);
         }
@@ -60,21 +60,21 @@ public sealed class NotificationRuleTests
     }
 
     [Fact]
-    public async Task MonitoringGapBreaksContinuousDuration()
+    public async Task MonitoringGapWithSameConfirmedStateKeepsContinuousDuration()
     {
         var fixture = await CreateFixtureAsync();
         try
         {
             var onlineAt = fixture.Start.AddHours(1); await fixture.ApplyAsync(true, onlineAt);
-            var gapStart = onlineAt.AddHours(1); var gapEnd = gapStart.AddHours(8); var gap = await fixture.Repository.StartMonitoringGapAsync(gapStart, "test", CancellationToken.None); await fixture.Repository.EndMonitoringGapAsync(gap, gapEnd, CancellationToken.None);
+            var gapStart = onlineAt.AddHours(1); var gapEnd = gapStart.AddHours(8); var gap = await fixture.Repository.StartMonitoringGapAsync(gapStart, "test", CancellationToken.None);
             var rule = await fixture.Repository.CreateNotificationRuleAsync(Rule(fixture.Subject.Id, NotificationCondition.OnlineFor, 2 * 60 * 60), CancellationToken.None);
             var service = new NotificationRuleService(fixture.Repository, fixture.Presence);
             var duringGap = await service.EvaluateAsync(gapStart.AddHours(1), CancellationToken.None); Assert.Empty(duringGap);
-            Assert.Empty(await service.EvaluateAsync(gapEnd.AddHours(1), CancellationToken.None));
-            Assert.Empty(await service.EvaluateAsync(gapEnd.AddHours(2), CancellationToken.None));
-            await fixture.ApplyAsync(false, gapEnd.AddHours(2)); await fixture.ApplyAsync(true, gapEnd.AddHours(2).AddMinutes(1));
-            var afterRecovery = await service.EvaluateAsync(gapEnd.AddHours(4).AddMinutes(1), CancellationToken.None); Assert.Single(afterRecovery); Assert.NotEqual($"{(int)PresenceState.Online}:{onlineAt.UtcTicks}", afterRecovery[0].EpisodeId);
-            Assert.Equal(rule.Id, afterRecovery[0].RuleId);
+            await fixture.Repository.EndMonitoringGapAsync(gap, gapEnd, CancellationToken.None);
+            await fixture.ApplyAsync(true, gapEnd);
+            var afterGap = await service.EvaluateAsync(gapEnd.AddMinutes(1), CancellationToken.None); Assert.Single(afterGap);
+            Assert.Equal($"state:{(int)PresenceState.Online}:{onlineAt.UtcTicks}", afterGap[0].EpisodeId);
+            Assert.Equal(rule.Id, afterGap[0].RuleId);
         }
         finally { fixture.Dispose(); }
     }
@@ -85,7 +85,7 @@ public sealed class NotificationRuleTests
         var fixture = await CreateFixtureAsync();
         try
         {
-            var offlineAt = fixture.Start.AddHours(1); await fixture.ApplyAsync(true, fixture.Start.AddMinutes(30)); await fixture.ApplyAsync(false, offlineAt);
+            var offlineAt = fixture.Start.AddHours(1); await fixture.ApplyAsync(true, fixture.Start.AddMinutes(30)); await fixture.ApplyAndConfirmOfflineAsync(offlineAt);
             await fixture.Repository.CreateNotificationRuleAsync(Rule(fixture.Subject.Id, NotificationCondition.OfflineFor, 60), CancellationToken.None);
             var service = new NotificationRuleService(fixture.Repository, fixture.Presence); var channel = new FakeChannel(false); using var dispatcher = new NotificationDispatcher(fixture.Repository, [channel]);
             var requests = await service.EvaluateAsync(offlineAt.AddMinutes(1), CancellationToken.None); Assert.Single(requests); await dispatcher.DispatchAsync(requests[0], CancellationToken.None);
@@ -104,7 +104,7 @@ public sealed class NotificationRuleTests
         try
         {
             await fixture.ApplyAsync(true, fixture.Start.AddMinutes(1));
-            await fixture.ApplyAsync(false, fixture.Start.AddMinutes(2));
+            await fixture.ApplyAndConfirmOfflineAsync(fixture.Start.AddMinutes(2));
             var rule = await fixture.Repository.CreateNotificationRuleAsync(Rule(fixture.Subject.Id, NotificationCondition.OfflineFor, 60), CancellationToken.None);
             var administration = new NotificationRuleAdministrationService(fixture.Repository);
             var ruleService = new NotificationRuleService(fixture.Repository, fixture.Presence);
@@ -233,6 +233,11 @@ public sealed class NotificationRuleTests
     {
         public string Root { get; } = root; public SqlitePresenceRepository Repository { get; } = repository; public SubjectPresenceService Presence { get; } = presence; public PresenceStateMachine Machine { get; } = machine; public Router Router { get; } = router; public NetworkDevice Device { get; } = device; public PresenceSubject Subject { get; } = subject; public DateTimeOffset Start { get; } = start;
         public async Task ApplyAsync(bool online, DateTimeOffset at) => await Machine.ApplySnapshotAsync(Router.Id, [new ObservedNetworkDevice(Device.MacAddress, "Phone", "Phone", "192.168.1.2", online, null, "5G", -45)], at, CancellationToken.None);
+        public async Task ApplyAndConfirmOfflineAsync(DateTimeOffset at)
+        {
+            await ApplyAsync(false, at);
+            await ApplyAsync(false, at + SubjectPresenceService.DefaultOfflineGracePeriod);
+        }
         public void Dispose() { if (Directory.Exists(Root)) Directory.Delete(Root, true); }
     }
 

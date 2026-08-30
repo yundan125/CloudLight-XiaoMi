@@ -20,7 +20,7 @@ public sealed class PresenceDataTransferService(IAppDataPaths paths)
     {
         var model = new ExportDocument(
             new ExportManifest(Format, 2, DateTimeOffset.UtcNow, Assembly.GetEntryAssembly()?.GetName().Version?.ToString() ?? "development", false),
-            [], [], [], [], [], [], [], [], [], []);
+            [], [], [], [], [], [], [], [], [], [], []);
         await using var connection = new SqliteConnection(ConnectionString); await connection.OpenAsync(cancellationToken);
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
         await ReadAsync(connection, "SELECT MiotDid,MiotModel,PartnerId,Name,HomeId,RoomId,CreatedAt,LastSeenAt FROM Router", reader =>
@@ -37,12 +37,20 @@ public sealed class PresenceDataTransferService(IAppDataPaths paths)
             model.Subjects!.Add(new ExportSubject(Guid.Parse(reader.GetString(0)), reader.GetString(1), Text(reader, 2), Time(reader, 3), Time(reader, 4))), cancellationToken);
         await ReadAsync(connection, "SELECT s.ExportId,r.MiotDid,d.MacAddress,m.CreatedAt FROM SubjectDeviceMembership m JOIN PresenceSubject s ON s.Id=m.SubjectId JOIN NetworkDevice d ON d.Id=m.NetworkDeviceId JOIN Router r ON r.Id=d.RouterId", reader =>
             model.SubjectDeviceMemberships!.Add(new ExportSubjectDeviceMembership(Guid.Parse(reader.GetString(0)), reader.GetString(1), reader.GetString(2), Time(reader, 3))), cancellationToken);
-        await ReadAsync(connection, "SELECT s.ExportId,c.CurrentState,c.StateSince,c.LastObservedAt FROM SubjectCurrentState c JOIN PresenceSubject s ON s.Id=c.SubjectId", reader =>
-            model.SubjectCurrentStates!.Add(new ExportSubjectCurrentState(Guid.Parse(reader.GetString(0)), reader.GetInt32(1), Time(reader, 2), Time(reader, 3))), cancellationToken);
-        await ReadAsync(connection, "SELECT s.ExportId,r.Enabled,r.RuleCondition,r.ThresholdSeconds,r.Channel,r.TargetType,r.TargetId,r.MessageTemplate,r.CreatedAt,r.UpdatedAt FROM NotificationRule r JOIN PresenceSubject s ON s.Id=r.SubjectId", reader =>
-            model.NotificationRules!.Add(new ExportNotificationRule(Guid.Parse(reader.GetString(0)), reader.GetInt32(1) != 0, reader.GetInt32(2), reader.GetInt64(3), reader.GetInt32(4), reader.GetInt32(5), reader.GetString(6), reader.GetString(7), Time(reader, 8), Time(reader, 9))), cancellationToken);
-        await ReadAsync(connection, "SELECT s.ExportId,e.EventType,e.ObservedAt,g.StartedAt,g.Reason FROM SubjectPresenceEvent e JOIN PresenceSubject s ON s.Id=e.SubjectId JOIN MonitoringGap g ON g.Id=e.MonitoringGapId", reader =>
-            model.SubjectPresenceEvents!.Add(new ExportSubjectPresenceEvent(Guid.Parse(reader.GetString(0)), reader.GetInt32(1), Time(reader, 2), Time(reader, 3), reader.GetString(4))), cancellationToken);
+        await ReadAsync(connection, "SELECT s.ExportId,c.CurrentState,c.StateSince,c.LastObservedAt,c.PendingOfflineSince FROM SubjectCurrentState c JOIN PresenceSubject s ON s.Id=c.SubjectId", reader =>
+            model.SubjectCurrentStates!.Add(new ExportSubjectCurrentState(Guid.Parse(reader.GetString(0)), reader.GetInt32(1), Time(reader, 2), Time(reader, 3), NullableTime(reader, 4))), cancellationToken);
+        await ReadAsync(connection, "SELECT Note,OpenId,TargetType,CreatedAt,UpdatedAt FROM NotificationRecipient", reader =>
+            model.NotificationRecipients!.Add(new ExportNotificationRecipient(reader.GetString(0), reader.GetString(1), reader.GetInt32(2), Time(reader, 3), Time(reader, 4))), cancellationToken);
+        var ruleTargets = new Dictionary<long, List<ExportNotificationRecipientTarget>>();
+        await ReadAsync(connection, "SELECT rr.RuleId,n.TargetType,n.OpenId FROM NotificationRuleRecipient rr JOIN NotificationRecipient n ON n.Id=rr.RecipientId", reader =>
+        {
+            if (!ruleTargets.TryGetValue(reader.GetInt64(0), out var values)) ruleTargets[reader.GetInt64(0)] = values = [];
+            values.Add(new ExportNotificationRecipientTarget(reader.GetInt32(1), reader.GetString(2)));
+        }, cancellationToken);
+        await ReadAsync(connection, "SELECT r.Id,s.ExportId,r.Enabled,r.RuleCondition,r.ThresholdSeconds,r.Channel,r.TargetType,r.TargetId,r.MessageTemplate,r.CreatedAt,r.UpdatedAt FROM NotificationRule r JOIN PresenceSubject s ON s.Id=r.SubjectId", reader =>
+            model.NotificationRules!.Add(new ExportNotificationRule(Guid.Parse(reader.GetString(1)), reader.GetInt32(2) != 0, reader.GetInt32(3), reader.GetInt64(4), reader.GetInt32(5), reader.GetInt32(6), reader.GetString(7), reader.GetString(8), Time(reader, 9), Time(reader, 10), reader.GetInt64(0), ruleTargets.GetValueOrDefault(reader.GetInt64(0)))), cancellationToken);
+        await ReadAsync(connection, "SELECT s.ExportId,e.EventType,e.ObservedAt,g.StartedAt,g.Reason,e.StateSince FROM SubjectPresenceEvent e JOIN PresenceSubject s ON s.Id=e.SubjectId LEFT JOIN MonitoringGap g ON g.Id=e.MonitoringGapId", reader =>
+            model.SubjectPresenceEvents!.Add(new ExportSubjectPresenceEvent(Guid.Parse(reader.GetString(0)), reader.GetInt32(1), Time(reader, 2), NullableTime(reader, 3), Text(reader, 4), NullableTime(reader, 5))), cancellationToken);
         await transaction.CommitAsync(cancellationToken);
 
         var temporary = targetPath + ".new";
@@ -132,24 +140,37 @@ public sealed class PresenceDataTransferService(IAppDataPaths paths)
         {
             var subjectId = subjects[value.SubjectExportId];
             await ExecuteAsync(connection,
-                "INSERT INTO SubjectCurrentState(SubjectId,CurrentState,StateSince,LastObservedAt) VALUES($subject,$state,$since,$observed) ON CONFLICT(SubjectId) DO UPDATE SET CurrentState=CASE WHEN excluded.LastObservedAt>=SubjectCurrentState.LastObservedAt THEN excluded.CurrentState ELSE SubjectCurrentState.CurrentState END,StateSince=CASE WHEN excluded.LastObservedAt>=SubjectCurrentState.LastObservedAt THEN excluded.StateSince ELSE SubjectCurrentState.StateSince END,LastObservedAt=CASE WHEN excluded.LastObservedAt>=SubjectCurrentState.LastObservedAt THEN excluded.LastObservedAt ELSE SubjectCurrentState.LastObservedAt END",
-                [("$subject", subjectId), ("$state", value.CurrentState), ("$since", Iso(value.StateSince)), ("$observed", Iso(value.LastObservedAt))], cancellationToken);
+                "INSERT INTO SubjectCurrentState(SubjectId,CurrentState,StateSince,LastObservedAt,PendingOfflineSince) VALUES($subject,$state,$since,$observed,$pending) ON CONFLICT(SubjectId) DO UPDATE SET CurrentState=CASE WHEN excluded.LastObservedAt>=SubjectCurrentState.LastObservedAt THEN excluded.CurrentState ELSE SubjectCurrentState.CurrentState END,StateSince=CASE WHEN excluded.LastObservedAt>=SubjectCurrentState.LastObservedAt THEN excluded.StateSince ELSE SubjectCurrentState.StateSince END,LastObservedAt=CASE WHEN excluded.LastObservedAt>=SubjectCurrentState.LastObservedAt THEN excluded.LastObservedAt ELSE SubjectCurrentState.LastObservedAt END,PendingOfflineSince=CASE WHEN excluded.LastObservedAt>=SubjectCurrentState.LastObservedAt THEN excluded.PendingOfflineSince ELSE SubjectCurrentState.PendingOfflineSince END",
+                [("$subject", subjectId), ("$state", value.CurrentState), ("$since", Iso(value.StateSince)), ("$observed", Iso(value.LastObservedAt)), ("$pending", value.PendingOfflineSince is null ? null : Iso(value.PendingOfflineSince.Value))], cancellationToken);
         }
         foreach (var value in document.SubjectPresenceEvents ?? [])
         {
             var subjectId = subjects[value.SubjectExportId];
-            var gapId = await ScalarLongAsync(connection,
-                "SELECT Id FROM MonitoringGap WHERE StartedAt=$start AND Reason=$reason LIMIT 1",
-                [("$start", Iso(value.MonitoringGapStartedAt)), ("$reason", value.MonitoringGapReason)], cancellationToken);
-            if (gapId == 0)
+            long? gapId = null;
+            if (value.MonitoringGapStartedAt is { } gapStartedAt && !string.IsNullOrWhiteSpace(value.MonitoringGapReason))
             {
-                skipped++;
-                continue;
+                var resolvedGapId = await ScalarLongAsync(connection,
+                    "SELECT Id FROM MonitoringGap WHERE StartedAt=$start AND Reason=$reason LIMIT 1",
+                    [("$start", Iso(gapStartedAt)), ("$reason", value.MonitoringGapReason)], cancellationToken);
+                if (resolvedGapId == 0)
+                {
+                    skipped++;
+                    continue;
+                }
+                gapId = resolvedGapId;
             }
             var changed = await InsertOrIgnoreAsync(connection,
-                "INSERT OR IGNORE INTO SubjectPresenceEvent(SubjectId,EventType,ObservedAt,MonitoringGapId) VALUES($subject,$type,$at,$gap)",
-                [("$subject", subjectId), ("$type", value.EventType), ("$at", Iso(value.ObservedAt)), ("$gap", gapId)], cancellationToken);
+                "INSERT OR IGNORE INTO SubjectPresenceEvent(SubjectId,EventType,ObservedAt,MonitoringGapId,StateSince) VALUES($subject,$type,$at,$gap,$since)",
+                [("$subject", subjectId), ("$type", value.EventType), ("$at", Iso(value.ObservedAt)), ("$gap", gapId), ("$since", value.StateSince is null ? null : Iso(value.StateSince.Value))], cancellationToken);
             if (changed == 1) addedEvents++; else skipped++;
+        }
+        var importedRecipients = new Dictionary<(int TargetType, string TargetId), long>();
+        foreach (var value in document.NotificationRecipients ?? [])
+        {
+            await ExecuteAsync(connection, "INSERT OR IGNORE INTO NotificationRecipient(Note,OpenId,TargetType,CreatedAt,UpdatedAt) VALUES($note,$openid,$type,$created,$updated)",
+                [("$note", value.Note), ("$openid", value.OpenId), ("$type", value.TargetType), ("$created", Iso(value.CreatedAt)), ("$updated", Iso(value.UpdatedAt))], cancellationToken);
+            var recipientId = await ScalarLongAsync(connection, "SELECT Id FROM NotificationRecipient WHERE TargetType=$type AND OpenId=$openid LIMIT 1", [ ("$type", value.TargetType), ("$openid", value.OpenId) ], cancellationToken);
+            importedRecipients[(value.TargetType, value.OpenId)] = recipientId;
         }
         foreach (var value in document.NotificationRules ?? [])
         {
@@ -160,13 +181,31 @@ public sealed class PresenceDataTransferService(IAppDataPaths paths)
             {
                 await ExecuteAsync(connection, "INSERT INTO NotificationRule(SubjectId,Enabled,RuleCondition,ThresholdSeconds,Channel,TargetType,TargetId,MessageTemplate,CreatedAt,UpdatedAt) VALUES($subject,$enabled,$condition,$threshold,$channel,$targetType,$target,$template,$created,$updated)",
                     [("$subject", subjectId), ("$enabled", value.Enabled ? 1 : 0), ("$condition", value.Condition), ("$threshold", value.ThresholdSeconds), ("$channel", value.Channel), ("$targetType", value.TargetType), ("$target", value.TargetId), ("$template", value.MessageTemplate), ("$created", Iso(value.CreatedAt)), ("$updated", Iso(value.UpdatedAt))], cancellationToken);
+                existing = await ScalarLongAsync(connection, "SELECT last_insert_rowid()", [], cancellationToken);
             }
             else skipped++;
+            var targets = value.Recipients is { Count: > 0 }
+                ? value.Recipients
+                : [new ExportNotificationRecipientTarget(value.TargetType, value.TargetId)];
+            foreach (var target in targets)
+            {
+                if (!importedRecipients.TryGetValue((target.TargetType, target.TargetId), out var recipientId))
+                {
+                    await ExecuteAsync(connection, "INSERT OR IGNORE INTO NotificationRecipient(Note,OpenId,TargetType,CreatedAt,UpdatedAt) VALUES($note,$openid,$type,$now,$now)",
+                        [("$note", "已有接收人"), ("$openid", target.TargetId), ("$type", target.TargetType), ("$now", Iso(DateTimeOffset.UtcNow))], cancellationToken);
+                    recipientId = await ScalarLongAsync(connection, "SELECT Id FROM NotificationRecipient WHERE TargetType=$type AND OpenId=$openid LIMIT 1", [("$type", target.TargetType), ("$openid", target.TargetId)], cancellationToken);
+                    importedRecipients[(target.TargetType, target.TargetId)] = recipientId;
+                }
+                await ExecuteAsync(connection, "INSERT OR IGNORE INTO NotificationRuleRecipient(RuleId,RecipientId,CreatedAt) VALUES($rule,$recipient,$now)",
+                    [("$rule", existing), ("$recipient", recipientId), ("$now", Iso(DateTimeOffset.UtcNow))], cancellationToken);
+            }
         }
         await transaction.CommitAsync(cancellationToken);
         var repository = new SqlitePresenceRepository(paths);
         await repository.EnsureEveryDeviceHasSubjectAsync(cancellationToken);
         await repository.EnsureSubjectCurrentStatesAsync(cancellationToken);
+        await repository.ReconcileSubjectIdentityAsync(cancellationToken);
+        await repository.EnsureNotificationRuleEventWatermarksAsync(cancellationToken);
         return new ImportResult(addedDevices, updatedDevices, addedEvents, skipped);
     }
 
@@ -180,9 +219,20 @@ public sealed class PresenceDataTransferService(IAppDataPaths paths)
         if (document.Events.Any(value => !deviceKeys.Contains(Key(value.RouterMiotDid, PresenceStateMachine.NormalizeMac(value.MacAddress)))) || document.Sessions.Any(value => !deviceKeys.Contains(Key(value.RouterMiotDid, PresenceStateMachine.NormalizeMac(value.MacAddress))))) throw new InvalidDataException("历史记录引用了不存在的设备。 ");
         var subjectIds = (document.Subjects ?? []).Select(value => value.ExportId).ToHashSet();
         if ((document.SubjectDeviceMemberships ?? []).Any(value => !subjectIds.Contains(value.SubjectExportId) || !deviceKeys.Contains(Key(value.RouterMiotDid, PresenceStateMachine.NormalizeMac(value.MacAddress))))) throw new InvalidDataException("主体关联引用了不存在的主体或设备。 ");
-        if ((document.SubjectCurrentStates ?? []).Any(value => !subjectIds.Contains(value.SubjectExportId) || value.CurrentState is not (1 or 2) || value.StateSince > value.LastObservedAt)) throw new InvalidDataException("主体当前状态数据不完整或无效。 ");
-        if ((document.SubjectPresenceEvents ?? []).Any(value => !subjectIds.Contains(value.SubjectExportId) || value.EventType is not (1 or 2))) throw new InvalidDataException("主体活动记录不完整或无效。 ");
-        if ((document.NotificationRules ?? []).Any(value => !subjectIds.Contains(value.SubjectExportId) || value.Condition is not (1 or 2) || value.ThresholdSeconds is < 60 or > 365L * 24 * 60 * 60 || value.Channel != 1 || value.TargetType is not (1 or 2) || string.IsNullOrWhiteSpace(value.TargetId) || value.TargetId.Any(char.IsWhiteSpace) || value.TargetId.Length > 256 || value.MessageTemplate is null || value.MessageTemplate.Length > 10_000)) throw new InvalidDataException("通知规则数据不完整或超出允许范围。 ");
+        if ((document.SubjectCurrentStates ?? []).Any(value => !subjectIds.Contains(value.SubjectExportId) || value.CurrentState is not (1 or 2) || value.StateSince > value.LastObservedAt || (value.PendingOfflineSince is { } pending && (pending < value.StateSince || pending > value.LastObservedAt)))) throw new InvalidDataException("主体当前状态数据不完整或无效。 ");
+        if ((document.SubjectPresenceEvents ?? []).Any(value => !subjectIds.Contains(value.SubjectExportId) || value.EventType is < 1 or > 6 || ((value.EventType is 1 or 2) && (value.MonitoringGapStartedAt is null || string.IsNullOrWhiteSpace(value.MonitoringGapReason))) || (value.EventType is >= 3 and <= 6 && value.MonitoringGapStartedAt is not null))) throw new InvalidDataException("主体活动记录不完整或无效。 ");
+        if ((document.NotificationRecipients ?? []).Any(value => value.TargetType is not (1 or 2) || string.IsNullOrWhiteSpace(value.OpenId) || value.OpenId.Any(char.IsWhiteSpace) || value.OpenId.Length > 256 || value.Note is null || value.Note.Length > 120)) throw new InvalidDataException("QQ 接收人数据不完整或超出允许范围。 ");
+        if ((document.NotificationRules ?? []).Any(value =>
+            !subjectIds.Contains(value.SubjectExportId) ||
+            value.Condition is < 1 or > 4 ||
+            (value.Condition is 1 or 2
+                ? value.ThresholdSeconds is < 60 or > 365L * 24 * 60 * 60
+                : value.ThresholdSeconds != 0) ||
+            value.Channel != 1 || value.TargetType is not (1 or 2) ||
+            string.IsNullOrWhiteSpace(value.TargetId) || value.TargetId.Any(char.IsWhiteSpace) ||
+            value.TargetId.Length > 256 || value.MessageTemplate is null || value.MessageTemplate.Length > 10_000 ||
+            (value.Recipients ?? []).Any(target => target.TargetType is not (1 or 2) || string.IsNullOrWhiteSpace(target.TargetId) || target.TargetId.Any(char.IsWhiteSpace) || target.TargetId.Length > 256)))
+            throw new InvalidDataException("通知规则数据不完整或超出允许范围。 ");
     }
 
     private static List<(string, object?)> DeviceParameters(ExportDevice value, long routerId, string mac) => [("$router", routerId), ("$mac", mac), ("$original", value.OriginalName), ("$origin", value.OriginName), ("$custom", value.CustomName), ("$note", value.Note), ("$ip", value.LastIp), ("$connection", value.ConnectionType), ("$signal", value.Signal), ("$state", value.CurrentState), ("$first", Iso(value.FirstSeenAt)), ("$last", Iso(value.LastSeenAt)), ("$changed", value.LastStateChangedAt is null ? null : Iso(value.LastStateChangedAt.Value)), ("$historical", value.LastKnownHistoricalState ?? value.CurrentState)];
@@ -228,7 +278,7 @@ public sealed class PresenceDataTransferService(IAppDataPaths paths)
     private static DateTimeOffset ParseTime(string value) => DateTimeOffset.Parse(value, CultureInfo.InvariantCulture);
     private static string Iso(DateTimeOffset value) => value.ToUniversalTime().ToString("O");
 
-    public sealed record ExportDocument(ExportManifest Manifest, List<ExportRouter> Routers, List<ExportDevice> Devices, List<ExportEvent> Events, List<ExportSession> Sessions, List<ExportGap> MonitoringGaps, List<ExportSubject>? Subjects = null, List<ExportSubjectDeviceMembership>? SubjectDeviceMemberships = null, List<ExportNotificationRule>? NotificationRules = null, List<ExportSubjectPresenceEvent>? SubjectPresenceEvents = null, List<ExportSubjectCurrentState>? SubjectCurrentStates = null);
+    public sealed record ExportDocument(ExportManifest Manifest, List<ExportRouter> Routers, List<ExportDevice> Devices, List<ExportEvent> Events, List<ExportSession> Sessions, List<ExportGap> MonitoringGaps, List<ExportSubject>? Subjects = null, List<ExportSubjectDeviceMembership>? SubjectDeviceMemberships = null, List<ExportNotificationRule>? NotificationRules = null, List<ExportSubjectPresenceEvent>? SubjectPresenceEvents = null, List<ExportSubjectCurrentState>? SubjectCurrentStates = null, List<ExportNotificationRecipient>? NotificationRecipients = null);
     public sealed record ExportManifest(string Format, int Version, DateTimeOffset CreatedAtUtc, string AppVersion, bool ContainsAuthentication);
     public sealed record ExportRouter(string MiotDid, string MiotModel, string PartnerId, string Name, string? HomeId, string? RoomId, DateTimeOffset CreatedAt, DateTimeOffset LastSeenAt);
     public sealed record ExportDevice(string RouterMiotDid, string MacAddress, string? OriginalName, string? OriginName, string? CustomName, string? Note, string? LastIp, string? ConnectionType, int? Signal, int CurrentState, DateTimeOffset FirstSeenAt, DateTimeOffset LastSeenAt, DateTimeOffset? LastStateChangedAt, int? LastKnownHistoricalState = null);
@@ -237,7 +287,9 @@ public sealed class PresenceDataTransferService(IAppDataPaths paths)
     public sealed record ExportGap(DateTimeOffset StartedAt, DateTimeOffset? EndedAt, string Reason);
     public sealed record ExportSubject(Guid ExportId, string DisplayName, string? Note, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
     public sealed record ExportSubjectDeviceMembership(Guid SubjectExportId, string RouterMiotDid, string MacAddress, DateTimeOffset CreatedAt);
-    public sealed record ExportNotificationRule(Guid SubjectExportId, bool Enabled, int Condition, long ThresholdSeconds, int Channel, int TargetType, string TargetId, string? MessageTemplate, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
-    public sealed record ExportSubjectPresenceEvent(Guid SubjectExportId, int EventType, DateTimeOffset ObservedAt, DateTimeOffset MonitoringGapStartedAt, string MonitoringGapReason);
-    public sealed record ExportSubjectCurrentState(Guid SubjectExportId, int CurrentState, DateTimeOffset StateSince, DateTimeOffset LastObservedAt);
+    public sealed record ExportNotificationRule(Guid SubjectExportId, bool Enabled, int Condition, long ThresholdSeconds, int Channel, int TargetType, string TargetId, string? MessageTemplate, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, long SourceRuleId = 0, List<ExportNotificationRecipientTarget>? Recipients = null);
+    public sealed record ExportNotificationRecipient(string Note, string OpenId, int TargetType, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
+    public sealed record ExportNotificationRecipientTarget(int TargetType, string TargetId);
+    public sealed record ExportSubjectPresenceEvent(Guid SubjectExportId, int EventType, DateTimeOffset ObservedAt, DateTimeOffset? MonitoringGapStartedAt, string? MonitoringGapReason, DateTimeOffset? StateSince = null);
+    public sealed record ExportSubjectCurrentState(Guid SubjectExportId, int CurrentState, DateTimeOffset StateSince, DateTimeOffset LastObservedAt, DateTimeOffset? PendingOfflineSince = null);
 }

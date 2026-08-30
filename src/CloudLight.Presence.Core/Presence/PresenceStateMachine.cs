@@ -56,13 +56,7 @@ public sealed class PresenceStateMachine(IPresenceRepository repository)
             await ApplyKnownDeviceAsync(existing, null, PresenceState.Offline, observedAt, cancellationToken);
         }
 
-        await UpdateSubjectCurrentStatesAsync(routerId, observedAt, cancellationToken);
-        if (gapAtObservation is not null && subjectStatesBeforeGap.Count > 0)
-            await RecordDetectedSubjectActivitiesAsync(
-                subjectStatesBeforeGap,
-                gapAtObservation,
-                observedAt,
-                cancellationToken);
+        await UpdateSubjectCurrentStatesAsync(routerId, observedAt, gapAtObservation, subjectStatesBeforeGap, cancellationToken);
     }
 
     private async Task<MonitoringGap?> FindMonitoringGapAtObservationAsync(
@@ -108,33 +102,11 @@ public sealed class PresenceStateMachine(IPresenceRepository repository)
             .ToDictionary(value => value.SubjectId, value => value.State);
     }
 
-    private async Task RecordDetectedSubjectActivitiesAsync(
-        IReadOnlyDictionary<long, PresenceState> subjectStatesBeforeGap,
-        MonitoringGap gap,
-        DateTimeOffset observedAt,
-        CancellationToken cancellationToken)
-    {
-        foreach (var (subjectId, before) in subjectStatesBeforeGap)
-        {
-            if (before is not (PresenceState.Online or PresenceState.Offline)) continue;
-            var after = (await repository.GetSubjectCurrentStateAsync(subjectId, cancellationToken))?.CurrentState;
-            if (after is not (PresenceState.Online or PresenceState.Offline) || after == before) continue;
-            var eventType = after == PresenceState.Online
-                ? SubjectPresenceEventType.DetectedOnlineAfterGap
-                : SubjectPresenceEventType.DetectedOfflineAfterGap;
-            await repository.AddSubjectPresenceEventAsync(new SubjectPresenceEvent(
-                0,
-                subjectId,
-                eventType,
-                observedAt,
-                gap.Id),
-                cancellationToken);
-        }
-    }
-
     private async Task UpdateSubjectCurrentStatesAsync(
         long routerId,
         DateTimeOffset observedAt,
+        MonitoringGap? gapAtObservation,
+        IReadOnlyDictionary<long, PresenceState> subjectStatesBeforeGap,
         CancellationToken cancellationToken)
     {
         var subjectIds = (await repository.GetDeviceSubjectMapAsync(routerId, cancellationToken))
@@ -147,15 +119,182 @@ public sealed class PresenceStateMachine(IPresenceRepository repository)
             if (members.Count == 0) continue;
             var currentState = SubjectPresenceService.Aggregate(members.Select(member => member.CurrentObservedState));
             if (currentState is not (PresenceState.Online or PresenceState.Offline)) continue;
-            var previous = await repository.GetSubjectCurrentStateAsync(subjectId, cancellationToken);
-            var stateSince = previous?.CurrentState == currentState
-                ? previous.StateSince
-                : observedAt;
-            await repository.UpsertSubjectCurrentStateAsync(
-                new SubjectCurrentState(subjectId, currentState, stateSince, observedAt),
-                cancellationToken);
+            var previous = await EnsureConfirmedBaselineAsync(
+                subjectId, members, currentState, observedAt, gapAtObservation,
+                subjectStatesBeforeGap.GetValueOrDefault(subjectId), cancellationToken);
+
+            if (gapAtObservation is not null && subjectStatesBeforeGap.TryGetValue(subjectId, out var stateBeforeGap))
+            {
+                await ApplyGapObservationAsync(subjectId, previous, stateBeforeGap, currentState, gapAtObservation, observedAt, cancellationToken);
+                continue;
+            }
+
+            await ApplyContinuousObservationAsync(subjectId, previous, currentState, observedAt, cancellationToken);
         }
     }
+
+    private async Task<SubjectCurrentState> EnsureConfirmedBaselineAsync(
+        long subjectId,
+        IReadOnlyList<NetworkDevice> members,
+        PresenceState observedState,
+        DateTimeOffset observedAt,
+        MonitoringGap? gapAtObservation,
+        PresenceState stateBeforeGap,
+        CancellationToken cancellationToken)
+    {
+        var previous = await repository.GetSubjectCurrentStateAsync(subjectId, cancellationToken);
+        var events = await repository.GetSubjectPresenceEventsAsync(subjectId, DateTimeOffset.MinValue, DateTimeOffset.MaxValue, cancellationToken);
+        if (events.Any(IsConfirmedHistoryEvent))
+        {
+            if (previous is not null) return previous;
+
+            // Imports or an interrupted older run can leave canonical history
+            // behind without its current-state projection. Rebuild that
+            // projection from the latest confirmed fact instead of falling
+            // back to a new, incorrect "now" boundary.
+            var latest = events
+                .Where(IsConfirmedHistoryEvent)
+                .OrderBy(value => value.EffectiveAt)
+                .ThenBy(value => value.ObservedAt)
+                .Last();
+            var restored = new SubjectCurrentState(
+                subjectId,
+                SubjectPresenceService.StateFor(latest),
+                latest.EffectiveAt,
+                observedAt);
+            await repository.UpsertSubjectCurrentStateAsync(restored, cancellationToken);
+            return restored;
+        }
+
+        // A safe upgrade baseline comes from the old grace-normalized subject
+        // timeline, never from one arbitrary MAC.  For the first snapshot that
+        // closes a gap, inspect only the pre-gap portion if a prior confirmed
+        // state exists so same-state gaps keep their original episode.
+        var baselineEnd = gapAtObservation is not null && stateBeforeGap is (PresenceState.Online or PresenceState.Offline)
+            ? gapAtObservation.StartedAt
+            : observedAt;
+        var legacy = new SubjectPresenceService(repository, new PresenceStatisticsService(repository));
+        var from = members.Min(value => value.FirstSeenAt);
+        var timeline = await legacy.GetLegacyTimelineAsync(subjectId, from, baselineEnd, cancellationToken);
+        var expectedState = stateBeforeGap is (PresenceState.Online or PresenceState.Offline)
+            ? stateBeforeGap
+            : observedState;
+        var segment = timeline.LastOrDefault(value => value.State == expectedState);
+        var correctedLegacySince = segment is not null && await HasLegacyBoundaryEvidenceAsync(
+            members, expectedState, segment.Start, cancellationToken)
+            ? segment.Start
+            : (DateTimeOffset?)null;
+        var stateSince = correctedLegacySince
+            ?? (previous?.CurrentState == expectedState ? (DateTimeOffset?)previous.StateSince : null)
+            ?? observedAt;
+        var baseline = new SubjectCurrentState(subjectId, expectedState, stateSince, observedAt);
+        await repository.RecordSubjectStateAndEventAsync(baseline, new SubjectPresenceEvent(
+            0,
+            subjectId,
+            expectedState == PresenceState.Online ? SubjectPresenceEventType.InitialOnline : SubjectPresenceEventType.InitialOffline,
+            observedAt,
+            null,
+            stateSince), cancellationToken);
+        return baseline;
+    }
+
+    private async Task<bool> HasLegacyBoundaryEvidenceAsync(
+        IReadOnlyList<NetworkDevice> members,
+        PresenceState state,
+        DateTimeOffset boundary,
+        CancellationToken cancellationToken)
+    {
+        foreach (var member in members)
+        {
+            if (state == PresenceState.Online)
+            {
+                if ((await repository.GetSessionsAsync(member.Id, cancellationToken)).Any(value => value.StartedAt == boundary))
+                    return true;
+                if ((await repository.GetEventsAsync(member.Id, cancellationToken)).Any(value => value.EventType == PresenceEventType.Online && value.ObservedAt == boundary))
+                    return true;
+            }
+            else if ((await repository.GetEventsAsync(member.Id, cancellationToken)).Any(value => value.EventType == PresenceEventType.Offline && value.ObservedAt == boundary)
+                || (await repository.GetSessionsAsync(member.Id, cancellationToken)).Any(value => value.EndedAt == boundary))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private async Task ApplyGapObservationAsync(
+        long subjectId,
+        SubjectCurrentState previous,
+        PresenceState stateBeforeGap,
+        PresenceState observedState,
+        MonitoringGap gap,
+        DateTimeOffset observedAt,
+        CancellationToken cancellationToken)
+    {
+        if (stateBeforeGap == observedState)
+        {
+            await repository.UpsertSubjectCurrentStateAsync(previous with
+            {
+                CurrentState = stateBeforeGap,
+                LastObservedAt = observedAt,
+                PendingOfflineSince = null
+            }, cancellationToken);
+            return;
+        }
+
+        await repository.RecordSubjectStateAndEventAsync(new SubjectCurrentState(subjectId, observedState, observedAt, observedAt), new SubjectPresenceEvent(
+            0,
+            subjectId,
+            observedState == PresenceState.Online ? SubjectPresenceEventType.DetectedOnlineAfterGap : SubjectPresenceEventType.DetectedOfflineAfterGap,
+            observedAt,
+            gap.Id,
+            observedAt), cancellationToken);
+    }
+
+    private async Task ApplyContinuousObservationAsync(
+        long subjectId,
+        SubjectCurrentState previous,
+        PresenceState observedState,
+        DateTimeOffset observedAt,
+        CancellationToken cancellationToken)
+    {
+        if (previous.CurrentState == observedState)
+        {
+            await repository.UpsertSubjectCurrentStateAsync(previous with
+            {
+                LastObservedAt = observedAt,
+                PendingOfflineSince = null
+            }, cancellationToken);
+            return;
+        }
+
+        if (observedState == PresenceState.Online)
+        {
+            await repository.RecordSubjectStateAndEventAsync(new SubjectCurrentState(subjectId, PresenceState.Online, observedAt, observedAt), new SubjectPresenceEvent(
+                0, subjectId, SubjectPresenceEventType.ConfirmedOnline, observedAt, null, observedAt), cancellationToken);
+            return;
+        }
+
+        var pendingSince = previous.PendingOfflineSince ?? observedAt;
+        if (observedAt - pendingSince < SubjectPresenceService.DefaultOfflineGracePeriod)
+        {
+            await repository.UpsertSubjectCurrentStateAsync(previous with
+            {
+                LastObservedAt = observedAt,
+                PendingOfflineSince = pendingSince
+            }, cancellationToken);
+            return;
+        }
+
+        await repository.RecordSubjectStateAndEventAsync(new SubjectCurrentState(subjectId, PresenceState.Offline, pendingSince, observedAt), new SubjectPresenceEvent(
+            0, subjectId, SubjectPresenceEventType.ConfirmedOffline, observedAt, null, pendingSince), cancellationToken);
+    }
+
+    private static bool IsConfirmedHistoryEvent(SubjectPresenceEvent value) => value.EventType is
+        SubjectPresenceEventType.InitialOnline or
+        SubjectPresenceEventType.InitialOffline or
+        SubjectPresenceEventType.ConfirmedOnline or
+        SubjectPresenceEventType.ConfirmedOffline;
 
     private async Task ApplyKnownDeviceAsync(
         NetworkDevice existing,

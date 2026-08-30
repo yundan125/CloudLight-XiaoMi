@@ -106,6 +106,34 @@ public sealed class SubjectProductModelTests
         });
     }
 
+    [Fact]
+    public async Task StartupRebindsAnUnambiguousOrphanRuleToItsRenamedDeviceSubject()
+    {
+        await WithRepository(async (repository, paths, router) =>
+        {
+            var now = DateTimeOffset.UtcNow;
+            var device = await repository.InsertDeviceAsync(Device(router.Id, "AA:BB:CC:DD:EE:07", "DESKTOP-BOLQ07G"), CancellationToken.None);
+            var target = await repository.CreateSubjectAsync("我的电脑", null, Guid.NewGuid(), now, CancellationToken.None);
+            await repository.SetSubjectDevicesAsync(target.Id, [device.Id], now, CancellationToken.None);
+            var orphan = await repository.CreateSubjectAsync("DESKTOP-BOLQ07G", null, Guid.NewGuid(), now, CancellationToken.None);
+            var rule = await repository.CreateNotificationRuleAsync(new NotificationRule(
+                0, orphan.Id, true, NotificationCondition.OnlineFor, 60,
+                NotificationChannelType.QQ, NotificationTargetType.Private, "test-openid", "{name}", now, now), CancellationToken.None);
+            await repository.UpsertNotificationRuleStateAsync(new NotificationRuleState(rule.Id, "old", now, true, now, false, null, null, now), CancellationToken.None);
+
+            var reopened = new SqlitePresenceRepository(paths);
+            await reopened.InitializeAsync(CancellationToken.None);
+
+            var repaired = await reopened.GetNotificationRuleAsync(rule.Id, CancellationToken.None);
+            Assert.NotNull(repaired);
+            Assert.Equal(target.Id, repaired!.SubjectId);
+            var state = await reopened.GetNotificationRuleStateAsync(rule.Id, CancellationToken.None);
+            Assert.NotNull(state);
+            Assert.Equal(0, state!.LastProcessedSubjectEventId);
+            Assert.Null(await reopened.GetSubjectAsync(orphan.Id, CancellationToken.None));
+        });
+    }
+
     private static async Task WithRepository(Func<SqlitePresenceRepository, AppPaths, Router, Task> test)
     {
         var root = Path.Combine(Path.GetTempPath(), "CloudLight-Subject-Product-Tests", Guid.NewGuid().ToString("N")); Directory.CreateDirectory(root);
