@@ -68,7 +68,13 @@ public sealed class DeviceDetailViewModel : ObservableObject, IDisposable
         foreach (var (days, label) in new[] { (1, "最近24小时"), (3, "最近3天"), (7, "最近7天"), (30, "最近30天") })
         {
             var value = await _statistics.GetStatisticsAsync(Device.Id, now.AddDays(-days), now, CancellationToken.None);
-            Statistics.Add(new StatisticCardViewModel(label, Format(value.KnownOnlineDuration), $"已记录：{Format(value.KnownDuration)} / {Format(value.WindowDuration)}", $"记录期间在线：{value.OnlinePercentageOfKnownTime:P1}", value.Coverage < .9));
+            Statistics.Add(new StatisticCardViewModel(label, Format(value.KnownOnlineDuration), $"覆盖率：{value.Coverage:P1}", $"在线率：{value.OnlineRate:P1}", value.Coverage < .9)
+            {
+                OfflineDuration = $"离线：{Format(value.KnownOfflineDuration)}",
+                UnknownDuration = $"未监控：{Format(value.UnknownDuration)}",
+                CoverageDetail = $"有效记录：{Format(value.KnownDuration)} / {Format(value.WindowDuration)}",
+                QualityWarning = value.Coverage < .9 ? "数据覆盖不足，在线率仅供参考" : ""
+            });
         }
         var events = await _repository.GetEventsAsync(Device.Id, CancellationToken.None); var sessions = await _repository.GetSessionsAsync(Device.Id, CancellationToken.None); History.Clear();
         foreach (var value in events.Take(30))
@@ -117,5 +123,11 @@ public sealed class DeviceDetailViewModel : ObservableObject, IDisposable
     private static string Format(TimeSpan value) { var hours = (int)value.TotalHours; return hours > 0 ? $"{hours}小时{value.Minutes}分钟" : $"{value.Minutes}分钟"; }
 }
 
-public sealed record StatisticCardViewModel(string Label, string OnlineDuration, string Coverage, string OnlinePercentage, bool HasGap);
+public sealed record StatisticCardViewModel(string Label, string OnlineDuration, string Coverage, string OnlinePercentage, bool HasGap)
+{
+    public string OfflineDuration { get; init; } = "";
+    public string UnknownDuration { get; init; } = "";
+    public string CoverageDetail { get; init; } = "";
+    public string QualityWarning { get; init; } = "";
+}
 public sealed record HistoryItemViewModel(DateTimeOffset ObservedAt, string Event, string EventColor = "#334155", string Mark = "") { public string Day => ObservedAt.ToString("MM-dd"); public string Time => ObservedAt.ToString("HH:mm:ss"); public string Timestamp => ObservedAt.ToString("MM-dd HH:mm:ss"); }

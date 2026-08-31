@@ -1,6 +1,7 @@
 using System.Text;
 using CloudLight.Presence.Core.Interfaces;
 using CloudLight.Presence.Core.Models;
+using CloudLight.Presence.Infrastructure.Diagnostics;
 using CloudLight.Presence.Infrastructure.Settings;
 
 namespace CloudLight.Presence.Infrastructure.Notifications;
@@ -64,6 +65,7 @@ public sealed class NotificationDiagnosticsLogger(IAppDataPaths paths) : INotifi
     {
         var normalized = string.IsNullOrWhiteSpace(value) ? "(empty)" : value.Trim();
         normalized = new string(normalized.Select(value => value is '\r' or '\n' or '\t' ? ' ' : value).ToArray());
+        normalized = DiagnosticsRedaction.RedactText(normalized);
         return normalized.Length <= maxLength ? normalized : normalized[..maxLength];
     }
 }

@@ -29,9 +29,9 @@ public static class SubjectActivityBuilder
         var eventBoundaries = detectedAfterGap.Select(value => value.EffectiveAt).ToHashSet();
         var activities = normalized
             .Where(segment => !eventBoundaries.Contains(segment.Start))
-            .Select(segment => new SubjectActivityItem(segment.Start, ToActivityType(segment.State)))
+            .Select(segment => new SubjectActivityItem(segment.Start, ToActivityType(segment.State), segment.UnobservedReason))
             .Concat(detectedAfterGap.Select(ToActivityItem).Where(value => value is not null).Select(value => value!))
-            .GroupBy(value => (value.OccurredAtUtc, value.Type))
+            .GroupBy(value => (value.OccurredAtUtc, value.Type, value.UnobservedReason))
             .Select(group => group.First())
             .OrderByDescending(value => value.OccurredAtUtc)
             .ThenByDescending(value => (int)value.Type)
@@ -67,7 +67,10 @@ public static class SubjectActivityBuilder
                 if (hasObservedKnownState) firstKnownAfterGap = true;
                 if (includeUnknownPeriods)
                 {
-                    if (result.Count > 0 && result[^1].State == PresenceState.Unknown && result[^1].End == segment.Start)
+                    if (result.Count > 0
+                        && result[^1].State == PresenceState.Unknown
+                        && result[^1].UnobservedReason == segment.UnobservedReason
+                        && result[^1].End == segment.Start)
                         result[^1] = result[^1] with { End = segment.End };
                     else
                         result.Add(segment);

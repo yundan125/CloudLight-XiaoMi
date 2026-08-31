@@ -5,6 +5,7 @@ using System.Text;
 using System.Text.Json;
 using CloudLight.Presence.Core.Interfaces;
 using CloudLight.Presence.Core.Models;
+using CloudLight.Presence.Infrastructure.Diagnostics;
 using CloudLight.Presence.Infrastructure.Settings;
 
 namespace CloudLight.Presence.Infrastructure.Notifications;
@@ -577,6 +578,7 @@ public sealed class QQNotificationChannel : INotificationChannel, IAsyncDisposab
     private static string SafeError(string value)
     {
         var sanitized = new string((value ?? string.Empty).Trim().Select(character => character is '\r' or '\n' or '\t' || character < 0x20 ? ' ' : character).ToArray());
+        sanitized = DiagnosticsRedaction.RedactText(sanitized);
         return sanitized.Length > 500 ? sanitized[..500] : sanitized;
     }
 }

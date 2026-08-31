@@ -41,6 +41,20 @@ public sealed class RouterPresenceViewModel : ObservableObject, IDisposable
     public string SearchText { get => _main.SearchText; set => _main.SearchText = value; }
     public ICollectionView CardsView => _main.CardsView;
     public string DiagnosticMessage => _main.DiagnosticMessage;
+    public RouterCapabilityDiagnostic? RouterDiagnostic => _main.CurrentRouterDiagnostic;
+    public string RouterCompatibilityText => _main.RouterCompatibilityText;
+    public string RouterDidText => MaskIdentifier(Router.MiotDid);
+    public string PartnerIdText => MaskIdentifier(Router.PartnerId);
+    public string PartnerIdStatus => RouterDiagnostic is null
+        ? (string.IsNullOrWhiteSpace(Router.PartnerId) ? "缺失" : "存在")
+        : RouterDiagnostic.HasPartnerId ? "存在" : "缺失";
+    public string ClientListStatus => RouterDiagnostic is null ? "尚未检查" : RouterDiagnostic.ClientListAvailable ? "可用" : "暂不可用";
+    public string PresenceStatus => RouterDiagnostic is null ? "尚未检查" : RouterDiagnostic.PresenceAvailable ? "可用" : "暂不可用";
+    public string ApiCodeText => RouterDiagnostic?.LastApiCode?.ToString() ?? "暂无";
+    public string SuccessfulFieldsText => RouterDiagnostic is { SuccessfulFields.Count: > 0 } diagnostic
+        ? string.Join(", ", diagnostic.SuccessfulFields)
+        : "暂无";
+    public string LastSuccessText => RouterDiagnostic?.LastSuccessAt is { } value ? value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") : "暂无";
 
     public void Dispose()
     {
@@ -92,6 +106,27 @@ public sealed class RouterPresenceViewModel : ObservableObject, IDisposable
             case nameof(MainViewModel.DiagnosticMessage):
                 Raise(nameof(DiagnosticMessage));
                 break;
+            case nameof(MainViewModel.CurrentRouterDiagnostic):
+                Raise(nameof(RouterDiagnostic));
+                Raise(nameof(PartnerIdStatus));
+                Raise(nameof(ClientListStatus));
+                Raise(nameof(PresenceStatus));
+                Raise(nameof(ApiCodeText));
+                Raise(nameof(SuccessfulFieldsText));
+                Raise(nameof(LastSuccessText));
+                break;
+            case nameof(MainViewModel.RouterCompatibilityText):
+                Raise(nameof(RouterCompatibilityText));
+                break;
         }
+    }
+
+    private static string MaskIdentifier(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return "未提供";
+        var trimmed = value.Trim();
+        return trimmed.Length <= 6
+            ? "***"
+            : $"{trimmed[..3]}****{trimmed[^3..]}";
     }
 }

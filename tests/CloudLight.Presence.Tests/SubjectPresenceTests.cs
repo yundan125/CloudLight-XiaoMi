@@ -112,6 +112,26 @@ public sealed class SubjectPresenceTests
     }
 
     [Fact]
+    public void ActivityProjectionKeepsDistinctMonitoringGapReasons()
+    {
+        var timeline = new PresenceTimelineSegment[]
+        {
+            new(At(18), At(19), PresenceState.Online),
+            new(At(19), At(20), PresenceState.Unknown, "UserPaused"),
+            new(At(20), At(21), PresenceState.Unknown, "Xiaomi Cloud 暂时不可用"),
+            new(At(21), At(22), PresenceState.Online)
+        };
+
+        var activities = SubjectActivityBuilder.Build(timeline, includeUnknownPeriods: true);
+
+        Assert.Equal(
+            ["Xiaomi Cloud 暂时不可用", "UserPaused"],
+            activities.Where(value => value.Type == SubjectActivityType.UnknownPeriod)
+                .Select(value => value.UnobservedReason ?? string.Empty)
+                .ToArray());
+    }
+
+    [Fact]
     public async Task AllOfflineBeyondGraceMakesSubjectOffline()
     {
         await WithSubject(async (repository, service, subject, a, _) =>

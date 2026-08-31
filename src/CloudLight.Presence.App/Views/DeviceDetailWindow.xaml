@@ -19,9 +19,12 @@
               <TextBlock Text="{Binding Label}" Style="{DynamicResource MutedTextStyle}"/>
               <TextBlock Text="在线" Style="{DynamicResource MutedTextStyle}" FontSize="11" Margin="0,9,0,0"/>
               <TextBlock Text="{Binding OnlineDuration}" FontSize="22" FontWeight="SemiBold" Margin="0,2,0,0"/>
-              <TextBlock Text="{Binding Coverage}" Style="{DynamicResource MutedTextStyle}" FontSize="11" Margin="0,5,0,0"/>
+              <TextBlock Text="{Binding OfflineDuration}" Style="{DynamicResource MutedTextStyle}" FontSize="11" Margin="0,4,0,0"/>
+              <TextBlock Text="{Binding UnknownDuration}" Style="{DynamicResource MutedTextStyle}" FontSize="11" Margin="0,2,0,0"/>
+              <TextBlock Text="{Binding Coverage}" Style="{DynamicResource MutedTextStyle}" FontSize="11" Margin="0,2,0,0"/>
               <TextBlock Text="{Binding OnlinePercentage}" Foreground="{DynamicResource TextBrush}" Margin="0,3,0,0"/>
-              <TextBlock Text="部分时间没有监控记录" Foreground="{DynamicResource WarningBrush}" FontSize="11" Margin="0,7,0,0" TextWrapping="Wrap" Visibility="{Binding HasGap, Converter={StaticResource BooleanToVisibility}}"/>
+              <TextBlock Text="{Binding CoverageDetail}" Style="{DynamicResource MutedTextStyle}" FontSize="11" TextWrapping="Wrap" Margin="0,2,0,0"/>
+              <TextBlock Text="{Binding QualityWarning}" Foreground="{DynamicResource WarningBrush}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap"/>
             </StackPanel>
           </Border>
         </DataTemplate></ItemsControl.ItemTemplate>
@@ -31,7 +34,7 @@
       <Border Style="{DynamicResource CardStyle}">
         <StackPanel>
           <StackPanel Orientation="Horizontal"><Button Content="24小时" Style="{DynamicResource FilterButton}" Command="{Binding Show24HoursCommand}" Tag="{Binding Is24HoursSelected}"/><Button Content="3天" Style="{DynamicResource FilterButton}" Command="{Binding Show3DaysCommand}" Tag="{Binding Is3DaysSelected}"/><Button Content="7天" Style="{DynamicResource FilterButton}" Command="{Binding Show7DaysCommand}" Tag="{Binding Is7DaysSelected}"/><Button Content="30天" Style="{DynamicResource FilterButton}" Command="{Binding Show30DaysCommand}" Tag="{Binding Is30DaysSelected}"/><TextBlock Text="{Binding SelectedRange}" VerticalAlignment="Center" Foreground="{DynamicResource MutedBrush}" Margin="6,0,0,0"/></StackPanel>
-          <StackPanel Orientation="Horizontal" Margin="0,14,0,8"><TextBlock Text="■ 在线" Foreground="{DynamicResource SuccessBrush}"/><TextBlock Text="■ 离线" Foreground="{DynamicResource SubtleBrush}" Margin="18,0,0,0"/><TextBlock Text="▧ 暂无记录" Foreground="{DynamicResource SubtleBrush}" Margin="18,0,0,0"/></StackPanel>
+          <StackPanel Orientation="Horizontal" Margin="0,14,0,8"><TextBlock Text="■ 在线" Foreground="{DynamicResource SuccessBrush}"/><TextBlock Text="■ 离线" Foreground="{DynamicResource SubtleBrush}" Margin="18,0,0,0"/><TextBlock Text="▧ 未监控" Foreground="{DynamicResource SubtleBrush}" Margin="18,0,0,0"/><TextBlock Text="▧ 用户暂停" Foreground="{DynamicResource AccentBrush}" Margin="18,0,0,0"/></StackPanel>
           <controls:PresenceTimelineControl Segments="{Binding Timeline}" From="{Binding TimelineFrom}" To="{Binding TimelineTo}" Days="{Binding TimelineDays}"/>
         </StackPanel>
       </Border>

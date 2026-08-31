@@ -35,7 +35,7 @@ Name: "chinesesimp"; MessagesFile: ".\ChineseSimplified.isl"
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加快捷方式："; Flags: unchecked
 
 [Files]
-Source: "{#PublishDir}\*"; DestDir: "{app}"; Excludes: "*.pdb;*.pyc"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#PublishDir}\*"; DestDir: "{app}"; Excludes: "*.pdb,*.pyc"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\CloudLight XiaoMi"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"

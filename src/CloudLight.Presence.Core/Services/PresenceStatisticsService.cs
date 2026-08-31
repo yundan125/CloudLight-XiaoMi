@@ -19,7 +19,7 @@ public sealed class PresenceStatisticsService(IPresenceRepository repository) : 
         if (to <= from) return [];
         var sessions = await repository.GetSessionsAsync(deviceId, cancellationToken);
         var device = await repository.GetDeviceAsync(deviceId, cancellationToken);
-        var gaps = await repository.GetMonitoringGapsAsync(from, to, cancellationToken);
+        var gaps = await repository.GetMonitoringGapsAsync(from, to, cancellationToken, device?.RouterId);
         var knownFrom = device is null ? to : Clamp(device.FirstSeenAt, from, to);
         var onlineIntervals = sessions
             .Select(session => ClipSession(session, gaps, from, to))
@@ -40,12 +40,14 @@ public sealed class PresenceStatisticsService(IPresenceRepository repository) : 
         for (var index = 0; index < points.Length - 1; index++)
         {
             var start = points[index]; var end = points[index + 1];
-            var unknown = start < knownFrom || gaps.Any(gap => gap.StartedAt < end && (gap.EndedAt ?? to) > start);
+            var gap = gaps.FirstOrDefault(value => value.StartedAt < end && (value.EndedAt ?? to) > start);
+            var unknown = start < knownFrom || gap is not null;
             var online = onlineIntervals.Any(session => session.Start < end && session.End > start);
             var state = unknown ? PresenceState.Unknown : online ? PresenceState.Online : PresenceState.Offline;
-            if (result.Count > 0 && result[^1].State == state && result[^1].End == start)
+            var reason = start < knownFrom ? "暂无历史记录" : gap?.Reason;
+            if (result.Count > 0 && result[^1].State == state && result[^1].UnobservedReason == reason && result[^1].End == start)
                 result[^1] = result[^1] with { End = end };
-            else result.Add(new PresenceTimelineSegment(start, end, state));
+            else result.Add(new PresenceTimelineSegment(start, end, state, reason));
         }
         return result;
     }
@@ -63,11 +65,11 @@ public sealed class PresenceStatisticsService(IPresenceRepository repository) : 
         // A session written by an older version may remain open across a gap.
         // It is valid only up to the first monitoring boundary after it began;
         // it must never resume after that boundary without a new observation.
-        var startedDuringGap = gaps.Any(gap => gap.StartedAt <= session.StartedAt && (gap.EndedAt ?? to) > session.StartedAt);
+        var startedDuringGap = gaps.Any(gap => !IsUserPauseGap(gap) && gap.StartedAt <= session.StartedAt && (gap.EndedAt ?? to) > session.StartedAt);
         if (startedDuringGap) return null;
 
         var firstGapStart = gaps
-            .Where(gap => gap.StartedAt > session.StartedAt && gap.StartedAt < end)
+            .Where(gap => !IsUserPauseGap(gap) && gap.StartedAt > session.StartedAt && gap.StartedAt < end)
             .Select(gap => gap.StartedAt)
             .DefaultIfEmpty(end)
             .Min();
@@ -80,4 +82,5 @@ public sealed class PresenceStatisticsService(IPresenceRepository repository) : 
     private static DateTimeOffset Max(DateTimeOffset left, DateTimeOffset right) => left > right ? left : right;
     private static DateTimeOffset Min(DateTimeOffset left, DateTimeOffset right) => left < right ? left : right;
     private static DateTimeOffset Clamp(DateTimeOffset value, DateTimeOffset from, DateTimeOffset to) => Max(from, Min(value, to));
+    private static bool IsUserPauseGap(MonitoringGap gap) => gap.Reason is "UserPaused" or "暂停监控";
 }

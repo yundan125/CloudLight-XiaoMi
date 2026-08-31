@@ -19,4 +19,23 @@ public interface IXiaomiPresenceSource
     Task<IReadOnlyList<ObservedNetworkDevice>> GetDevicesAsync(string partnerId, CancellationToken cancellationToken);
 }
 
+/// <summary>
+/// Optional richer probe contract. The legacy presence source contract stays
+/// small so test sources and third-party integrations remain compatible.
+/// </summary>
+public interface IXiaomiPresenceDiagnosticsSource
+{
+    Task<RouterPresenceProbeResult> GetDevicesWithDiagnosticsAsync(
+        XiaomiRouterDevice router,
+        CancellationToken cancellationToken);
+}
+
+public sealed class RouterPresenceProbeException(
+    string message,
+    RouterCapabilityDiagnostic diagnostic,
+    Exception? inner = null) : Exception(message, inner)
+{
+    public RouterCapabilityDiagnostic Diagnostic { get; } = diagnostic;
+}
+
 public class AuthenticationRequiredException(string message, Exception? inner = null) : Exception(message, inner);

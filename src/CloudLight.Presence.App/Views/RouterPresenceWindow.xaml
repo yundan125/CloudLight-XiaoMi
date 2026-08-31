@@ -23,6 +23,40 @@
         <Button Content="{Binding RefreshButtonText}" Command="{Binding RefreshCommand}" Style="{DynamicResource SecondaryButtonStyle}" Padding="12,7" Margin="14,0,0,0"/>
       </WrapPanel>
 
+      <Border Style="{DynamicResource CardStyle}" Margin="0,16,0,0">
+        <StackPanel>
+          <TextBlock Text="路由器兼容性" Style="{DynamicResource CardTitleStyle}"/>
+          <TextBlock Text="{Binding RouterCompatibilityText}" Foreground="{DynamicResource TextBrush}" Margin="0,8,0,0" TextWrapping="Wrap"/>
+          <Grid Margin="0,12,0,0">
+            <Grid.ColumnDefinitions><ColumnDefinition Width="130"/><ColumnDefinition Width="*"/><ColumnDefinition Width="130"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+            <Grid.RowDefinitions><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
+            <TextBlock Text="Model" Style="{DynamicResource FieldLabelStyle}"/>
+            <TextBlock Grid.Column="1" Text="{Binding Router.MiotModel}" TextTrimming="CharacterEllipsis" ToolTip="{Binding Router.MiotModel}"/>
+            <TextBlock Grid.Column="2" Text="DID" Style="{DynamicResource FieldLabelStyle}"/>
+            <TextBlock Grid.Column="3" Text="{Binding RouterDidText}" TextTrimming="CharacterEllipsis"/>
+            <TextBlock Grid.Row="1" Text="partner_id" Style="{DynamicResource FieldLabelStyle}" Margin="0,8,0,0"/>
+            <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding PartnerIdText}" Margin="0,8,0,0" TextTrimming="CharacterEllipsis"/>
+            <TextBlock Grid.Row="1" Grid.Column="2" Text="partner_id 状态" Style="{DynamicResource FieldLabelStyle}" Margin="0,8,0,0"/>
+            <TextBlock Grid.Row="1" Grid.Column="3" Text="{Binding PartnerIdStatus}" Margin="0,8,0,0"/>
+            <TextBlock Grid.Row="2" Text="Endpoint" Style="{DynamicResource FieldLabelStyle}" Margin="0,8,0,0"/>
+            <TextBlock Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="3" Text="{Binding RouterDiagnostic.Endpoint}" Foreground="{DynamicResource MutedBrush}" Margin="0,8,0,0" TextTrimming="CharacterEllipsis" ToolTip="{Binding RouterDiagnostic.Endpoint}"/>
+            <TextBlock Grid.Row="3" Text="客户端列表" Style="{DynamicResource FieldLabelStyle}" Margin="0,8,0,0"/>
+            <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding ClientListStatus}" Margin="0,8,0,0"/>
+            <TextBlock Grid.Row="3" Grid.Column="2" Text="Presence" Style="{DynamicResource FieldLabelStyle}" Margin="0,8,0,0"/>
+            <TextBlock Grid.Row="3" Grid.Column="3" Text="{Binding PresenceStatus}" Margin="0,8,0,0"/>
+          </Grid>
+          <Grid Margin="0,10,0,0">
+            <Grid.ColumnDefinitions><ColumnDefinition Width="130"/><ColumnDefinition Width="*"/><ColumnDefinition Width="130"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+            <TextBlock Text="最近 API code" Style="{DynamicResource FieldLabelStyle}"/>
+            <TextBlock Grid.Column="1" Text="{Binding ApiCodeText}"/>
+            <TextBlock Grid.Column="2" Text="最近成功" Style="{DynamicResource FieldLabelStyle}"/>
+            <TextBlock Grid.Column="3" Text="{Binding LastSuccessText}"/>
+            <TextBlock Grid.Row="1" Text="成功字段" Style="{DynamicResource FieldLabelStyle}" Margin="0,8,0,0"/>
+            <TextBlock Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="3" Text="{Binding SuccessfulFieldsText}" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" Margin="0,8,0,0"/>
+          </Grid>
+        </StackPanel>
+      </Border>
+
       <Grid Margin="0,22,0,16">
         <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="320"/></Grid.ColumnDefinitions>
         <StackPanel Orientation="Horizontal">

@@ -38,6 +38,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly PresenceMonitor _monitor;
     private readonly JsonSettingsStore _settings;
     private readonly DispatcherTimer _accountRefreshTimer;
+    private readonly DispatcherTimer _pauseTimer;
     private Router? _selectedRouter;
     private string _cloudStatus = "正在初始化";
     private string _diagnosticMessage = "";
@@ -51,6 +52,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private string _searchText = "";
     private string _accountSearchText = "";
     private PresenceSettings _currentSettings = new();
+    private RouterCapabilityDiagnostic? _routerDiagnostic;
+    private bool _pauseResumeInProgress;
     private NavigationTarget _currentNavigationTarget = NavigationTarget.Overview;
     private bool _isDevicesExpanded = true;
     private RouterPresenceViewModel? _currentRouterPresence;
@@ -101,6 +104,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         ShowAboutCommand = new RelayCommand(ShowAboutPage);
 
         _monitor.StatusChanged += OnStatusChanged;
+        _monitor.RouterDiagnosticChanged += OnRouterDiagnosticChanged;
         _monitor.SnapshotApplied += (_, _) => RunOnUi(RefreshCardsAsync);
         _monitor.RefreshingChanged += (_, _) => RunOnUi(() =>
         {
@@ -120,6 +124,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _accountRefreshTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(45) };
         _accountRefreshTimer.Tick += async (_, _) => await RefreshAccountDevicesAsync(CancellationToken.None);
         _accountRefreshTimer.Start();
+
+        _pauseTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        _pauseTimer.Tick += async (_, _) => await CheckPauseExpiryAsync();
+        _pauseTimer.Start();
     }
 
     public MainViewModel(
@@ -197,6 +205,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public string RouterSummary => SelectedRouter is null ? "尚未选择路由器" : $"{SelectedRouter.Name} · {SelectedRouter.MiotModel}";
     public string RouterName => SelectedRouter?.Name ?? "尚未选择路由器";
     public string RouterModel => SelectedRouter?.MiotModel ?? "未选择型号";
+    public RouterCapabilityDiagnostic? CurrentRouterDiagnostic => _routerDiagnostic;
+    public string RouterCompatibilityText => _routerDiagnostic is null
+        ? "尚未完成客户端列表检查"
+        : _routerDiagnostic.PresenceAvailable
+            ? $"客户端列表可用 · 最近成功 {_routerDiagnostic.LastSuccessAt?.ToLocalTime().ToString("HH:mm:ss") ?? "未知"}"
+            : _routerDiagnostic.Error ?? "客户端 API 暂不可用";
     public NavigationTarget CurrentNavigationTarget
     {
         get => _currentNavigationTarget;
@@ -359,6 +373,19 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public bool HasMultipleRouters => Routers.Count > 1;
     public PresenceSettings CurrentSettings => _currentSettings;
     public bool IsMonitoring => _monitor.IsRunning;
+    public bool IsPaused => _monitor.IsPaused;
+    public DateTimeOffset? PauseUntil => _monitor.PauseUntil ?? _currentSettings.PauseUntil;
+    public string PauseStatusText
+    {
+        get
+        {
+            if (!IsPaused) return "Presence 监控中";
+            var until = PauseUntil;
+            return until is null || until == DateTimeOffset.MaxValue
+                ? "Presence 监控已暂停，可手动恢复"
+                : $"Presence 监控已暂停，剩余 {FormatRemaining(until.Value - DateTimeOffset.UtcNow)}";
+        }
+    }
     public int PollingIntervalSeconds => Math.Clamp(_currentSettings.PollingIntervalSeconds, 5, 300);
     public bool IsRefreshing => _isAccountRefreshing || _monitor.IsRefreshing;
     public string RefreshButtonText => IsRefreshing ? "正在刷新…" : "⟳ 刷新";
@@ -370,6 +397,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             await _repository.InitializeAsync(cancellationToken);
             _currentSettings = await _settings.LoadAsync(cancellationToken);
             _monitor.UpdatePollingInterval(TimeSpan.FromSeconds(PollingIntervalSeconds));
+            if (_currentSettings.PauseUntil is { } pauseUntil && pauseUntil != DateTimeOffset.MaxValue && pauseUntil <= DateTimeOffset.UtcNow)
+            {
+                _currentSettings = _currentSettings with { PauseUntil = null };
+                await _settings.SaveAsync(_currentSettings, cancellationToken);
+            }
             if (!_source.HasStoredLogin)
             {
                 LoginRequired = true;
@@ -428,6 +460,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
+    public Task RefreshAsync() => RefreshNowAsync();
+
     public async Task RefreshCardsAsync()
     {
         if (SelectedRouter is null) return;
@@ -484,6 +518,17 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _currentSettings = await _settings.LoadAsync(CancellationToken.None);
         _currentSettings = _currentSettings with { StartWithWindows = startWithWindows, StartMinimized = startMinimized };
         await _settings.SaveAsync(_currentSettings, CancellationToken.None);
+        Raise(nameof(CurrentSettings));
+        Raise(nameof(Diagnostics));
+    }
+
+    public async Task SaveCloseBehaviorAsync(bool minimizeToTray)
+    {
+        _currentSettings = await _settings.LoadAsync(CancellationToken.None);
+        _currentSettings = _currentSettings with { MinimizeToTrayOnClose = minimizeToTray };
+        await _settings.SaveAsync(_currentSettings, CancellationToken.None);
+        Raise(nameof(CurrentSettings));
+        Raise(nameof(Diagnostics));
     }
 
     public async Task SavePollingIntervalAsync(int seconds)
@@ -498,22 +543,46 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         Raise(nameof(Diagnostics));
     }
 
-    public async Task PauseAsync()
+    public Task PauseAsync() => PauseAsync(null);
+
+    public async Task PauseAsync(TimeSpan? duration)
     {
-        if (_monitor.IsRunning) await _monitor.StopAsync("暂停监控", CancellationToken.None);
+        var now = DateTimeOffset.UtcNow;
+        var pauseUntil = duration is { } value
+            ? now.Add(value)
+            : DateTimeOffset.MaxValue;
+        _currentSettings = await _settings.LoadAsync(CancellationToken.None);
+        _currentSettings = _currentSettings with { PauseUntil = pauseUntil };
+        await _settings.SaveAsync(_currentSettings, CancellationToken.None);
+        await _monitor.PauseAsync(pauseUntil, CancellationToken.None);
         await RefreshCardsAsync();
         Raise(nameof(IsMonitoring));
+        Raise(nameof(IsPaused));
+        Raise(nameof(PauseUntil));
+        Raise(nameof(PauseStatusText));
+        Raise(nameof(CurrentSettings));
+        Raise(nameof(Diagnostics));
         RefreshCommand.Refresh();
     }
 
     public async Task ResumeAsync()
     {
-        if (!_monitor.IsRunning && SelectedRouter is not null)
+        _currentSettings = await _settings.LoadAsync(CancellationToken.None);
+        if (_currentSettings.PauseUntil is not null)
         {
-            await _monitor.StartAsync(SelectedRouter, CancellationToken.None);
-            await RefreshCardsAsync();
+            _currentSettings = _currentSettings with { PauseUntil = null };
+            await _settings.SaveAsync(_currentSettings, CancellationToken.None);
         }
+        if (_monitor.IsPaused) await _monitor.ResumeAsync(CancellationToken.None);
+        else if (!_monitor.IsRunning && SelectedRouter is not null)
+            await _monitor.StartAsync(SelectedRouter, CancellationToken.None);
+        await RefreshCardsAsync();
         Raise(nameof(IsMonitoring));
+        Raise(nameof(IsPaused));
+        Raise(nameof(PauseUntil));
+        Raise(nameof(PauseStatusText));
+        Raise(nameof(CurrentSettings));
+        Raise(nameof(Diagnostics));
         RefreshCommand.Refresh();
     }
 
@@ -522,7 +591,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public void Dispose()
     {
         _accountRefreshTimer.Stop();
+        _pauseTimer.Stop();
         _monitor.StatusChanged -= OnStatusChanged;
+        _monitor.RouterDiagnosticChanged -= OnRouterDiagnosticChanged;
         CurrentRouterPresence?.Dispose();
         CurrentXiaomiAccountDeviceDetail?.Dispose();
         CurrentSubjectDetail?.Dispose();
@@ -539,6 +610,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         CurrentRouterPresence = new RouterPresenceViewModel(this, router);
         IsDevicesExpanded = true;
         CurrentNavigationTarget = NavigationTarget.RouterPresence(router.Id);
+    }
+
+    public async Task ShowRouterPresenceAsync(Router router)
+    {
+        ArgumentNullException.ThrowIfNull(router);
+        var changed = SelectedRouter?.Id != router.Id;
+        ShowRouterPresence(router);
+        if (changed || (!_monitor.IsRunning && !_monitor.IsPaused))
+            await StartSelectedAsync();
     }
 
     public void ShowXiaomiAccountDeviceDetail(XiaomiAccountDeviceDetailViewModel detail)
@@ -692,11 +772,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         var discoveredRouters = AccountDevices
             .Select(value => value.Device)
-            .Where(value => value.IsRouter && !string.IsNullOrWhiteSpace(value.PartnerId))
+            .Where(value => value.IsRouter)
             .Select(value => new XiaomiRouterDevice(
                 value.Did,
                 value.Model ?? "unknown",
-                value.PartnerId!,
+                value.PartnerId ?? string.Empty,
                 value.DisplayName,
                 value.HomeId,
                 value.RoomId))
@@ -738,7 +818,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
 
         _currentSettings = await _settings.LoadAsync(cancellationToken);
-        SelectedRouter = Routers.FirstOrDefault(value => value.PartnerId == _currentSettings.SelectedRouterPartnerId) ??
+        SelectedRouter = Routers.FirstOrDefault(value => value.MiotDid == _currentSettings.SelectedRouterMiotDid) ??
+                         Routers.FirstOrDefault(value => value.PartnerId == _currentSettings.SelectedRouterPartnerId) ??
                          (Routers.Count == 1 ? Routers[0] : null);
         if (SelectedRouter is not null)
             await StartSelectedAsync();
@@ -755,12 +836,34 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         if (SelectedRouter is null) return;
         _currentSettings = await _settings.LoadAsync(CancellationToken.None);
-        _currentSettings = _currentSettings with { SelectedRouterPartnerId = SelectedRouter.PartnerId };
+        _currentSettings = _currentSettings with
+        {
+            SelectedRouterPartnerId = SelectedRouter.PartnerId,
+            SelectedRouterMiotDid = SelectedRouter.MiotDid
+        };
         await _settings.SaveAsync(_currentSettings, CancellationToken.None);
+        _routerDiagnostic = await _repository.GetRouterCapabilityDiagnosticAsync(SelectedRouter.Id, CancellationToken.None);
+        Raise(nameof(CurrentRouterDiagnostic));
+        Raise(nameof(RouterCompatibilityText));
         if (_monitor.IsRunning) await _monitor.StopAsync("切换路由器", CancellationToken.None);
-        await _monitor.StartAsync(SelectedRouter, CancellationToken.None);
+        await _monitor.SelectRouterAsync(SelectedRouter, CancellationToken.None);
+        if (_currentSettings.PauseUntil is { } pauseUntil && (pauseUntil == DateTimeOffset.MaxValue || pauseUntil > DateTimeOffset.UtcNow))
+            await _monitor.PauseAsync(pauseUntil, CancellationToken.None);
+        else
+        {
+            if (_currentSettings.PauseUntil is not null)
+            {
+                _currentSettings = _currentSettings with { PauseUntil = null };
+                await _settings.SaveAsync(_currentSettings, CancellationToken.None);
+            }
+            await _monitor.StartAsync(SelectedRouter, CancellationToken.None);
+        }
         RefreshCommand.Refresh();
         await RefreshCardsAsync();
+        Raise(nameof(IsMonitoring));
+        Raise(nameof(IsPaused));
+        Raise(nameof(PauseUntil));
+        Raise(nameof(PauseStatusText));
         Raise(nameof(RouterSummary));
         Raise(nameof(Diagnostics));
     }
@@ -912,9 +1015,42 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
         DiagnosticMessage = status.Message ?? "";
         LoginRequired = status.State == CloudConnectionState.NeedsLogin;
+        Raise(nameof(IsMonitoring));
+        Raise(nameof(IsPaused));
+        Raise(nameof(PauseUntil));
+        Raise(nameof(PauseStatusText));
+        Raise(nameof(CurrentSettings));
         Raise(nameof(Diagnostics));
         RefreshCommand.Refresh();
         await RefreshCardsAsync();
+    });
+
+    private async Task CheckPauseExpiryAsync()
+    {
+        if (_pauseResumeInProgress || !_monitor.IsPaused || _monitor.PauseUntil is not { } pauseUntil) return;
+        Raise(nameof(PauseStatusText));
+        if (pauseUntil == DateTimeOffset.MaxValue || pauseUntil > DateTimeOffset.UtcNow) return;
+        _pauseResumeInProgress = true;
+        try { await ResumeAsync(); }
+        catch (Exception exception) { DiagnosticMessage = $"自动恢复 Presence 失败：{exception.Message}"; }
+        finally { _pauseResumeInProgress = false; }
+    }
+
+    private static string FormatRemaining(TimeSpan value)
+    {
+        if (value < TimeSpan.Zero) return "0分钟";
+        if (value.TotalHours >= 1) return $"{(int)value.TotalHours}小时{value.Minutes}分钟";
+        return $"{Math.Max(1, (int)value.TotalMinutes)}分钟";
+    }
+
+    private void OnRouterDiagnosticChanged(object? sender, RouterCapabilityDiagnostic diagnostic) => RunOnUi(() =>
+    {
+        if (SelectedRouter is null || diagnostic.RouterId != SelectedRouter.Id) return Task.CompletedTask;
+        _routerDiagnostic = diagnostic;
+        Raise(nameof(CurrentRouterDiagnostic));
+        Raise(nameof(RouterCompatibilityText));
+        Raise(nameof(Diagnostics));
+        return Task.CompletedTask;
     });
 
     private void RaisePresenceCounts()

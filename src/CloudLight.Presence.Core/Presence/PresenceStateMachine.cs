@@ -16,7 +16,7 @@ public sealed class PresenceStateMachine(IPresenceRepository repository)
         // snapshot that closes a monitoring gap.  We write one observation at
         // the subject boundary after the complete router snapshot is applied,
         // never one event per MAC address.
-        var gapAtObservation = await FindMonitoringGapAtObservationAsync(observedAt, cancellationToken);
+        var gapAtObservation = await FindMonitoringGapAtObservationAsync(routerId, observedAt, cancellationToken);
         var subjectStatesBeforeGap = gapAtObservation is null
             ? new Dictionary<long, PresenceState>()
             : await CaptureOrReadGapSubjectBaselinesAsync(routerId, gapAtObservation, cancellationToken);
@@ -60,12 +60,13 @@ public sealed class PresenceStateMachine(IPresenceRepository repository)
     }
 
     private async Task<MonitoringGap?> FindMonitoringGapAtObservationAsync(
+        long routerId,
         DateTimeOffset observedAt,
         CancellationToken cancellationToken)
     {
         var from = observedAt == DateTimeOffset.MinValue ? observedAt : observedAt.AddTicks(-1);
         var to = observedAt == DateTimeOffset.MaxValue ? observedAt : observedAt.AddTicks(1);
-        return (await repository.GetMonitoringGapsAsync(from, to, cancellationToken))
+        return (await repository.GetMonitoringGapsAsync(from, to, cancellationToken, routerId))
             .Where(value => value.StartedAt < observedAt && (value.EndedAt is null || value.EndedAt >= observedAt))
             .OrderByDescending(value => value.StartedAt)
             .FirstOrDefault();
@@ -318,17 +319,18 @@ public sealed class PresenceStateMachine(IPresenceRepository repository)
             lastEvidenceAt = Max(lastEvidenceAt, session.StartedAt);
             if (session.EndKnown && session.EndedAt is { } endedAt) lastEvidenceAt = Max(lastEvidenceAt, endedAt);
         }
-        var gaps = await repository.GetMonitoringGapsAsync(existing.FirstSeenAt, observedAt, cancellationToken);
+        var gaps = await repository.GetMonitoringGapsAsync(existing.FirstSeenAt, observedAt, cancellationToken, existing.RouterId);
         var crossedMonitoringGap = gaps.Any(gap => gap.StartedAt < observedAt && (gap.EndedAt ?? observedAt) > lastEvidenceAt);
+        var crossedOperationalGap = gaps.Any(gap => !IsUserPauseGap(gap) && gap.StartedAt < observedAt && (gap.EndedAt ?? observedAt) > lastEvidenceAt);
         var sessionGapBoundary = openSession is null
             ? null
-            : gaps.Where(gap => gap.StartedAt > openSession.StartedAt && gap.StartedAt < observedAt)
+            : gaps.Where(gap => !IsUserPauseGap(gap) && gap.StartedAt > openSession.StartedAt && gap.StartedAt < observedAt)
                 .Select(gap => (DateTimeOffset?)gap.StartedAt)
                 .OrderBy(value => value)
                 .FirstOrDefault();
         var sessionStartedDuringGapBoundary = openSession is null
             ? null
-            : gaps.Where(gap => gap.StartedAt <= openSession.StartedAt && (gap.EndedAt ?? observedAt) > openSession.StartedAt)
+            : gaps.Where(gap => !IsUserPauseGap(gap) && gap.StartedAt <= openSession.StartedAt && (gap.EndedAt ?? observedAt) > openSession.StartedAt)
                 .Select(gap => (DateTimeOffset?)gap.StartedAt)
                 .OrderBy(value => value)
                 .FirstOrDefault();
@@ -336,7 +338,7 @@ public sealed class PresenceStateMachine(IPresenceRepository repository)
         var replaceOpenSession = nextState == PresenceState.Online && crossedMonitoringGap && openSession is not null &&
             sessionBoundary is not null;
         var startUnconfirmedSession = nextState == PresenceState.Online &&
-            (historicalState == PresenceState.Unknown || crossedMonitoringGap || (observedChanged && openSession is null));
+            (historicalState == PresenceState.Unknown || crossedOperationalGap || (observedChanged && openSession is null));
         var updated = existing with
         {
             OriginalName = observed?.Name ?? existing.OriginalName,
@@ -418,6 +420,8 @@ public sealed class PresenceStateMachine(IPresenceRepository repository)
     }
 
     private static DateTimeOffset Max(DateTimeOffset left, DateTimeOffset right) => left > right ? left : right;
+
+    private static bool IsUserPauseGap(MonitoringGap gap) => gap.Reason is "UserPaused" or "暂停监控";
 
     public static string NormalizeMac(string value)
     {

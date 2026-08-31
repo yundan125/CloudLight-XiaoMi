@@ -6,7 +6,7 @@ using CloudLight.Presence.Xiaomi.Cloud;
 
 namespace CloudLight.Presence.Xiaomi;
 
-public sealed class XiaomiPresenceSource : IXiaomiPresenceSource, IXiaomiAccountDeviceSource, IXiaomiDeviceControlSource
+public sealed class XiaomiPresenceSource : IXiaomiPresenceSource, IXiaomiPresenceDiagnosticsSource, IXiaomiAccountDeviceSource, IXiaomiDeviceControlSource
 {
     private static readonly JsonSerializerOptions Options = new(JsonSerializerDefaults.Web) { WriteIndented = true };
     private readonly ISecureSessionStore _store;
@@ -63,11 +63,11 @@ public sealed class XiaomiPresenceSource : IXiaomiPresenceSource, IXiaomiAccount
             session => DiscoverAccountDevicesWithSessionAsync(session, cancellationToken),
             cancellationToken);
         return devices
-            .Where(value => value.IsRouter && !string.IsNullOrWhiteSpace(value.PartnerId))
+            .Where(value => value.IsRouter)
             .Select(value => new XiaomiRouterDevice(
                 value.Did,
                 value.Model ?? "unknown",
-                value.PartnerId!,
+                value.PartnerId ?? string.Empty,
                 value.DisplayName,
                 value.HomeId,
                 value.RoomId))
@@ -82,6 +82,49 @@ public sealed class XiaomiPresenceSource : IXiaomiPresenceSource, IXiaomiAccount
         WithRefreshAsync(
             session => _gateway.GetRouterClientsAsync(session, partnerId, cancellationToken),
             cancellationToken);
+
+    public async Task<RouterPresenceProbeResult> GetDevicesWithDiagnosticsAsync(
+        XiaomiRouterDevice router,
+        CancellationToken cancellationToken)
+    {
+        var endpoint = XiaomiApiEndpoints.AppGatewayBaseUrl + XiaomiApiEndpoints.RouterClientListPath;
+        var now = DateTimeOffset.UtcNow;
+        if (string.IsNullOrWhiteSpace(router.PartnerId))
+        {
+            return new([], new RouterCapabilityDiagnostic(
+                0, router.MiotDid, router.MiotModel, false, endpoint, null, false, [], null, false,
+                "未返回 Router ID / partner_id。", now));
+        }
+
+        try
+        {
+            var probe = await WithRefreshAsync(
+                session => _gateway.GetRouterClientsWithDiagnosticsAsync(session, router.PartnerId, cancellationToken),
+                cancellationToken);
+            return new(probe.Devices, new RouterCapabilityDiagnostic(
+                0, router.MiotDid, router.MiotModel, true, endpoint, probe.ApiCode,
+                probe.ClientListAvailable, probe.SuccessfulFields, probe.ClientListAvailable ? now : null,
+                probe.ClientListAvailable, probe.Error, now));
+        }
+        catch (RouterPresenceProbeException)
+        {
+            throw;
+        }
+        catch (XiaomiCloudException exception)
+        {
+            throw new RouterPresenceProbeException(
+                exception.Message,
+                new RouterCapabilityDiagnostic(0, router.MiotDid, router.MiotModel, true, endpoint,
+                    exception.XiaomiCode, false, [], null, false, exception.Message, now), exception);
+        }
+        catch (Exception exception)
+        {
+            throw new RouterPresenceProbeException(
+                exception.Message,
+                new RouterCapabilityDiagnostic(0, router.MiotDid, router.MiotModel, true, endpoint,
+                    null, false, [], null, false, exception.Message, now), exception);
+        }
+    }
 
     public Task<XiaomiPowerStateResult> ReadPowerStateAsync(
         XiaomiAccountDevice device,

@@ -11,10 +11,16 @@ public sealed class NotificationRuntime(
 {
     private readonly SemaphoreSlim _evaluateGate = new(1, 1);
     private readonly INotificationDiagnostics _diagnostics = diagnostics ?? NullNotificationDiagnostics.Instance;
+    private readonly object _statusSync = new();
     private CancellationTokenSource? _lifetime;
     private Task? _timerTask;
+    private DateTimeOffset? _lastEvaluationAt;
+    private string? _lastEvaluationError;
 
     public bool IsRunning => _timerTask is { IsCompleted: false };
+    public DateTimeOffset? LastEvaluationAt { get { lock (_statusSync) return _lastEvaluationAt; } }
+    public string? LastEvaluationError { get { lock (_statusSync) return _lastEvaluationError; } }
+    public event EventHandler? EvaluationCompleted;
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
@@ -40,8 +46,17 @@ public sealed class NotificationRuntime(
     public async Task EvaluateAndDispatchAsync(CancellationToken cancellationToken)
     {
         await _evaluateGate.WaitAsync(cancellationToken);
+        SetEvaluationError(null);
+        var evaluationStarted = false;
         try
         {
+            // User-paused Presence is an intentional observation gap. Do not
+            // advance rule state, create deliveries, or retry QQ messages
+            // while the monitor is paused; connection alerts are handled by
+            // their separate runtime.
+            if (monitor.IsPaused) return;
+            evaluationStarted = true;
+
             IReadOnlyList<NotificationRequest> requests;
             try
             {
@@ -53,6 +68,7 @@ public sealed class NotificationRuntime(
             }
             catch (Exception exception)
             {
+                SetEvaluationError(exception.Message);
                 await _diagnostics.RecordAsync("evaluate", exception, null, null, cancellationToken);
                 return;
             }
@@ -69,6 +85,7 @@ public sealed class NotificationRuntime(
                 }
                 catch (Exception exception)
                 {
+                    SetEvaluationError(exception.Message);
                     await _diagnostics.RecordAsync("dispatch", exception, request.RuleId, request.DeliveryId, cancellationToken);
                 }
             }
@@ -83,10 +100,17 @@ public sealed class NotificationRuntime(
             }
             catch (Exception exception)
             {
+                SetEvaluationError(exception.Message);
                 await _diagnostics.RecordAsync("retry", exception, null, null, cancellationToken);
             }
         }
-        finally { _evaluateGate.Release(); }
+        finally
+        {
+            if (evaluationStarted)
+                lock (_statusSync) _lastEvaluationAt = DateTimeOffset.UtcNow;
+            _evaluateGate.Release();
+            try { EvaluationCompleted?.Invoke(this, EventArgs.Empty); } catch { }
+        }
     }
 
     public async ValueTask DisposeAsync()
@@ -131,7 +155,13 @@ public sealed class NotificationRuntime(
         }
         catch (Exception exception)
         {
+            SetEvaluationError(exception.Message);
             await _diagnostics.RecordAsync("runtime", exception, null, null, CancellationToken.None);
         }
+    }
+
+    private void SetEvaluationError(string? error)
+    {
+        lock (_statusSync) _lastEvaluationError = string.IsNullOrWhiteSpace(error) ? null : error;
     }
 }

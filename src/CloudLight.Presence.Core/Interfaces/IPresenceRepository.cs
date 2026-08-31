@@ -7,6 +7,8 @@ public interface IPresenceRepository
     Task InitializeAsync(CancellationToken cancellationToken);
     Task<Router> UpsertRouterAsync(Router router, CancellationToken cancellationToken);
     Task<IReadOnlyList<Router>> GetRoutersAsync(CancellationToken cancellationToken);
+    Task<RouterCapabilityDiagnostic?> GetRouterCapabilityDiagnosticAsync(long routerId, CancellationToken cancellationToken);
+    Task UpsertRouterCapabilityDiagnosticAsync(RouterCapabilityDiagnostic diagnostic, CancellationToken cancellationToken);
     Task<NetworkDevice?> FindDeviceAsync(long routerId, string macAddress, CancellationToken cancellationToken);
     Task<NetworkDevice?> GetDeviceAsync(long deviceId, CancellationToken cancellationToken);
     Task<NetworkDevice> InsertDeviceAsync(NetworkDevice device, CancellationToken cancellationToken);
@@ -38,12 +40,12 @@ public interface IPresenceRepository
     Task CloseOpenSessionAsync(long deviceId, DateTimeOffset endedAt, CancellationToken cancellationToken);
     Task CloseOpenSessionAtBoundaryAsync(long deviceId, DateTimeOffset endedAt, CancellationToken cancellationToken);
     Task<IReadOnlyList<PresenceSession>> GetSessionsAsync(long deviceId, CancellationToken cancellationToken);
-    Task<IReadOnlyList<MonitoringGap>> GetMonitoringGapsAsync(DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken);
+    Task<IReadOnlyList<MonitoringGap>> GetMonitoringGapsAsync(DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken, long? routerId = null);
     Task<IReadOnlyList<MonitoringGapSubjectBaseline>> GetMonitoringGapSubjectBaselinesAsync(long monitoringGapId, CancellationToken cancellationToken);
     Task AddMonitoringGapSubjectBaselineAsync(MonitoringGapSubjectBaseline baseline, CancellationToken cancellationToken);
-    Task<long> StartMonitoringGapAsync(DateTimeOffset startedAt, string reason, CancellationToken cancellationToken);
+    Task<long> StartMonitoringGapAsync(DateTimeOffset startedAt, string reason, CancellationToken cancellationToken, long? routerId = null);
     Task EndMonitoringGapAsync(long gapId, DateTimeOffset endedAt, CancellationToken cancellationToken);
-    Task CloseOpenMonitoringGapsAsync(DateTimeOffset endedAt, CancellationToken cancellationToken);
+    Task CloseOpenMonitoringGapsAsync(DateTimeOffset endedAt, CancellationToken cancellationToken, long? routerId = null);
     Task<long> StartApplicationRunAsync(DateTimeOffset startedAt, CancellationToken cancellationToken);
     Task UpdateApplicationRunCloudUpdateAsync(long runId, DateTimeOffset updatedAt, CancellationToken cancellationToken);
     Task EndApplicationRunAsync(long runId, DateTimeOffset endedAt, CancellationToken cancellationToken);
@@ -102,6 +104,7 @@ public interface ISubjectPresenceService
 public interface INotificationRuleService
 {
     Task<IReadOnlyList<NotificationRequest>> EvaluateAsync(DateTimeOffset now, CancellationToken cancellationToken);
+    Task<RuleEvaluationDiagnostic> EvaluateDiagnosticAsync(long ruleId, DateTimeOffset now, CancellationToken cancellationToken);
 }
 
 public interface INotificationChannel

@@ -23,7 +23,10 @@ public sealed class PresenceTimelineControl : FrameworkElement
     {
         base.OnRender(dc); if (To <= From || ActualWidth < 100) return;
         var rows = Math.Max(1, Math.Min(30, Days)); var labelWidth = rows == 1 ? 48d : 64d; var barLeft = labelWidth; var barWidth = Math.Max(1, ActualWidth - labelWidth); var rowHeight = 28d;
-        var online = new SolidColorBrush(Color.FromRgb(34, 197, 94)); var offline = new SolidColorBrush(Color.FromRgb(220, 228, 239)); var unknown = new DrawingBrush { TileMode = TileMode.Tile, Viewport = new Rect(0, 0, 8, 8), ViewportUnits = BrushMappingMode.Absolute, Drawing = new GeometryDrawing(new SolidColorBrush(Color.FromRgb(241, 245, 249)), null, Geometry.Parse("M0,8 L8,0 M-2,2 L2,-2 M6,10 L10,6")) { Pen = new Pen(new SolidColorBrush(Color.FromRgb(148, 163, 184)), 1) } };
+        var online = new SolidColorBrush(Color.FromRgb(34, 197, 94)); var offline = new SolidColorBrush(Color.FromRgb(220, 228, 239));
+        var unknown = CreateUnknownBrush(Color.FromRgb(241, 245, 249), Color.FromRgb(148, 163, 184));
+        var paused = CreateUnknownBrush(Color.FromRgb(239, 246, 255), Color.FromRgb(96, 165, 250));
+        var unavailable = CreateUnknownBrush(Color.FromRgb(255, 247, 237), Color.FromRgb(251, 146, 60));
         var typeface = new Typeface("Segoe UI"); var segments = Segments?.Cast<PresenceTimelineSegment>().ToArray() ?? [];
         for (var row = 0; row < rows; row++)
         {
@@ -36,7 +39,18 @@ public sealed class PresenceTimelineControl : FrameworkElement
             {
                 var start = segment.Start > rowStart ? segment.Start : rowStart; var end = segment.End < rowEnd ? segment.End : rowEnd; if (end <= start) continue;
                 var x = barLeft + (start - rowStart).TotalSeconds / (rowEnd - rowStart).TotalSeconds * barWidth; var width = (end - start).TotalSeconds / (rowEnd - rowStart).TotalSeconds * barWidth;
-                dc.DrawRectangle(segment.State == PresenceState.Online ? online : segment.State == PresenceState.Offline ? offline : unknown, null, new Rect(x, y + 4, Math.Max(1, width), 18));
+                System.Windows.Media.Brush brush = segment.State == PresenceState.Online
+                    ? online
+                    : segment.State == PresenceState.Offline
+                        ? offline
+                        : segment.UnobservedReason is "UserPaused" or "用户暂停监控"
+                            ? paused
+                            : segment.UnobservedReason?.Contains("Xiaomi", StringComparison.OrdinalIgnoreCase) == true
+                              || segment.UnobservedReason?.Contains("Router", StringComparison.OrdinalIgnoreCase) == true
+                              || segment.UnobservedReason?.Contains("连接", StringComparison.Ordinal) == true
+                                ? unavailable
+                                : unknown;
+                dc.DrawRectangle(brush, null, new Rect(x, y + 4, Math.Max(1, width), 18));
             }
             if (rows == 1)
             {
@@ -48,5 +62,24 @@ public sealed class PresenceTimelineControl : FrameworkElement
             }
         }
         dc.DrawText(new FormattedText(rows == 1 ? "现在" : "每天一行", System.Globalization.CultureInfo.CurrentCulture, System.Windows.FlowDirection.LeftToRight, typeface, 11, new SolidColorBrush(Color.FromRgb(100, 116, 139)), VisualTreeHelper.GetDpi(this).PixelsPerDip), new Point(Math.Max(labelWidth, ActualWidth - (rows == 1 ? 28 : 55)), rows == 1 ? 47 : rows * rowHeight + 2));
+    }
+
+    private static DrawingBrush CreateUnknownBrush(Color background, Color stripe)
+    {
+        var brush = new DrawingBrush
+        {
+            TileMode = TileMode.Tile,
+            Viewport = new Rect(0, 0, 8, 8),
+            ViewportUnits = BrushMappingMode.Absolute,
+            Drawing = new GeometryDrawing(
+                new SolidColorBrush(background),
+                null,
+                Geometry.Parse("M0,8 L8,0 M-2,2 L2,-2 M6,10 L10,6"))
+            {
+                Pen = new Pen(new SolidColorBrush(stripe), 1)
+            }
+        };
+        brush.Freeze();
+        return brush;
     }
 }

@@ -6,6 +6,10 @@ obj/
 *.suo
 .research/
 
+# Python bytecode and local interpreter caches.
+__pycache__/
+*.pyc
+
 # Never commit authentication, live databases, or live-account captures.
 auth.dat
 presence.db

@@ -19,19 +19,27 @@ public sealed class NotificationSettingsViewModel : ObservableObject, IDisposabl
     private readonly DpapiQqSecretStore _secretStore;
     private readonly QQNotificationChannel _qq;
     private readonly NotificationRuleAdministrationService _ruleAdministration;
+    private readonly INotificationRuleService? _ruleService;
     private readonly SemaphoreSlim _loadGate = new(1, 1);
     private NotificationChannelStatus _qqStatus;
     private QqNotificationSettings _qqSettings = new();
     private ConnectionAlertSettings _connectionAlerts = new();
     private bool _secretConfigured;
     private string _operationStatus = "";
+    private bool _disposed;
 
-    public NotificationSettingsViewModel(IPresenceRepository repository, JsonSettingsStore settings, DpapiQqSecretStore secretStore, QQNotificationChannel qq)
+    public NotificationSettingsViewModel(
+        IPresenceRepository repository,
+        JsonSettingsStore settings,
+        DpapiQqSecretStore secretStore,
+        QQNotificationChannel qq,
+        INotificationRuleService? ruleService = null)
     {
         _repository = repository;
         _settings = settings;
         _secretStore = secretStore;
         _qq = qq;
+        _ruleService = ruleService;
         _ruleAdministration = new NotificationRuleAdministrationService(repository);
         _qqStatus = qq.Status;
         _qq.StatusChanged += QqStatusChanged;
@@ -331,8 +339,43 @@ public sealed class NotificationSettingsViewModel : ObservableObject, IDisposabl
         finally { _loadGate.Release(); }
     }
 
+    public async Task RefreshRuleDiagnosticsAsync(CancellationToken cancellationToken)
+    {
+        if (_ruleService is null || _disposed) return;
+        var dispatcher = System.Windows.Application.Current?.Dispatcher;
+        if (dispatcher is not null && !dispatcher.CheckAccess())
+        {
+            var operation = dispatcher.InvokeAsync(() => RefreshRuleDiagnosticsCoreAsync(cancellationToken));
+            await operation.Task.Unwrap();
+            return;
+        }
+        if (_disposed || Rules.Count == 0) return;
+        await _loadGate.WaitAsync(cancellationToken);
+        try { await RefreshRuleDiagnosticsCoreAsync(cancellationToken); }
+        finally { _loadGate.Release(); }
+    }
+
+    public async Task CheckRuleAsync(NotificationRuleItemViewModel item, CancellationToken cancellationToken)
+    {
+        if (_disposed || _ruleService is null)
+        {
+            if (!_disposed) OperationStatus = "规则诊断服务尚未初始化。";
+            return;
+        }
+        await _loadGate.WaitAsync(cancellationToken);
+        try
+        {
+            var diagnostic = await _ruleService.EvaluateDiagnosticAsync(item.Rule.Id, DateTimeOffset.UtcNow, cancellationToken);
+            item.ApplyDiagnostic(diagnostic);
+            OperationStatus = $"检查完成：{diagnostic.Title}";
+        }
+        finally { _loadGate.Release(); }
+    }
+
     public void Dispose()
     {
+        if (_disposed) return;
+        _disposed = true;
         _qq.StatusChanged -= QqStatusChanged;
         _loadGate.Dispose();
     }
@@ -352,6 +395,7 @@ public sealed class NotificationSettingsViewModel : ObservableObject, IDisposabl
             var ruleRecipients = await _repository.GetNotificationRuleRecipientsAsync(rule.Id, cancellationToken);
             Rules.Add(new NotificationRuleItemViewModel(rule, names.GetValueOrDefault(rule.SubjectId, "未知主体"), ruleRecipients));
         }
+        await RefreshRuleDiagnosticsCoreAsync(cancellationToken);
         var deliveries = await _repository.GetRecentNotificationDeliveriesAsync(30, cancellationToken);
         RecentDeliveries.Clear();
         foreach (var delivery in deliveries)
@@ -370,6 +414,24 @@ public sealed class NotificationSettingsViewModel : ObservableObject, IDisposabl
             RecentSystemDeliveries.Add(new SystemNotificationDeliveryItemViewModel(delivery, recipientName));
         }
         Raise(nameof(HasRules)); Raise(nameof(HasRecipients)); Raise(nameof(HasRecentDeliveries)); Raise(nameof(HasRecentSystemDeliveries)); Raise(nameof(HasAnyRecentDeliveries));
+    }
+
+    private async Task RefreshRuleDiagnosticsCoreAsync(CancellationToken cancellationToken)
+    {
+        if (_ruleService is null || _disposed) return;
+        foreach (var rule in Rules.ToArray())
+        {
+            try
+            {
+                var diagnostic = await _ruleService.EvaluateDiagnosticAsync(rule.Rule.Id, DateTimeOffset.UtcNow, cancellationToken);
+                rule.ApplyDiagnostic(diagnostic);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch (Exception exception)
+            {
+                rule.ApplyDiagnosticError(exception.Message);
+            }
+        }
     }
 
     private async Task<QqNotificationSettings> NormalizeDefaultRecipientsAsync(QqNotificationSettings settings, CancellationToken cancellationToken)
@@ -468,8 +530,10 @@ public sealed class NotificationRecipientItemViewModel(NotificationRecipient rec
 public sealed class NotificationRuleItemViewModel(
     NotificationRule rule,
     string subjectName,
-    IReadOnlyList<NotificationRecipient> recipients)
+    IReadOnlyList<NotificationRecipient> recipients) : ObservableObject
 {
+    private RuleEvaluationDiagnostic? _diagnostic;
+
     public NotificationRule Rule { get; } = rule;
     public string SubjectName { get; } = subjectName;
     public IReadOnlyList<NotificationRecipient> Recipients { get; } = recipients;
@@ -491,6 +555,74 @@ public sealed class NotificationRuleItemViewModel(
         ? $"{SubjectName} · {ConditionText} {DurationText} · 发送到 {TargetText}"
         : $"{SubjectName} · {ConditionText} · 发送到 {TargetText}";
     public string MessagePreview => string.IsNullOrWhiteSpace(Rule.MessageTemplate) ? "使用默认通知内容" : Rule.MessageTemplate.Replace('\n', ' ');
+    public RuleEvaluationDiagnostic? Diagnostic => _diagnostic;
+    public bool HasDiagnostic => _diagnostic is not null;
+    public string DiagnosticTitle => _diagnostic?.Title ?? "尚未评估";
+    public string DiagnosticText => _diagnostic?.Explanation ?? "等待首次规则评估。";
+    public string CurrentStateText => _diagnostic is null ? "当前状态：未知" : $"当前状态：{PresenceStateText(_diagnostic.CurrentState)}";
+    public string CurrentDurationText => _diagnostic is null || !_diagnostic.HasProgress
+        ? ""
+        : $"当前连续：{FormatDuration(_diagnostic.CurrentDuration)}\n触发阈值：{DurationText}";
+    public bool HasProgress => _diagnostic?.HasProgress == true;
+    public double ProgressValue => (_diagnostic?.Progress ?? 0) * 100;
+    public string ProgressText => HasProgress ? $"进度：{_diagnostic!.ProgressPercentage}%" : "";
+    public string LastEvaluationText => FormatTimestamp(_diagnostic?.LastEvaluationAt, "最近评估");
+    public string LastTriggeredText => FormatTimestamp(_diagnostic?.LastTriggeredAt, "最近触发");
+    public string LastSentText => FormatTimestamp(_diagnostic?.LastSentAt, "最近发送");
+    public string LastErrorText => string.IsNullOrWhiteSpace(_diagnostic?.LastError) ? "" : $"最近错误：{_diagnostic.LastError}";
+    public string DiagnosticColor => _diagnostic?.Status switch
+    {
+        RuleEvaluationDiagnosticStatus.DeliveryFailed => "#B45309",
+        RuleEvaluationDiagnosticStatus.SubjectUnavailable or RuleEvaluationDiagnosticStatus.RecipientUnavailable => "#B91C1C",
+        RuleEvaluationDiagnosticStatus.ThresholdReached or RuleEvaluationDiagnosticStatus.Delivered => "#16803A",
+        RuleEvaluationDiagnosticStatus.AccumulatingDuration => "#2563EB",
+        _ => "#64748B"
+    };
+
+    public void ApplyDiagnostic(RuleEvaluationDiagnostic diagnostic)
+    {
+        _diagnostic = diagnostic;
+        Raise(nameof(Diagnostic));
+        Raise(nameof(HasDiagnostic));
+        Raise(nameof(DiagnosticTitle));
+        Raise(nameof(DiagnosticText));
+        Raise(nameof(CurrentStateText));
+        Raise(nameof(CurrentDurationText));
+        Raise(nameof(HasProgress));
+        Raise(nameof(ProgressValue));
+        Raise(nameof(ProgressText));
+        Raise(nameof(LastEvaluationText));
+        Raise(nameof(LastTriggeredText));
+        Raise(nameof(LastSentText));
+        Raise(nameof(LastErrorText));
+        Raise(nameof(DiagnosticColor));
+    }
+
+    public void ApplyDiagnosticError(string error)
+    {
+        var now = DateTimeOffset.UtcNow;
+        ApplyDiagnostic(new RuleEvaluationDiagnostic(
+            Rule.Id, Rule.SubjectId, Rule.Condition, RuleEvaluationDiagnosticStatus.SubjectUnavailable,
+            now, "诊断失败", $"规则诊断失败：{error}", LastError: error, LastEvaluationAt: now));
+    }
+
+    private static string PresenceStateText(PresenceState state) => state switch
+    {
+        PresenceState.Online => "在线",
+        PresenceState.Offline => "离线",
+        _ => "未知"
+    };
+
+    private static string FormatDuration(TimeSpan value)
+    {
+        if (value < TimeSpan.Zero) return "0分钟";
+        if (value.TotalDays >= 1) return $"{(int)value.TotalDays}天{value.Hours}小时";
+        if (value.TotalHours >= 1) return $"{(int)value.TotalHours}小时{value.Minutes}分钟";
+        return $"{Math.Max(0, (int)value.TotalMinutes)}分钟";
+    }
+
+    private static string FormatTimestamp(DateTimeOffset? value, string label) =>
+        value is null ? $"{label}：暂无" : $"{label}：{value.Value.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
 }
 
 public sealed class NotificationDeliveryItemViewModel(NotificationDelivery delivery, string subjectName, string? recipientName = null)

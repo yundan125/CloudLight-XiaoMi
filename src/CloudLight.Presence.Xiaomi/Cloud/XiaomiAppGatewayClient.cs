@@ -185,7 +185,16 @@ internal sealed class XiaomiAppGatewayClient
         XiaomiSession session,
         string partnerId,
         CancellationToken cancellationToken)
+        => (await GetRouterClientsWithDiagnosticsAsync(session, partnerId, cancellationToken)).Devices;
+
+    public async Task<RouterClientProbeResult> GetRouterClientsWithDiagnosticsAsync(
+        XiaomiSession session,
+        string partnerId,
+        CancellationToken cancellationToken)
     {
+        if (string.IsNullOrWhiteSpace(partnerId))
+            return new([], null, [], "未返回 Router ID / partner_id。", false);
+
         using var document = await CallAsync(
             session,
             XiaomiApiEndpoints.RouterClientListPath,
@@ -200,10 +209,14 @@ internal sealed class XiaomiAppGatewayClient
             ? root
             : root.TryGetProperty("result", out var nested) ? nested : root;
         var hasCode = TryCode(root, out var code) || TryCode(body, out code);
-        if (!hasCode || code != 0 ||
-            !body.TryGetProperty("devices", out var devices) || devices.ValueKind != JsonValueKind.Array)
-            throw new XiaomiCloudException($"device_list 响应无效（code={(TryCode(body, out code) ? code.ToString() : "missing")}）。", xiaomiCode: code);
-        return devices.EnumerateArray().Select(item => new ObservedNetworkDevice(
+        if (!hasCode || code != 0)
+            return new([], code, [], $"device_list API 返回错误（code={(hasCode ? code.ToString() : "missing")}）。", false);
+        if (!body.TryGetProperty("devices", out var devices) || devices.ValueKind != JsonValueKind.Array)
+            return new([], code, ["code"], "未返回客户端列表字段 devices。", false);
+
+        var fields = devices.EnumerateArray().SelectMany(value => value.EnumerateObject().Select(property => property.Name))
+            .Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToArray();
+        var normalized = devices.EnumerateArray().Select(item => new ObservedNetworkDevice(
             Text(item, "mac") ?? throw new XiaomiCloudException("device_list 设备缺少 MAC。"),
             Text(item, "name"),
             Text(item, "originName"),
@@ -215,6 +228,7 @@ internal sealed class XiaomiAppGatewayClient
             Long(item, "dSpeed"),
             Long(item, "uSpeed"),
             (Long(item, "totalRX") ?? 0) + (Long(item, "totalTX") ?? 0))).ToArray();
+        return new(normalized, code, fields, null, true);
     }
 
     public async Task<IReadOnlyList<XiaomiPropertyReadResult>> GetPropertiesAsync(
@@ -595,6 +609,13 @@ internal sealed class XiaomiAppGatewayClient
         return http;
     }
 }
+
+internal sealed record RouterClientProbeResult(
+    IReadOnlyList<ObservedNetworkDevice> Devices,
+    int? ApiCode,
+    IReadOnlyList<string> SuccessfulFields,
+    string? Error,
+    bool ClientListAvailable);
 
 internal sealed record XiaomiHomeInfo(
     string Id,

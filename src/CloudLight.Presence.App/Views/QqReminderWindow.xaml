@@ -49,7 +49,7 @@
                 <TextBlock Text="{Binding Note}" Style="{DynamicResource CardTitleStyle}" TextTrimming="CharacterEllipsis" ToolTip="{Binding Note}"/>
                 <StackPanel Grid.Row="1" Margin="0,8,0,8">
                   <TextBlock Text="{Binding Summary}" Style="{DynamicResource MutedTextStyle}"/>
-                  <TextBlock Text="{Binding OpenId}" Foreground="{DynamicResource SubtleBrush}" TextTrimming="CharacterEllipsis" ToolTip="{Binding OpenId}" Margin="0,5,0,0"/>
+                  <TextBlock Text="{Binding MaskedOpenId}" Foreground="{DynamicResource SubtleBrush}" TextTrimming="CharacterEllipsis" Margin="0,5,0,0"/>
                 </StackPanel>
                 <StackPanel Grid.Row="2" Orientation="Horizontal">
                   <Button Content="测试" Click="TestRecipientClicked" CommandParameter="{Binding}" Style="{DynamicResource SecondaryButtonStyle}" Padding="10,6"/>
@@ -94,14 +94,31 @@
                   <Grid>
                     <Grid.RowDefinitions><RowDefinition/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
                     <StackPanel>
-                      <StackPanel Orientation="Horizontal"><TextBlock Text="{Binding SubjectName}" Style="{DynamicResource CardTitleStyle}"/><Border Style="{DynamicResource StatusBadgeStyle}" Background="{DynamicResource SuccessSoftBrush}" Margin="10,0,0,0"><TextBlock Text="{Binding EnabledText}" Foreground="{DynamicResource SuccessBrush}"/></Border></StackPanel>
+                      <StackPanel Orientation="Horizontal"><TextBlock Text="{Binding SubjectName}" Style="{DynamicResource CardTitleStyle}"/><Border Style="{DynamicResource StatusBadgeStyle}" Background="{DynamicResource SuccessSoftBrush}" Margin="10,0,0,0"><TextBlock Text="{Binding EnabledText}" Foreground="{DynamicResource SuccessBrush}"/></Border><Border Style="{DynamicResource StatusBadgeStyle}" Background="{DynamicResource CardBrush}" Margin="8,0,0,0"><TextBlock Text="{Binding DiagnosticTitle}" Foreground="{Binding DiagnosticColor}"/></Border></StackPanel>
                       <TextBlock Text="{Binding ConditionText}" Foreground="{DynamicResource TextBrush}" Margin="0,7,0,0"/>
                       <TextBlock Text="{Binding TargetText, StringFormat=发送到：{0}}" Style="{DynamicResource MutedTextStyle}" Margin="0,5,0,0" TextTrimming="CharacterEllipsis" ToolTip="{Binding TargetText}"/>
                       <TextBlock Text="{Binding MessagePreview}" Style="{DynamicResource MutedTextStyle}" Margin="0,5,0,0" TextTrimming="CharacterEllipsis" ToolTip="{Binding MessagePreview}"/>
+                      <Border Background="{DynamicResource CardBrush}" BorderBrush="{DynamicResource CardBorderBrush}" BorderThickness="1" CornerRadius="8" Padding="11" Margin="0,11,0,0">
+                        <StackPanel>
+                          <TextBlock Text="{Binding DiagnosticText}" Foreground="{Binding DiagnosticColor}" TextWrapping="Wrap"/>
+                          <StackPanel>
+                            <StackPanel.Style><Style TargetType="StackPanel"><Setter Property="Visibility" Value="Collapsed"/><Style.Triggers><DataTrigger Binding="{Binding HasProgress}" Value="True"><Setter Property="Visibility" Value="Visible"/></DataTrigger></Style.Triggers></Style></StackPanel.Style>
+                            <TextBlock Text="{Binding CurrentStateText}" Style="{DynamicResource MutedTextStyle}" Margin="0,8,0,0"/>
+                            <TextBlock Text="{Binding CurrentDurationText}" Style="{DynamicResource MutedTextStyle}" TextWrapping="Wrap" Margin="0,3,0,0"/>
+                            <ProgressBar Value="{Binding ProgressValue, Mode=OneWay}" Maximum="100" Height="6" Margin="0,8,0,0"/>
+                            <TextBlock Text="{Binding ProgressText}" Style="{DynamicResource MutedTextStyle}" Margin="0,4,0,0"/>
+                          </StackPanel>
+                          <TextBlock Text="{Binding LastEvaluationText}" Style="{DynamicResource MutedTextStyle}" Margin="0,8,0,0"/>
+                          <TextBlock Text="{Binding LastTriggeredText}" Style="{DynamicResource MutedTextStyle}" Margin="0,3,0,0"/>
+                          <TextBlock Text="{Binding LastSentText}" Style="{DynamicResource MutedTextStyle}" Margin="0,3,0,0"/>
+                          <TextBlock Text="{Binding LastErrorText}" Foreground="{DynamicResource WarningBrush}" TextWrapping="Wrap" Margin="0,3,0,0"/>
+                        </StackPanel>
+                      </Border>
                     </StackPanel>
                     <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,14,0,0">
                       <Button Content="{Binding ToggleText}" Style="{DynamicResource SecondaryButtonStyle}" CommandParameter="{Binding}" Click="ToggleRuleClicked" Padding="10,6"/>
                       <Button Content="编辑" Style="{DynamicResource SecondaryButtonStyle}" CommandParameter="{Binding}" Click="EditRuleClicked" Padding="10,6"/>
+                      <Button Content="检查规则" Style="{DynamicResource SecondaryButtonStyle}" CommandParameter="{Binding}" Click="CheckRuleClicked" Padding="10,6"/>
                       <Button Content="删除" Style="{DynamicResource DangerButton}" CommandParameter="{Binding}" Click="DeleteRuleClicked" Padding="10,6" Margin="0"/>
                     </StackPanel>
                   </Grid>

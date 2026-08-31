@@ -181,6 +181,13 @@ public partial class QqReminderWindow : System.Windows.Controls.UserControl
         catch (Exception exception) { _notifications.OperationStatus = $"提醒状态未更新：{exception.Message}"; }
     }
 
+    private async void CheckRuleClicked(object sender, RoutedEventArgs e)
+    {
+        if (GetRuleItem(sender) is not { } item) return;
+        try { await _notifications.CheckRuleAsync(item, CancellationToken.None); }
+        catch (Exception exception) { _notifications.OperationStatus = $"规则检查失败：{exception.Message}"; }
+    }
+
     private async void DeleteRuleClicked(object sender, RoutedEventArgs e)
     {
         if (GetRuleItem(sender) is not { } item || OwnerWindow is not { } owner) return;

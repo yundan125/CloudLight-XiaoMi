@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text.Json;
 using CloudLight.Presence.Core.Interfaces;
 using CloudLight.Presence.Core.Models;
 using CloudLight.Presence.Infrastructure.Settings;
@@ -14,14 +15,35 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
     {
         Directory.CreateDirectory(paths.RootDirectory);
         await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
-        command.CommandText = """
-            PRAGMA journal_mode=WAL;
-            PRAGMA foreign_keys=ON;
+        await using (var journal = connection.CreateCommand())
+        {
+            journal.CommandText = "PRAGMA journal_mode=WAL;";
+            await journal.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        var backupService = new SqliteDatabaseBackupService(paths);
+        var inspection = await SqliteDatabaseBackupService.InspectAsync(connection, cancellationToken);
+
+        try
+        {
+            if (inspection.NeedsMigration)
+                await backupService.CreateMigrationBackupAsync(connection, inspection.CurrentSchemaVersion, cancellationToken);
+            await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+            var sqliteTransaction = (SqliteTransaction)transaction;
+            await using var command = connection.CreateCommand();
+            command.Transaction = sqliteTransaction;
+            command.CommandText = """
             CREATE TABLE IF NOT EXISTS Router (
               Id INTEGER PRIMARY KEY AUTOINCREMENT, MiotDid TEXT NOT NULL UNIQUE,
               MiotModel TEXT NOT NULL, PartnerId TEXT NOT NULL, Name TEXT NOT NULL,
               HomeId TEXT NULL, RoomId TEXT NULL, CreatedAt TEXT NOT NULL, LastSeenAt TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS RouterCapabilityDiagnostic (
+              RouterId INTEGER PRIMARY KEY, HasPartnerId INTEGER NOT NULL,
+              Endpoint TEXT NOT NULL, LastApiCode INTEGER NULL,
+              ClientListAvailable INTEGER NOT NULL, SuccessfulFields TEXT NOT NULL,
+              LastSuccessAt TEXT NULL, PresenceAvailable INTEGER NOT NULL,
+              Error TEXT NULL, UpdatedAt TEXT NOT NULL,
+              FOREIGN KEY(RouterId) REFERENCES Router(Id) ON DELETE CASCADE);
             CREATE TABLE IF NOT EXISTS NetworkDevice (
               Id INTEGER PRIMARY KEY AUTOINCREMENT, RouterId INTEGER NOT NULL,
               MacAddress TEXT NOT NULL, OriginalName TEXT NULL, OriginName TEXT NULL,
@@ -42,7 +64,8 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
               EndKnown INTEGER NOT NULL, FOREIGN KEY(DeviceId) REFERENCES NetworkDevice(Id));
             CREATE TABLE IF NOT EXISTS MonitoringGap (
               Id INTEGER PRIMARY KEY AUTOINCREMENT, StartedAt TEXT NOT NULL,
-              EndedAt TEXT NULL, Reason TEXT NOT NULL);
+              EndedAt TEXT NULL, Reason TEXT NOT NULL, RouterId INTEGER NULL,
+              FOREIGN KEY(RouterId) REFERENCES Router(Id) ON DELETE SET NULL);
             CREATE TABLE IF NOT EXISTS MonitoringGapSubjectBaseline (
               MonitoringGapId INTEGER NOT NULL, SubjectId INTEGER NOT NULL,
               State INTEGER NOT NULL,
@@ -51,7 +74,6 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
               FOREIGN KEY(SubjectId) REFERENCES PresenceSubject(Id) ON DELETE CASCADE);
             CREATE INDEX IF NOT EXISTS IX_MonitoringGapSubjectBaseline_Subject ON MonitoringGapSubjectBaseline(SubjectId);
             CREATE UNIQUE INDEX IF NOT EXISTS UX_PresenceSession_Stable ON PresenceSession(DeviceId, StartedAt);
-            CREATE UNIQUE INDEX IF NOT EXISTS UX_MonitoringGap_Stable ON MonitoringGap(StartedAt, Reason);
             CREATE TABLE IF NOT EXISTS ApplicationRun (
               Id INTEGER PRIMARY KEY AUTOINCREMENT, StartedAt TEXT NOT NULL,
               EndedAt TEXT NULL, LastSuccessfulCloudUpdateAt TEXT NULL);
@@ -133,20 +155,33 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
             CREATE INDEX IF NOT EXISTS IX_SystemNotificationDelivery_Pending ON SystemNotificationDelivery(Status,NextAttemptAt);
             CREATE INDEX IF NOT EXISTS IX_SystemNotificationDelivery_Created ON SystemNotificationDelivery(CreatedAt DESC);
             """;
-        await command.ExecuteNonQueryAsync(cancellationToken);
-        await EnsureNetworkDeviceHistorySchemaAsync(connection, cancellationToken);
-        await EnsureSubjectCurrentStateSchemaAsync(connection, cancellationToken);
-        await MigrateSubjectPresenceEventSchemaAsync(connection, cancellationToken);
-        await EnsureNotificationRuleStateSchemaAsync(connection, cancellationToken);
-        await MigrateNotificationRecipientsAsync(connection, cancellationToken);
-        await MigrateNotificationDeliverySchemaAsync(connection, cancellationToken);
-        await MigrateSystemNotificationDeliverySchemaAsync(connection, cancellationToken);
-        await EnsureLegacyNotificationDeliveryUniqueIndexAsync(connection, cancellationToken);
-        await BackfillNotificationDeliveryRecipientsAsync(connection, cancellationToken);
-        await EnsureEveryDeviceHasSubjectAsync(cancellationToken);
-        await EnsureSubjectCurrentStatesAsync(cancellationToken);
-        await ReconcileSubjectIdentityAsync(cancellationToken);
-        await EnsureNotificationRuleEventWatermarksAsync(cancellationToken);
+            await command.ExecuteNonQueryAsync(cancellationToken);
+            await EnsureMonitoringGapSchemaAsync(connection, sqliteTransaction, cancellationToken);
+            await EnsureNetworkDeviceHistorySchemaAsync(connection, sqliteTransaction, cancellationToken);
+            await EnsureSubjectCurrentStateSchemaAsync(connection, sqliteTransaction, cancellationToken);
+            await MigrateSubjectPresenceEventSchemaAsync(connection, sqliteTransaction, cancellationToken);
+            await EnsureNotificationRuleStateSchemaAsync(connection, sqliteTransaction, cancellationToken);
+            await MigrateNotificationRecipientsAsync(connection, sqliteTransaction, cancellationToken);
+            await MigrateNotificationDeliverySchemaAsync(connection, sqliteTransaction, cancellationToken);
+            await MigrateSystemNotificationDeliverySchemaAsync(connection, sqliteTransaction, cancellationToken);
+            await EnsureLegacyNotificationDeliveryUniqueIndexAsync(connection, sqliteTransaction, cancellationToken);
+            await BackfillNotificationDeliveryRecipientsAsync(connection, sqliteTransaction, cancellationToken);
+            await SetSchemaVersionAsync(connection, sqliteTransaction, cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+
+            // These are ordinary idempotent data repairs, not schema changes;
+            // they run after the structural transaction has committed.
+            await EnsureEveryDeviceHasSubjectAsync(cancellationToken);
+            await EnsureSubjectCurrentStatesAsync(cancellationToken);
+            await ReconcileSubjectIdentityAsync(cancellationToken);
+            await EnsureNotificationRuleEventWatermarksAsync(cancellationToken);
+        }
+        catch (Exception exception)
+        {
+            if (inspection.NeedsMigration)
+                await backupService.RecordMigrationFailureAsync(exception, CancellationToken.None);
+            throw;
+        }
     }
 
     public async Task<Router> UpsertRouterAsync(Router router, CancellationToken cancellationToken)
@@ -166,6 +201,56 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         await reader.ReadAsync(cancellationToken);
         return ReadRouter(reader);
+    }
+
+    private static async Task SetSchemaVersionAsync(SqliteConnection connection, SqliteTransaction transaction, CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = $"PRAGMA user_version={SqliteDatabaseBackupService.CurrentSchemaVersion};";
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task EnsureMonitoringGapSchemaAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        var hasRouterId = false;
+        await using (var info = connection.CreateCommand())
+        {
+            info.Transaction = transaction;
+            info.CommandText = "PRAGMA table_info(MonitoringGap)";
+            await using var reader = await info.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+                hasRouterId |= string.Equals(reader.GetString(1), "RouterId", StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (!hasRouterId)
+            await ExecuteInTransactionAsync(connection, transaction,
+                "ALTER TABLE MonitoringGap ADD COLUMN RouterId INTEGER NULL",
+                [], cancellationToken);
+        if (!await HasMonitoringGapStableIndexAsync(connection, transaction, cancellationToken))
+            await ExecuteInTransactionAsync(connection, transaction,
+                "DROP INDEX IF EXISTS UX_MonitoringGap_Stable; CREATE UNIQUE INDEX IF NOT EXISTS UX_MonitoringGap_Stable ON MonitoringGap(IFNULL(RouterId,0),StartedAt,Reason);",
+                [], cancellationToken);
+    }
+
+    private static async Task<bool> HasMonitoringGapStableIndexAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "SELECT sql FROM sqlite_master WHERE type='index' AND name='UX_MonitoringGap_Stable' AND tbl_name='MonitoringGap'";
+        var sql = Convert.ToString(await command.ExecuteScalarAsync(cancellationToken));
+        if (string.IsNullOrWhiteSpace(sql)) return false;
+        var normalized = sql.Replace(" ", string.Empty, StringComparison.Ordinal)
+            .Replace("\r", string.Empty, StringComparison.Ordinal)
+            .Replace("\n", string.Empty, StringComparison.Ordinal)
+            .ToUpperInvariant();
+        return normalized.Contains("IFNULL(ROUTERID,0),STARTEDAT,REASON", StringComparison.Ordinal);
     }
 
     public async Task<IReadOnlyList<Router>> GetRoutersAsync(CancellationToken cancellationToken)
@@ -524,6 +609,52 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         return result;
     }
 
+    public async Task<RouterCapabilityDiagnostic?> GetRouterCapabilityDiagnosticAsync(long routerId, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT d.RouterId,r.MiotDid,r.MiotModel,d.HasPartnerId,d.Endpoint,d.LastApiCode,
+                   d.ClientListAvailable,d.SuccessfulFields,d.LastSuccessAt,d.PresenceAvailable,d.Error,d.UpdatedAt
+            FROM RouterCapabilityDiagnostic d JOIN Router r ON r.Id=d.RouterId WHERE d.RouterId=$router
+            """;
+        Add(command, "$router", routerId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken)) return null;
+        var fields = JsonSerializer.Deserialize<string[]>(reader.GetString(7)) ?? [];
+        return new(
+            reader.GetInt64(0), reader.GetString(1), reader.GetString(2), reader.GetInt32(3) != 0,
+            reader.GetString(4), reader.IsDBNull(5) ? null : reader.GetInt32(5), reader.GetInt32(6) != 0,
+            fields, reader.IsDBNull(8) ? null : ParseTime(reader.GetString(8)), reader.GetInt32(9) != 0,
+            Text(reader, "Error"), ParseTime(reader.GetString(11)));
+    }
+
+    public async Task UpsertRouterCapabilityDiagnosticAsync(RouterCapabilityDiagnostic diagnostic, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO RouterCapabilityDiagnostic(
+              RouterId,HasPartnerId,Endpoint,LastApiCode,ClientListAvailable,SuccessfulFields,
+              LastSuccessAt,PresenceAvailable,Error,UpdatedAt)
+            VALUES($router,$partner,$endpoint,$code,$clients,$fields,$success,$presence,$error,$updated)
+            ON CONFLICT(RouterId) DO UPDATE SET HasPartnerId=$partner,Endpoint=$endpoint,
+              LastApiCode=$code,ClientListAvailable=$clients,SuccessfulFields=$fields,
+              LastSuccessAt=$success,PresenceAvailable=$presence,Error=$error,UpdatedAt=$updated
+            """;
+        Add(command, "$router", diagnostic.RouterId);
+        Add(command, "$partner", diagnostic.HasPartnerId ? 1 : 0);
+        Add(command, "$endpoint", diagnostic.Endpoint);
+        Add(command, "$code", diagnostic.LastApiCode);
+        Add(command, "$clients", diagnostic.ClientListAvailable ? 1 : 0);
+        Add(command, "$fields", JsonSerializer.Serialize(diagnostic.SuccessfulFields ?? []));
+        Add(command, "$success", diagnostic.LastSuccessAt is null ? null : Time(diagnostic.LastSuccessAt.Value));
+        Add(command, "$presence", diagnostic.PresenceAvailable ? 1 : 0);
+        Add(command, "$error", diagnostic.Error);
+        Add(command, "$updated", Time(diagnostic.UpdatedAt));
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
     public async Task<SubjectCurrentState?> GetSubjectCurrentStateAsync(long subjectId, CancellationToken cancellationToken)
     {
         await using var connection = await OpenAsync(cancellationToken);
@@ -654,13 +785,20 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         return result;
     }
 
-    public async Task<IReadOnlyList<MonitoringGap>> GetMonitoringGapsAsync(DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<MonitoringGap>> GetMonitoringGapsAsync(
+        DateTimeOffset from,
+        DateTimeOffset to,
+        CancellationToken cancellationToken,
+        long? routerId = null)
     {
         await using var connection = await OpenAsync(cancellationToken); await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT * FROM MonitoringGap WHERE StartedAt < $to AND (EndedAt IS NULL OR EndedAt > $from) ORDER BY StartedAt";
+        command.CommandText = routerId is null
+            ? "SELECT Id,StartedAt,EndedAt,Reason,RouterId FROM MonitoringGap WHERE StartedAt < $to AND (EndedAt IS NULL OR EndedAt > $from) ORDER BY StartedAt"
+            : "SELECT Id,StartedAt,EndedAt,Reason,RouterId FROM MonitoringGap WHERE StartedAt < $to AND (EndedAt IS NULL OR EndedAt > $from) AND (RouterId IS NULL OR RouterId=$router) ORDER BY StartedAt";
         Add(command, "$from", Time(from)); Add(command, "$to", Time(to));
+        if (routerId is not null) Add(command, "$router", routerId.Value);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken); var result = new List<MonitoringGap>();
-        while (await reader.ReadAsync(cancellationToken)) result.Add(new MonitoringGap(reader.GetInt64(0), ParseTime(reader.GetString(1)), reader.IsDBNull(2) ? null : ParseTime(reader.GetString(2)), reader.GetString(3)));
+        while (await reader.ReadAsync(cancellationToken)) result.Add(new MonitoringGap(reader.GetInt64(0), ParseTime(reader.GetString(1)), reader.IsDBNull(2) ? null : ParseTime(reader.GetString(2)), reader.GetString(3), reader.IsDBNull(4) ? null : reader.GetInt64(4)));
         return result;
     }
 
@@ -682,16 +820,37 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         ExecuteAsync("INSERT OR IGNORE INTO MonitoringGapSubjectBaseline(MonitoringGapId,SubjectId,State) VALUES($gap,$subject,$state)",
             [("$gap", baseline.MonitoringGapId), ("$subject", baseline.SubjectId), ("$state", (int)baseline.State)], cancellationToken);
 
-    public async Task<long> StartMonitoringGapAsync(DateTimeOffset startedAt, string reason, CancellationToken cancellationToken)
+    public async Task<long> StartMonitoringGapAsync(DateTimeOffset startedAt, string reason, CancellationToken cancellationToken, long? routerId = null)
     {
         await using var connection = await OpenAsync(cancellationToken);
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
         var sqliteTransaction = (SqliteTransaction)transaction;
+        await using (var existing = connection.CreateCommand())
+        {
+            existing.Transaction = sqliteTransaction;
+            existing.CommandText = routerId is null
+                ? "SELECT Id FROM MonitoringGap WHERE EndedAt IS NULL AND Reason=$reason AND RouterId IS NULL ORDER BY StartedAt DESC LIMIT 1"
+                : "SELECT Id FROM MonitoringGap WHERE EndedAt IS NULL AND Reason=$reason AND RouterId=$router ORDER BY StartedAt DESC LIMIT 1";
+            Add(existing, "$reason", reason);
+            if (routerId is not null) Add(existing, "$router", routerId.Value);
+            if (await existing.ExecuteScalarAsync(cancellationToken) is { } current && current is not DBNull)
+            {
+                await transaction.CommitAsync(cancellationToken);
+                return Convert.ToInt64(current, CultureInfo.InvariantCulture);
+            }
+        }
         await using var command = connection.CreateCommand(); command.Transaction = sqliteTransaction;
-        command.CommandText = "INSERT INTO MonitoringGap(StartedAt,Reason) VALUES($at,$reason); SELECT last_insert_rowid();";
+        command.CommandText = "INSERT INTO MonitoringGap(StartedAt,Reason,RouterId) VALUES($at,$reason,$router); SELECT last_insert_rowid();";
         Add(command, "$at", Time(startedAt)); Add(command, "$reason", reason);
+        Add(command, "$router", routerId);
         var id = (long)(await command.ExecuteScalarAsync(cancellationToken) ?? 0L);
-        await CloseOpenSessionsAtAsync(connection, sqliteTransaction, startedAt, cancellationToken);
+        // A user pause is an intentional observation gap. Keep the current
+        // session open while paused; the first post-pause snapshot will
+        // reconcile its boundary without turning the pause into an ordinary
+        // offline transition. Operational shutdown/failure gaps retain the
+        // historical boundary-closing behavior.
+        if (reason is not ("UserPaused" or "暂停监控"))
+            await CloseOpenSessionsAtAsync(connection, sqliteTransaction, startedAt, cancellationToken, routerId);
         await transaction.CommitAsync(cancellationToken);
         return id;
     }
@@ -701,9 +860,31 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         await using var connection = await OpenAsync(cancellationToken);
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
         var sqliteTransaction = (SqliteTransaction)transaction;
-        await ExecuteInTransactionAsync(connection, sqliteTransaction,
-            "UPDATE PresenceSession SET EndedAt=(SELECT StartedAt FROM MonitoringGap WHERE Id=$id),EndKnown=0 WHERE EndedAt IS NULL AND StartedAt <= (SELECT StartedAt FROM MonitoringGap WHERE Id=$id)",
-            [("$id", gapId)], cancellationToken);
+        var reason = "";
+        DateTimeOffset? startedAt = null;
+        await using (var reasonCommand = connection.CreateCommand())
+        {
+            reasonCommand.Transaction = sqliteTransaction;
+            reasonCommand.CommandText = "SELECT StartedAt,Reason FROM MonitoringGap WHERE Id=$id";
+            Add(reasonCommand, "$id", gapId);
+            await using var reader = await reasonCommand.ExecuteReaderAsync(cancellationToken);
+            if (await reader.ReadAsync(cancellationToken))
+            {
+                startedAt = ParseTime(reader.GetString(0));
+                reason = reader.GetString(1);
+            }
+        }
+        long? routerId = null;
+        await using (var routerCommand = connection.CreateCommand())
+        {
+            routerCommand.Transaction = sqliteTransaction;
+            routerCommand.CommandText = "SELECT RouterId FROM MonitoringGap WHERE Id=$id";
+            Add(routerCommand, "$id", gapId);
+            var value = await routerCommand.ExecuteScalarAsync(cancellationToken);
+            routerId = value is null or DBNull ? null : Convert.ToInt64(value, CultureInfo.InvariantCulture);
+        }
+        if (reason is not ("UserPaused" or "暂停监控"))
+            await CloseOpenSessionsAtAsync(connection, sqliteTransaction, startedAt ?? endedAt, cancellationToken, routerId);
         await ExecuteInTransactionAsync(connection, sqliteTransaction,
             "UPDATE MonitoringGap SET EndedAt=$end WHERE Id=$id",
             [("$id", gapId), ("$end", Time(endedAt))], cancellationToken);
@@ -713,28 +894,39 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         await transaction.CommitAsync(cancellationToken);
     }
 
-    public async Task CloseOpenMonitoringGapsAsync(DateTimeOffset endedAt, CancellationToken cancellationToken)
+    public async Task CloseOpenMonitoringGapsAsync(DateTimeOffset endedAt, CancellationToken cancellationToken, long? routerId = null)
     {
         await using var connection = await OpenAsync(cancellationToken);
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
         var sqliteTransaction = (SqliteTransaction)transaction;
-        var starts = new List<DateTimeOffset>();
+        var gaps = new List<(DateTimeOffset StartedAt, string Reason, long? RouterId)>();
         await using (var command = connection.CreateCommand())
         {
             command.Transaction = sqliteTransaction;
-            command.CommandText = "SELECT StartedAt FROM MonitoringGap WHERE EndedAt IS NULL AND StartedAt < $end ORDER BY StartedAt";
+            command.CommandText = routerId is null
+                ? "SELECT StartedAt,Reason,RouterId FROM MonitoringGap WHERE EndedAt IS NULL AND StartedAt < $end ORDER BY StartedAt"
+                : "SELECT StartedAt,Reason,RouterId FROM MonitoringGap WHERE EndedAt IS NULL AND StartedAt < $end AND (RouterId IS NULL OR RouterId=$router) ORDER BY StartedAt";
             Add(command, "$end", Time(endedAt));
+            if (routerId is not null) Add(command, "$router", routerId.Value);
             await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-            while (await reader.ReadAsync(cancellationToken)) starts.Add(ParseTime(reader.GetString(0)));
+            while (await reader.ReadAsync(cancellationToken)) gaps.Add((ParseTime(reader.GetString(0)), reader.GetString(1), reader.IsDBNull(2) ? null : reader.GetInt64(2)));
         }
-        foreach (var start in starts)
-            await CloseOpenSessionsAtAsync(connection, sqliteTransaction, start, cancellationToken);
+        foreach (var gap in gaps)
+            if (gap.Reason is not ("UserPaused" or "暂停监控"))
+                await CloseOpenSessionsAtAsync(connection, sqliteTransaction, gap.StartedAt, cancellationToken, gap.RouterId);
+        var parameters = new List<(string Name, object? Value)> { ("$end", Time(endedAt)) };
+        var scope = "";
+        if (routerId is not null)
+        {
+            scope = " AND (RouterId IS NULL OR RouterId=$router)";
+            parameters.Add(("$router", routerId.Value));
+        }
         await ExecuteInTransactionAsync(connection, sqliteTransaction,
-            "DELETE FROM MonitoringGapSubjectBaseline WHERE MonitoringGapId IN (SELECT Id FROM MonitoringGap WHERE EndedAt IS NULL AND StartedAt < $end)",
-            [("$end", Time(endedAt))], cancellationToken);
+            $"DELETE FROM MonitoringGapSubjectBaseline WHERE MonitoringGapId IN (SELECT Id FROM MonitoringGap WHERE EndedAt IS NULL AND StartedAt < $end{scope})",
+            parameters.ToArray(), cancellationToken);
         await ExecuteInTransactionAsync(connection, sqliteTransaction,
-            "UPDATE MonitoringGap SET EndedAt=$end WHERE EndedAt IS NULL AND StartedAt < $end",
-            [("$end", Time(endedAt))], cancellationToken);
+            $"UPDATE MonitoringGap SET EndedAt=$end WHERE EndedAt IS NULL AND StartedAt < $end{scope}",
+            parameters.ToArray(), cancellationToken);
         await transaction.CommitAsync(cancellationToken);
     }
 
@@ -742,6 +934,7 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
     {
         await using var connection = await OpenAsync(cancellationToken); await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
         DateTimeOffset? previousStarted = null; DateTimeOffset? previousUpdate = null; long? previousId = null;
+        var hasOpenUserPause = false;
         await using (var previous = connection.CreateCommand())
         {
             previous.Transaction = (SqliteTransaction)transaction;
@@ -749,15 +942,24 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
             await using var reader = await previous.ExecuteReaderAsync(cancellationToken);
             if (await reader.ReadAsync(cancellationToken)) { previousId = reader.GetInt64(0); previousStarted = ParseTime(reader.GetString(1)); previousUpdate = reader.IsDBNull(2) ? null : ParseTime(reader.GetString(2)); }
         }
+        await using (var pause = connection.CreateCommand())
+        {
+            pause.Transaction = (SqliteTransaction)transaction;
+            pause.CommandText = "SELECT EXISTS(SELECT 1 FROM MonitoringGap WHERE EndedAt IS NULL AND Reason IN ('UserPaused','暂停监控'))";
+            hasOpenUserPause = Convert.ToInt32(await pause.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture) != 0;
+        }
         if (previousId is not null && previousStarted is not null)
         {
-            var gapStart = previousUpdate ?? await GetLatestDeviceObservationAsync(connection, (SqliteTransaction)transaction, previousStarted.Value, cancellationToken) ?? previousStarted.Value;
-            if (gapStart < startedAt)
+            if (!hasOpenUserPause)
             {
-                await using var gap = connection.CreateCommand(); gap.Transaction = (SqliteTransaction)transaction;
-                gap.CommandText = "INSERT OR IGNORE INTO MonitoringGap(StartedAt,EndedAt,Reason) VALUES($start,NULL,'UnexpectedTermination')";
-                Add(gap, "$start", Time(gapStart)); await gap.ExecuteNonQueryAsync(cancellationToken);
-                await CloseOpenSessionsAtAsync(connection, (SqliteTransaction)transaction, gapStart, cancellationToken);
+                var gapStart = previousUpdate ?? await GetLatestDeviceObservationAsync(connection, (SqliteTransaction)transaction, previousStarted.Value, cancellationToken) ?? previousStarted.Value;
+                if (gapStart < startedAt)
+                {
+                    await using var gap = connection.CreateCommand(); gap.Transaction = (SqliteTransaction)transaction;
+                    gap.CommandText = "INSERT OR IGNORE INTO MonitoringGap(StartedAt,EndedAt,Reason) VALUES($start,NULL,'UnexpectedTermination')";
+                    Add(gap, "$start", Time(gapStart)); await gap.ExecuteNonQueryAsync(cancellationToken);
+                    await CloseOpenSessionsAtAsync(connection, (SqliteTransaction)transaction, gapStart, cancellationToken);
+                }
             }
             await using var close = connection.CreateCommand(); close.Transaction = (SqliteTransaction)transaction;
             close.CommandText = "UPDATE ApplicationRun SET EndedAt=$end WHERE Id=$id"; Add(close, "$end", Time(startedAt)); Add(close, "$id", previousId.Value); await close.ExecuteNonQueryAsync(cancellationToken);
@@ -1657,11 +1859,12 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    private static async Task EnsureNetworkDeviceHistorySchemaAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    private static async Task EnsureNetworkDeviceHistorySchemaAsync(SqliteConnection connection, SqliteTransaction transaction, CancellationToken cancellationToken)
     {
         var hasHistoricalState = false;
         await using (var info = connection.CreateCommand())
         {
+            info.Transaction = transaction;
             info.CommandText = "PRAGMA table_info(NetworkDevice)";
             await using var reader = await info.ExecuteReaderAsync(cancellationToken);
             while (await reader.ReadAsync(cancellationToken))
@@ -1670,18 +1873,21 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
 
         if (hasHistoricalState) return;
         await using var alter = connection.CreateCommand();
+        alter.Transaction = transaction;
         alter.CommandText = "ALTER TABLE NetworkDevice ADD COLUMN LastKnownHistoricalState INTEGER NOT NULL DEFAULT 0";
         await alter.ExecuteNonQueryAsync(cancellationToken);
         await using var backfill = connection.CreateCommand();
+        backfill.Transaction = transaction;
         backfill.CommandText = "UPDATE NetworkDevice SET LastKnownHistoricalState=CurrentState";
         await backfill.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    private static async Task EnsureSubjectCurrentStateSchemaAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    private static async Task EnsureSubjectCurrentStateSchemaAsync(SqliteConnection connection, SqliteTransaction transaction, CancellationToken cancellationToken)
     {
         var hasPendingOfflineSince = false;
         await using (var info = connection.CreateCommand())
         {
+            info.Transaction = transaction;
             info.CommandText = "PRAGMA table_info(SubjectCurrentState)";
             await using var reader = await info.ExecuteReaderAsync(cancellationToken);
             while (await reader.ReadAsync(cancellationToken))
@@ -1690,15 +1896,17 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
 
         if (hasPendingOfflineSince) return;
         await using var alter = connection.CreateCommand();
+        alter.Transaction = transaction;
         alter.CommandText = "ALTER TABLE SubjectCurrentState ADD COLUMN PendingOfflineSince TEXT NULL";
         await alter.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    private static async Task EnsureNotificationRuleStateSchemaAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    private static async Task EnsureNotificationRuleStateSchemaAsync(SqliteConnection connection, SqliteTransaction transaction, CancellationToken cancellationToken)
     {
         var hasWatermark = false;
         await using (var info = connection.CreateCommand())
         {
+            info.Transaction = transaction;
             info.CommandText = "PRAGMA table_info(NotificationRuleState)";
             await using var reader = await info.ExecuteReaderAsync(cancellationToken);
             while (await reader.ReadAsync(cancellationToken))
@@ -1707,14 +1915,13 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
 
         if (hasWatermark) return;
         await using var alter = connection.CreateCommand();
+        alter.Transaction = transaction;
         alter.CommandText = "ALTER TABLE NotificationRuleState ADD COLUMN LastProcessedSubjectEventId INTEGER NULL";
         await alter.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    private static async Task MigrateNotificationRecipientsAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    private static async Task MigrateNotificationRecipientsAsync(SqliteConnection connection, SqliteTransaction sqliteTransaction, CancellationToken cancellationToken)
     {
-        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
-        var sqliteTransaction = (SqliteTransaction)transaction;
         var legacyRules = new List<(long RuleId, int TargetType, string TargetId)>();
         await using (var command = connection.CreateCommand())
         {
@@ -1738,25 +1945,26 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
                 "INSERT OR IGNORE INTO NotificationRuleRecipient(RuleId,RecipientId,CreatedAt) VALUES($rule,$recipient,$now)",
                 [("$rule", ruleId), ("$recipient", recipientId), ("$now", Time(DateTimeOffset.UtcNow))], cancellationToken);
         }
-
-        await transaction.CommitAsync(cancellationToken);
     }
 
-    private async Task BackfillNotificationDeliveryRecipientsAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    private static async Task BackfillNotificationDeliveryRecipientsAsync(SqliteConnection connection, SqliteTransaction transaction, CancellationToken cancellationToken)
     {
-        await ExecuteAsync(
+        await ExecuteInTransactionAsync(
+            connection, transaction,
             "UPDATE NotificationDelivery SET RecipientId=(SELECT r.Id FROM NotificationRecipient r WHERE r.TargetType=NotificationDelivery.TargetType AND r.OpenId=NotificationDelivery.TargetId) WHERE RecipientId IS NULL AND RuleId IS NOT NULL",
             [], cancellationToken);
-        await ExecuteAsync(
+        await ExecuteInTransactionAsync(
+            connection, transaction,
             "UPDATE SystemNotificationDelivery SET RecipientId=(SELECT r.Id FROM NotificationRecipient r WHERE r.TargetType=SystemNotificationDelivery.TargetType AND r.OpenId=SystemNotificationDelivery.TargetId) WHERE RecipientId IS NULL",
             [], cancellationToken);
     }
 
-    private static async Task MigrateSystemNotificationDeliverySchemaAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    private static async Task MigrateSystemNotificationDeliverySchemaAsync(SqliteConnection connection, SqliteTransaction sqliteTransaction, CancellationToken cancellationToken)
     {
         var hasRecipientId = false;
         await using (var info = connection.CreateCommand())
         {
+            info.Transaction = sqliteTransaction;
             info.CommandText = "PRAGMA table_info(SystemNotificationDelivery)";
             await using var reader = await info.ExecuteReaderAsync(cancellationToken);
             while (await reader.ReadAsync(cancellationToken))
@@ -1767,6 +1975,7 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         var uniqueIndexes = new List<string>();
         await using (var indexes = connection.CreateCommand())
         {
+            indexes.Transaction = sqliteTransaction;
             indexes.CommandText = "PRAGMA index_list(SystemNotificationDelivery)";
             await using var reader = await indexes.ExecuteReaderAsync(cancellationToken);
             while (await reader.ReadAsync(cancellationToken))
@@ -1775,6 +1984,7 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         foreach (var indexName in uniqueIndexes)
         {
             await using var info = connection.CreateCommand();
+            info.Transaction = sqliteTransaction;
             info.CommandText = $"PRAGMA index_info(\"{indexName.Replace("\"", "\"\"", StringComparison.Ordinal)}\")";
             await using var reader = await info.ExecuteReaderAsync(cancellationToken);
             var columns = new List<string>();
@@ -1788,8 +1998,6 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
 
         if (hasRecipientId && hasUniqueKindEpisodeRecipient) return;
 
-        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
-        var sqliteTransaction = (SqliteTransaction)transaction;
         var recipientExpression = hasRecipientId
             ? "RecipientId"
             : "(SELECT r.Id FROM NotificationRecipient r WHERE r.TargetType=SystemNotificationDelivery_Legacy.TargetType AND r.OpenId=SystemNotificationDelivery_Legacy.TargetId)";
@@ -1827,15 +2035,15 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
             CREATE INDEX IX_SystemNotificationDelivery_Created ON SystemNotificationDelivery(CreatedAt DESC);
             """;
         await ExecuteInTransactionAsync(connection, sqliteTransaction, rebuildSql, [], cancellationToken);
-        await transaction.CommitAsync(cancellationToken);
     }
 
-    private static async Task MigrateSubjectPresenceEventSchemaAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    private static async Task MigrateSubjectPresenceEventSchemaAsync(SqliteConnection connection, SqliteTransaction sqliteTransaction, CancellationToken cancellationToken)
     {
         var hasStateSince = false;
         var monitoringGapIsRequired = false;
         await using (var info = connection.CreateCommand())
         {
+            info.Transaction = sqliteTransaction;
             info.CommandText = "PRAGMA table_info(SubjectPresenceEvent)";
             await using var reader = await info.ExecuteReaderAsync(cancellationToken);
             while (await reader.ReadAsync(cancellationToken))
@@ -1850,6 +2058,7 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         var monitoringGapDeleteIsSetNull = false;
         await using (var foreignKeys = connection.CreateCommand())
         {
+            foreignKeys.Transaction = sqliteTransaction;
             foreignKeys.CommandText = "PRAGMA foreign_key_list(SubjectPresenceEvent)";
             await using var reader = await foreignKeys.ExecuteReaderAsync(cancellationToken);
             while (await reader.ReadAsync(cancellationToken))
@@ -1861,21 +2070,19 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
 
         if (hasStateSince && !monitoringGapIsRequired && monitoringGapDeleteIsSetNull) return;
 
-        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
-        var sqliteTransaction = (SqliteTransaction)transaction;
         await ExecuteInTransactionAsync(connection, sqliteTransaction,
             "DROP INDEX IF EXISTS IX_SubjectPresenceEvent_Subject_Observed; DROP INDEX IF EXISTS UX_SubjectPresenceEvent_Stable; ALTER TABLE SubjectPresenceEvent RENAME TO SubjectPresenceEvent_Legacy; CREATE TABLE SubjectPresenceEvent_New (Id INTEGER PRIMARY KEY AUTOINCREMENT, SubjectId INTEGER NOT NULL, EventType INTEGER NOT NULL, ObservedAt TEXT NOT NULL, MonitoringGapId INTEGER NULL, StateSince TEXT NULL, FOREIGN KEY(SubjectId) REFERENCES PresenceSubject(Id) ON DELETE CASCADE, FOREIGN KEY(MonitoringGapId) REFERENCES MonitoringGap(Id) ON DELETE SET NULL); INSERT INTO SubjectPresenceEvent_New(Id,SubjectId,EventType,ObservedAt,MonitoringGapId,StateSince) SELECT Id,SubjectId,EventType,ObservedAt,MonitoringGapId,NULL FROM SubjectPresenceEvent_Legacy; DROP TABLE SubjectPresenceEvent_Legacy; ALTER TABLE SubjectPresenceEvent_New RENAME TO SubjectPresenceEvent; CREATE INDEX IX_SubjectPresenceEvent_Subject_Observed ON SubjectPresenceEvent(SubjectId,ObservedAt DESC); CREATE UNIQUE INDEX UX_SubjectPresenceEvent_Stable ON SubjectPresenceEvent(SubjectId,EventType,ObservedAt);",
             [], cancellationToken);
-        await transaction.CommitAsync(cancellationToken);
     }
 
-    private static async Task MigrateNotificationDeliverySchemaAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    private static async Task MigrateNotificationDeliverySchemaAsync(SqliteConnection connection, SqliteTransaction sqliteTransaction, CancellationToken cancellationToken)
     {
         var needsMigration = false;
         var hasRecipientId = false;
         var uniqueIndexes = new List<string>();
         await using (var info = connection.CreateCommand())
         {
+            info.Transaction = sqliteTransaction;
             info.CommandText = "PRAGMA table_info(NotificationDelivery)";
             await using var reader = await info.ExecuteReaderAsync(cancellationToken);
             while (await reader.ReadAsync(cancellationToken))
@@ -1887,6 +2094,7 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         }
         await using (var indexes = connection.CreateCommand())
         {
+            indexes.Transaction = sqliteTransaction;
             indexes.CommandText = "PRAGMA index_list(NotificationDelivery)";
             await using var reader = await indexes.ExecuteReaderAsync(cancellationToken);
             while (await reader.ReadAsync(cancellationToken))
@@ -1896,6 +2104,7 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         foreach (var indexName in uniqueIndexes)
         {
             await using var info = connection.CreateCommand();
+            info.Transaction = sqliteTransaction;
             info.CommandText = $"PRAGMA index_info(\"{indexName.Replace("\"", "\"\"", StringComparison.Ordinal)}\")";
             await using var reader = await info.ExecuteReaderAsync(cancellationToken);
             var columns = new List<string>();
@@ -1909,6 +2118,7 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         needsMigration |= !hasRecipientId || !hasUniqueRuleEpisodeRecipient;
         await using (var foreignKeys = connection.CreateCommand())
         {
+            foreignKeys.Transaction = sqliteTransaction;
             foreignKeys.CommandText = "PRAGMA foreign_key_list(NotificationDelivery)";
             await using var reader = await foreignKeys.ExecuteReaderAsync(cancellationToken);
             while (await reader.ReadAsync(cancellationToken))
@@ -1920,8 +2130,6 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         }
         if (!needsMigration) return;
 
-        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
-        var sqliteTransaction = (SqliteTransaction)transaction;
         var recipientExpression = hasRecipientId
             ? "RecipientId"
             : "(SELECT r.Id FROM NotificationRecipient r WHERE r.TargetType=NotificationDelivery_Legacy.TargetType AND r.OpenId=NotificationDelivery_Legacy.TargetId)";
@@ -1973,10 +2181,9 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
             CREATE INDEX IX_NotificationDelivery_Created ON NotificationDelivery(CreatedAt DESC);
             """;
         await ExecuteInTransactionAsync(connection, sqliteTransaction, rebuildSql, [], cancellationToken);
-        await transaction.CommitAsync(cancellationToken);
     }
 
-    private static async Task EnsureLegacyNotificationDeliveryUniqueIndexAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    private static async Task EnsureLegacyNotificationDeliveryUniqueIndexAsync(SqliteConnection connection, SqliteTransaction transaction, CancellationToken cancellationToken)
     {
         // SQLite treats NULLs as distinct in a regular UNIQUE constraint. Keep
         // legacy (unsaved-recipient) deliveries idempotent as well, while still
@@ -1984,6 +2191,7 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         // duplicate history is retained by detaching only the later duplicate
         // from the rule, matching the historical migration behavior.
         await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
         command.CommandText = """
             UPDATE NotificationDelivery
             SET RuleId=NULL
@@ -2089,10 +2297,19 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         return await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    private static Task CloseOpenSessionsAtAsync(SqliteConnection connection, SqliteTransaction transaction, DateTimeOffset boundary, CancellationToken cancellationToken) =>
+    private static Task CloseOpenSessionsAtAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        DateTimeOffset boundary,
+        CancellationToken cancellationToken,
+        long? routerId = null) =>
         ExecuteInTransactionAsync(connection, transaction,
-            "UPDATE PresenceSession SET EndedAt=$end,EndKnown=0 WHERE EndedAt IS NULL AND StartedAt <= $end",
-            [("$end", Time(boundary))], cancellationToken);
+            routerId is null
+                ? "UPDATE PresenceSession SET EndedAt=$end,EndKnown=0 WHERE EndedAt IS NULL AND StartedAt <= $end"
+                : "UPDATE PresenceSession SET EndedAt=$end,EndKnown=0 WHERE EndedAt IS NULL AND StartedAt <= $end AND DeviceId IN (SELECT Id FROM NetworkDevice WHERE RouterId=$router)",
+            routerId is null
+                ? [("$end", (object?)Time(boundary))]
+                : [("$end", (object?)Time(boundary)), ("$router", routerId.Value)], cancellationToken);
 
     private static NotificationRule NormalizeRule(NotificationRule value)
     {

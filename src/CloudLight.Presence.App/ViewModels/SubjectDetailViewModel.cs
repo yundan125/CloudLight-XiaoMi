@@ -56,7 +56,7 @@ public sealed class SubjectDetailViewModel : ObservableObject, IDisposable
         {
             if (await _repository.GetSubjectAsync(Subject.Id, CancellationToken.None) is { } latest) { _subject = latest; DisplayName = latest.DisplayName; Note = latest.Note; if (!IsNameEditing) NameDraft = latest.DisplayName; if (!IsNoteEditing) NoteDraft = latest.Note; Raise(nameof(Subject)); Raise(nameof(NoteText)); Raise(nameof(WindowTitle)); }
             _snapshot = await _presence.GetSnapshotAsync(Subject.Id, DateTimeOffset.UtcNow, CancellationToken.None); RaiseState(); Members.Clear(); foreach (var device in _snapshot?.Members ?? []) Members.Add(new(device, value => OpenDeviceRequested?.Invoke(this, value))); Raise(nameof(HasNoMembers));
-            var now = DateTimeOffset.UtcNow; Statistics.Clear(); foreach (var (days, label) in new[] { (1, "最近24小时"), (3, "最近3天"), (7, "最近7天"), (30, "最近30天") }) { var value = await _presence.GetSubjectStatisticsAsync(Subject.Id, now.AddDays(-days), now, CancellationToken.None); Statistics.Add(new(label, Format(value.KnownOnlineDuration), $"已记录：{Format(value.KnownDuration)} / {Format(value.WindowDuration)}", $"记录期间在线：{value.OnlinePercentageOfKnownTime:P1}", value.Coverage < .9)); }
+            var now = DateTimeOffset.UtcNow; Statistics.Clear(); foreach (var (days, label) in new[] { (1, "最近24小时"), (3, "最近3天"), (7, "最近7天"), (30, "最近30天") }) { var value = await _presence.GetSubjectStatisticsAsync(Subject.Id, now.AddDays(-days), now, CancellationToken.None); Statistics.Add(new(label, Format(value.KnownOnlineDuration), $"覆盖率：{value.Coverage:P1}", $"在线率：{value.OnlineRate:P1}", value.Coverage < .9) { OfflineDuration = $"离线：{Format(value.KnownOfflineDuration)}", UnknownDuration = $"未监控：{Format(value.UnknownDuration)}", CoverageDetail = $"有效记录：{Format(value.KnownDuration)} / {Format(value.WindowDuration)}", QualityWarning = value.Coverage < .9 ? "数据覆盖不足，在线率仅供参考" : "" }); }
             await LoadTimelineCoreAsync(_timelineDays, _selectedRange);
         } finally { _gate.Release(); }
     }
@@ -75,9 +75,18 @@ public sealed class SubjectDetailViewModel : ObservableObject, IDisposable
             SubjectActivityType.Offline => new(value.OccurredAtUtc.ToLocalTime(), "已离线", "#64748B", "○"),
             SubjectActivityType.DetectedOnlineAfterGap => new(value.OccurredAtUtc.ToLocalTime(), "检测到已上线", "#16803A", "●"),
             SubjectActivityType.DetectedOfflineAfterGap => new(value.OccurredAtUtc.ToLocalTime(), "检测到已离线", "#64748B", "○"),
-            _ => new(value.OccurredAtUtc.ToLocalTime(), "暂无监控数据", "#94A3B8", "◇")
+            _ => new(value.OccurredAtUtc.ToLocalTime(), FormatUnobservedReason(value.UnobservedReason), "#94A3B8", "◇")
         }); Raise(nameof(HasNoHistory)); Raise(nameof(HasDetectedAfterGapActivities));
     }
+    private static string FormatUnobservedReason(string? reason) => reason switch
+    {
+        "UserPaused" or "用户暂停监控" => "用户暂停监控",
+        "UnexpectedTermination" or "软件未运行" => "软件未运行",
+        _ when reason?.Contains("Xiaomi", StringComparison.OrdinalIgnoreCase) == true
+            || reason?.Contains("Router", StringComparison.OrdinalIgnoreCase) == true
+            || reason?.Contains("连接", StringComparison.Ordinal) == true => "Xiaomi / 路由器连接中断",
+        _ => "暂无监控数据"
+    };
     private async Task SaveAsync() { await _repository.UpdateSubjectAsync(Subject.Id, DisplayName, Note, DateTimeOffset.UtcNow, CancellationToken.None); SaveStatus = "已保存"; await ReloadAsync(); }
     public void BeginNameEdit() { NameDraft = DisplayName; IsNameEditing = true; }
     public void CancelNameEdit() { NameDraft = DisplayName; IsNameEditing = false; }

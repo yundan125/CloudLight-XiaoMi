@@ -36,7 +36,7 @@ public sealed class SubjectPresenceService(IPresenceRepository repository, IPres
 
         var gapFrom = now == DateTimeOffset.MinValue ? now : now.AddTicks(-1);
         var gapTo = now == DateTimeOffset.MaxValue ? now : now.AddTicks(1);
-        if ((await repository.GetMonitoringGapsAsync(gapFrom, gapTo, cancellationToken))
+        if ((await GetMonitoringGapsForMembersAsync(members, gapFrom, gapTo, cancellationToken))
             .Any(value => value.StartedAt <= now && (value.EndedAt is null || value.EndedAt > now)))
             return new(subject, members, PresenceState.Unknown, null, false, TimeSpan.Zero, null, null, null, routerName);
 
@@ -101,15 +101,16 @@ public sealed class SubjectPresenceService(IPresenceRepository repository, IPres
         var transitions = events.Where(IsTimelineEvent).OrderBy(value => value.EffectiveAt).ThenBy(value => value.ObservedAt).ThenBy(value => value.Id).ToArray();
 
         var canonicalStart = seeds[0].EffectiveAt;
+        var routerIds = members.Select(value => value.RouterId).Distinct().ToArray();
         if (canonicalStart <= from)
-            return await BuildConfirmedTimelineAsync(transitions, from, to, cancellationToken);
+            return await BuildConfirmedTimelineAsync(transitions, from, to, routerIds, cancellationToken);
 
         var prefixEnd = canonicalStart < to ? canonicalStart : to;
         var result = new List<PresenceTimelineSegment>();
         if (prefixEnd > from)
             result.AddRange(await GetLegacyTimelineAsync(subjectId, from, prefixEnd, cancellationToken));
         if (canonicalStart < to)
-            result.AddRange(await BuildConfirmedTimelineAsync(transitions, canonicalStart, to, cancellationToken));
+            result.AddRange(await BuildConfirmedTimelineAsync(transitions, canonicalStart, to, routerIds, cancellationToken));
         return Coalesce(result);
     }
 
@@ -152,9 +153,10 @@ public sealed class SubjectPresenceService(IPresenceRepository repository, IPres
         IReadOnlyList<SubjectPresenceEvent> confirmed,
         DateTimeOffset from,
         DateTimeOffset to,
+        IReadOnlyCollection<long> routerIds,
         CancellationToken cancellationToken)
     {
-        var gaps = (await repository.GetMonitoringGapsAsync(DateTimeOffset.MinValue, DateTimeOffset.MaxValue, cancellationToken))
+        var gaps = (await GetMonitoringGapsForRouterIdsAsync(routerIds, DateTimeOffset.MinValue, DateTimeOffset.MaxValue, cancellationToken))
             .ToDictionary(value => value.Id);
         var events = confirmed.Where(value => value.EffectiveAt <= to).ToArray();
         var prior = events.LastOrDefault(value => value.EffectiveAt <= from);
@@ -172,8 +174,43 @@ public sealed class SubjectPresenceService(IPresenceRepository repository, IPres
         if (currentState is { } state)
             Append(result, cursor, to, state);
         else
-            Append(result, cursor, to, PresenceState.Unknown);
-        return Coalesce(result);
+            Append(result, cursor, to, PresenceState.Unknown, "暂无历史记录");
+        return ApplyGapOverlay(result, gaps.Values, from, to);
+    }
+
+    private static IReadOnlyList<PresenceTimelineSegment> ApplyGapOverlay(
+        IReadOnlyList<PresenceTimelineSegment> source,
+        IEnumerable<MonitoringGap> gaps,
+        DateTimeOffset from,
+        DateTimeOffset to)
+    {
+        var relevantGaps = gaps
+            .Select(value => (Gap: value, Start: Max(from, value.StartedAt), End: Min(to, value.EndedAt ?? to)))
+            .Where(value => value.End > value.Start)
+            .OrderBy(value => value.Start)
+            .ToArray();
+        if (relevantGaps.Length == 0) return Coalesce(source);
+
+        var boundaries = new SortedSet<DateTimeOffset> { from, to };
+        foreach (var segment in source) { boundaries.Add(segment.Start); boundaries.Add(segment.End); }
+        foreach (var gap in relevantGaps) { boundaries.Add(gap.Start); boundaries.Add(gap.End); }
+
+        var points = boundaries.ToArray();
+        var result = new List<PresenceTimelineSegment>();
+        for (var index = 0; index < points.Length - 1; index++)
+        {
+            var start = points[index];
+            var end = points[index + 1];
+            var gap = relevantGaps.FirstOrDefault(value => value.Start < end && value.End > start).Gap;
+            if (gap is not null)
+                Append(result, start, end, PresenceState.Unknown, gap.Reason);
+            else
+            {
+                var state = source.FirstOrDefault(value => value.Start < end && value.End > start);
+                Append(result, start, end, state?.State ?? PresenceState.Unknown, state?.UnobservedReason);
+            }
+        }
+        return result;
     }
 
     private static void AppendIntervalBeforeTransition(
@@ -187,7 +224,7 @@ public sealed class SubjectPresenceService(IPresenceRepository repository, IPres
         if (transitionAt <= cursor) return;
         if (currentState is not { } state)
         {
-            Append(result, cursor, transitionAt, PresenceState.Unknown);
+            Append(result, cursor, transitionAt, PresenceState.Unknown, "暂无历史记录");
             return;
         }
 
@@ -195,7 +232,7 @@ public sealed class SubjectPresenceService(IPresenceRepository repository, IPres
         {
             var unknownStart = Max(cursor, gap.StartedAt);
             if (unknownStart > cursor) Append(result, cursor, unknownStart, state);
-            if (transitionAt > unknownStart) Append(result, unknownStart, transitionAt, PresenceState.Unknown);
+            if (transitionAt > unknownStart) Append(result, unknownStart, transitionAt, PresenceState.Unknown, gap.Reason);
             return;
         }
 
@@ -247,19 +284,19 @@ public sealed class SubjectPresenceService(IPresenceRepository repository, IPres
         return PresenceState.Offline;
     }
 
-    private static void Append(List<PresenceTimelineSegment> values, DateTimeOffset start, DateTimeOffset end, PresenceState state)
+    private static void Append(List<PresenceTimelineSegment> values, DateTimeOffset start, DateTimeOffset end, PresenceState state, string? unobservedReason = null)
     {
         if (end <= start) return;
-        if (values.Count > 0 && values[^1].State == state && values[^1].End == start)
+        if (values.Count > 0 && values[^1].State == state && values[^1].UnobservedReason == unobservedReason && values[^1].End == start)
             values[^1] = values[^1] with { End = end };
         else
-            values.Add(new PresenceTimelineSegment(start, end, state));
+            values.Add(new PresenceTimelineSegment(start, end, state, unobservedReason));
     }
 
     private static IReadOnlyList<PresenceTimelineSegment> Coalesce(IEnumerable<PresenceTimelineSegment> source)
     {
         var result = new List<PresenceTimelineSegment>();
-        foreach (var value in source) Append(result, value.Start, value.End, value.State);
+        foreach (var value in source) Append(result, value.Start, value.End, value.State, value.UnobservedReason);
         return result;
     }
 
@@ -276,6 +313,29 @@ public sealed class SubjectPresenceService(IPresenceRepository repository, IPres
         return names.Length == 0 ? null : string.Join("、", names);
     }
 
+    private async Task<IReadOnlyList<MonitoringGap>> GetMonitoringGapsForMembersAsync(
+        IReadOnlyList<NetworkDevice> members,
+        DateTimeOffset from,
+        DateTimeOffset to,
+        CancellationToken cancellationToken) =>
+        await GetMonitoringGapsForRouterIdsAsync(members.Select(value => value.RouterId).Distinct().ToArray(), from, to, cancellationToken);
+
+    private async Task<IReadOnlyList<MonitoringGap>> GetMonitoringGapsForRouterIdsAsync(
+        IReadOnlyCollection<long> routerIds,
+        DateTimeOffset from,
+        DateTimeOffset to,
+        CancellationToken cancellationToken)
+    {
+        if (routerIds.Count == 0)
+            return await repository.GetMonitoringGapsAsync(from, to, cancellationToken);
+
+        var result = new Dictionary<long, MonitoringGap>();
+        foreach (var routerId in routerIds)
+            foreach (var gap in await repository.GetMonitoringGapsAsync(from, to, cancellationToken, routerId))
+                result[gap.Id] = gap;
+        return result.Values.OrderBy(value => value.StartedAt).ToArray();
+    }
+
     private static DateTimeOffset? LastBoundary(IReadOnlyList<PresenceTimelineSegment> timeline, PresenceState state, int exclusiveEnd)
     {
         for (var index = Math.Min(exclusiveEnd, timeline.Count) - 1; index >= 0; index--)
@@ -285,4 +345,5 @@ public sealed class SubjectPresenceService(IPresenceRepository repository, IPres
 
     private static TimeSpan NonNegative(TimeSpan value) => value < TimeSpan.Zero ? TimeSpan.Zero : value;
     private static DateTimeOffset Max(DateTimeOffset left, DateTimeOffset right) => left > right ? left : right;
+    private static DateTimeOffset Min(DateTimeOffset left, DateTimeOffset right) => left < right ? left : right;
 }

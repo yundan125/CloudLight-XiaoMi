@@ -13,6 +13,11 @@
           <TextBlock Text="应用行为" Style="{DynamicResource CardTitleStyle}"/>
           <CheckBox x:Name="StartWithWindowsBox" Content="开机自动启动 CloudLight XiaoMi" Style="{DynamicResource ToggleSwitchStyle}" Checked="GeneralSettingChanged" Unchecked="GeneralSettingChanged" Margin="0,14,0,0"/>
           <CheckBox x:Name="StartMinimizedBox" Content="启动后最小化到托盘" Style="{DynamicResource ToggleSwitchStyle}" Checked="GeneralSettingChanged" Unchecked="GeneralSettingChanged" Margin="0,14,0,0"/>
+          <TextBlock Text="关闭主窗口时" Style="{DynamicResource MutedTextStyle}" Margin="0,16,0,6"/>
+          <StackPanel>
+            <RadioButton x:Name="MinimizeOnCloseBox" Content="最小化到托盘，继续后台监控" GroupName="CloseBehavior" Checked="CloseBehaviorChanged"/>
+            <RadioButton x:Name="ExitOnCloseBox" Content="退出程序" GroupName="CloseBehavior" Checked="CloseBehaviorChanged" Margin="0,7,0,0"/>
+          </StackPanel>
           <TextBlock x:Name="GeneralStatus" Style="{DynamicResource MutedTextStyle}" Margin="0,12,0,0"/>
         </StackPanel>
       </Border>
@@ -21,7 +26,7 @@
       <Border Style="{DynamicResource CardStyle}">
         <Grid>
           <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition/></Grid.ColumnDefinitions>
-          <Grid.RowDefinitions><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
+          <Grid.RowDefinitions><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
           <TextBlock Text="当前路由器" Style="{DynamicResource MutedTextStyle}"/>
           <TextBlock Grid.Column="1" Text="{Binding RouterSummary}" Foreground="{DynamicResource TextBrush}" TextTrimming="CharacterEllipsis"/>
           <TextBlock Grid.Row="1" Text="轮询间隔" Style="{DynamicResource MutedTextStyle}" Margin="0,16,0,0" VerticalAlignment="Center"/>
@@ -37,6 +42,18 @@
           </StackPanel>
           <TextBlock Grid.Row="3" Text="Xiaomi 状态" Style="{DynamicResource MutedTextStyle}" Margin="0,16,0,0"/>
           <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding CloudStatus}" Foreground="{DynamicResource TextBrush}" Margin="0,16,0,0"/>
+          <TextBlock Grid.Row="4" Text="监控状态" Style="{DynamicResource MutedTextStyle}" Margin="0,16,0,0"/>
+          <StackPanel Grid.Row="4" Grid.Column="1" Margin="0,12,0,0">
+            <TextBlock Text="{Binding PauseStatusText}" Foreground="{DynamicResource TextBrush}" TextWrapping="Wrap"/>
+            <WrapPanel Margin="0,8,0,0">
+              <Button Content="暂停 15 分钟" Style="{DynamicResource SecondaryButtonStyle}" Click="Pause15Clicked"/>
+              <Button Content="暂停 30 分钟" Style="{DynamicResource SecondaryButtonStyle}" Click="Pause30Clicked"/>
+              <Button Content="暂停 1 小时" Style="{DynamicResource SecondaryButtonStyle}" Click="Pause60Clicked"/>
+              <Button Content="暂停 2 小时" Style="{DynamicResource SecondaryButtonStyle}" Click="Pause120Clicked"/>
+              <Button Content="手动暂停" Style="{DynamicResource SecondaryButtonStyle}" Click="PauseManualClicked"/>
+              <Button Content="立即恢复" Style="{DynamicResource SecondaryButtonStyle}" Click="ResumeMonitoringClicked"/>
+            </WrapPanel>
+          </StackPanel>
         </Grid>
       </Border>
 
@@ -50,6 +67,18 @@
             <Button Content="导入数据" Style="{DynamicResource SecondaryButtonStyle}" Click="ImportClicked"/>
             <Button Content="打开数据目录" Style="{DynamicResource SecondaryButtonStyle}" Click="OpenDataDirectoryClicked" Margin="0"/>
           </WrapPanel>
+          <Border BorderBrush="{DynamicResource DividerBrush}" BorderThickness="0,1,0,0" Margin="0,16,0,0" Padding="0,14,0,0">
+            <StackPanel>
+              <TextBlock Text="数据库" Style="{DynamicResource CardTitleStyle}"/>
+              <TextBlock Text="当前数据库：presence.db" Style="{DynamicResource MutedTextStyle}" Margin="0,7,0,0"/>
+              <TextBlock x:Name="DatabaseBackupText" Style="{DynamicResource MutedTextStyle}" TextWrapping="Wrap" Margin="0,4,0,0"/>
+              <WrapPanel Margin="0,10,0,0">
+                <Button Content="打开备份目录" Style="{DynamicResource SecondaryButtonStyle}" Click="OpenBackupDirectoryClicked"/>
+                <Button Content="立即备份" Style="{DynamicResource SecondaryButtonStyle}" Click="ManualBackupClicked"/>
+              </WrapPanel>
+              <TextBlock x:Name="DatabaseBackupStatus" Style="{DynamicResource MutedTextStyle}" TextWrapping="Wrap" Margin="0,8,0,0"/>
+            </StackPanel>
+          </Border>
           <TextBlock x:Name="DataStatus" Style="{DynamicResource MutedTextStyle}" Margin="0,12,0,0"/>
         </StackPanel>
       </Border>
@@ -58,6 +87,14 @@
       <Border Style="{DynamicResource CardStyle}">
         <StackPanel>
           <TextBlock Text="运行状态" Style="{DynamicResource CardTitleStyle}" Margin="0,0,0,10"/>
+          <TextBlock x:Name="SystemDiagnosticsText" Foreground="{DynamicResource TextBrush}" TextWrapping="Wrap"/>
+          <WrapPanel Margin="0,14,0,0">
+            <Button Content="立即刷新诊断" Style="{DynamicResource SecondaryButtonStyle}" Click="RefreshDiagnosticsClicked"/>
+            <Button Content="导出诊断包" Style="{DynamicResource PrimaryButtonStyle}" Click="ExportDiagnosticsClicked"/>
+            <Button x:Name="OpenDiagnosticsFolderButton" Content="打开所在文件夹" Style="{DynamicResource SecondaryButtonStyle}" Click="OpenDiagnosticsFolderClicked" IsEnabled="False"/>
+          </WrapPanel>
+          <TextBlock x:Name="DiagnosticsStatus" Style="{DynamicResource MutedTextStyle}" TextWrapping="Wrap" Margin="0,10,0,0"/>
+          <TextBlock Text="详细诊断" Style="{DynamicResource MutedTextStyle}" Margin="0,14,0,5"/>
           <TextBlock Text="{Binding Diagnostics}" FontFamily="Consolas" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap"/>
         </StackPanel>
       </Border>

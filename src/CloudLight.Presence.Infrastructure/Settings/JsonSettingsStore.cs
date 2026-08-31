@@ -9,6 +9,13 @@ public sealed record PresenceSettings(
     bool StartMinimized = true,
     int PollingIntervalSeconds = 10)
 {
+    /// <summary>Stable router identity used when partner_id is absent or rotated.</summary>
+    public string? SelectedRouterMiotDid { get; init; }
+    /// <summary>Keep the existing background-first close behavior by default.</summary>
+    public bool MinimizeToTrayOnClose { get; init; } = true;
+    /// <summary>Null means not paused; MaxValue represents manual pause.</summary>
+    public DateTimeOffset? PauseUntil { get; init; }
+    public DateTimeOffset? LastUpdateCheckAt { get; init; }
     public QqNotificationSettings Qq { get; init; } = new();
     public ConnectionAlertSettings ConnectionAlerts { get; init; } = new();
 }

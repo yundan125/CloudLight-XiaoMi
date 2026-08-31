@@ -107,7 +107,8 @@ public sealed class ConfirmedPresenceNotificationTests
         var events = await fixture.Repository.GetSubjectPresenceEventsAsync(fixture.Subject.Id, fixture.Start, gapEnd.AddMinutes(1), CancellationToken.None);
 
         Assert.Equal(onlineSince, fact.StateSince);
-        Assert.DoesNotContain(timeline, value => value.State == PresenceState.Unknown);
+        Assert.Equal([PresenceState.Online, PresenceState.Unknown, PresenceState.Online], timeline.Select(value => value.State).ToArray());
+        Assert.Equal("test", timeline.Single(value => value.State == PresenceState.Unknown).UnobservedReason);
         Assert.DoesNotContain(events, value => value.EventType is SubjectPresenceEventType.DetectedOnlineAfterGap or SubjectPresenceEventType.DetectedOfflineAfterGap);
     }
 

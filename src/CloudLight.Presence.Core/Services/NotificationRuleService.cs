@@ -12,6 +12,306 @@ public sealed class NotificationRuleService(
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly INotificationDiagnostics _diagnostics = diagnostics ?? NullNotificationDiagnostics.Instance;
 
+    public async Task<RuleEvaluationDiagnostic> EvaluateDiagnosticAsync(
+        long ruleId,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            var rule = await repository.GetNotificationRuleAsync(ruleId, cancellationToken)
+                ?? throw new InvalidOperationException("通知规则不存在，可能已被删除。 ");
+            return await EvaluateDiagnosticCoreAsync(rule, now, cancellationToken);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    private async Task<RuleEvaluationDiagnostic> EvaluateDiagnosticCoreAsync(
+        NotificationRule rule,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        var state = await ReadRuleStateAsync(rule, cancellationToken);
+        var allDeliveries = await repository.GetNotificationDeliveriesForRuleAsync(rule.Id, cancellationToken);
+        var targets = await ResolveTargetsAsync(rule, cancellationToken);
+        var lastSentAt = allDeliveries
+            .Where(value => value.Status == NotificationDeliveryStatus.Delivered)
+            .Select(value => value.DeliveredAt ?? value.CreatedAt)
+            .DefaultIfEmpty()
+            .Max();
+        var lastDeliveryAt = allDeliveries
+            .Where(value => value.Status is not NotificationDeliveryStatus.Canceled)
+            .Select(value => value.CreatedAt)
+            .DefaultIfEmpty()
+            .Max();
+        var lastError = state.LastDeliveryError ?? allDeliveries
+            .Where(value => value.Status == NotificationDeliveryStatus.Failed && !string.IsNullOrWhiteSpace(value.Error))
+            .OrderByDescending(value => value.CreatedAt)
+            .Select(value => value.Error)
+            .FirstOrDefault();
+        var metadata = new DiagnosticMetadata(
+            state.UpdatedAt == default ? null : state.UpdatedAt,
+            state.TriggeredAt ?? (lastDeliveryAt == default ? null : lastDeliveryAt),
+            lastSentAt == default ? null : lastSentAt,
+            lastError,
+            targets);
+
+        if (!rule.Enabled)
+            return Diagnostic(rule, now, RuleEvaluationDiagnosticStatus.Disabled, "规则已关闭。", metadata: metadata);
+        if (targets.Count == 0 || targets.Any(value => string.IsNullOrWhiteSpace(value.TargetId)))
+            return Diagnostic(rule, now, RuleEvaluationDiagnosticStatus.RecipientUnavailable, "没有可用的 QQ 接收人，规则不会触发。", metadata: metadata);
+
+        return rule.Condition is NotificationCondition.OnlineFor or NotificationCondition.OfflineFor
+            ? await DiagnoseContinuousAsync(rule, now, state, allDeliveries, targets, metadata, cancellationToken)
+            : await DiagnoseDetectedAsync(rule, now, state, allDeliveries, targets, metadata, cancellationToken);
+    }
+
+    private async Task<RuleEvaluationDiagnostic> DiagnoseContinuousAsync(
+        NotificationRule rule,
+        DateTimeOffset now,
+        NotificationRuleState state,
+        IReadOnlyList<NotificationDelivery> allDeliveries,
+        IReadOnlyList<NotificationRecipientTarget> targets,
+        DiagnosticMetadata metadata,
+        CancellationToken cancellationToken)
+    {
+        var expected = rule.Condition == NotificationCondition.OnlineFor ? PresenceState.Online : PresenceState.Offline;
+        var evaluation = await ReadContinuousConditionAsync(rule, expected, now, state, cancellationToken);
+        var fact = evaluation.Fact;
+        if (fact is null)
+            return Diagnostic(rule, now, RuleEvaluationDiagnosticStatus.SubjectUnavailable, "当前主体不可用，暂时无法评估。", metadata: metadata);
+        if (fact.CurrentState == PresenceState.Unknown)
+            return Diagnostic(rule, now, RuleEvaluationDiagnosticStatus.WaitingForState, "当前主体状态未知，等待下一次成功的 Presence 检查。", fact, metadata: metadata);
+        if (!evaluation.StateMatches)
+        {
+            var current = PresenceDurationFormatter.StateText(fact.CurrentState);
+            var expectedText = PresenceDurationFormatter.StateText(expected);
+            return Diagnostic(rule, now, RuleEvaluationDiagnosticStatus.WaitingForState,
+                $"当前不会触发\n原因：当前主体处于{current}状态，规则要求连续{expectedText}。", fact, metadata: metadata);
+        }
+
+        var since = evaluation.StateSince!.Value;
+        var duration = evaluation.Duration;
+        var threshold = evaluation.Threshold;
+        var progress = evaluation.Progress;
+        var deliveries = evaluation.EpisodeDeliveries;
+        var status = DeliveryDiagnosticStatus(deliveries, targets);
+        if (status is not null)
+            return Diagnostic(rule, now, status.Value, DeliveryExplanation(status.Value), fact, since, duration, progress, metadata, deliveries);
+        if (evaluation.ThresholdReached)
+            return Diagnostic(rule, now, RuleEvaluationDiagnosticStatus.ThresholdReached,
+                $"当前条件已满足。\n{fact.Subject.DisplayName} 当前{PresenceDurationFormatter.StateText(expected)} {NotificationTemplateRenderer.FormatDuration(duration)}，已达到 {NotificationTemplateRenderer.FormatDuration(threshold)} 阈值。",
+                fact, since, duration, progress, metadata, deliveries);
+
+        var remaining = threshold - duration;
+        return Diagnostic(rule, now, RuleEvaluationDiagnosticStatus.AccumulatingDuration,
+            $"{fact.Subject.DisplayName} 当前{PresenceDurationFormatter.StateText(expected)} {NotificationTemplateRenderer.FormatDuration(duration)}。\n触发阈值：{NotificationTemplateRenderer.FormatDuration(threshold)}。\n预计还需要约 {NotificationTemplateRenderer.FormatDuration(remaining)}。",
+            fact, since, duration, progress, metadata, deliveries, remaining);
+    }
+
+    private async Task<RuleEvaluationDiagnostic> DiagnoseDetectedAsync(
+        NotificationRule rule,
+        DateTimeOffset now,
+        NotificationRuleState state,
+        IReadOnlyList<NotificationDelivery> allDeliveries,
+        IReadOnlyList<NotificationRecipientTarget> targets,
+        DiagnosticMetadata metadata,
+        CancellationToken cancellationToken)
+    {
+        var evaluation = await ReadDetectedConditionAsync(rule, PresenceStateFor(rule.Condition), now, state, includeHistory: true, cancellationToken: cancellationToken);
+        var fact = evaluation.Fact;
+        if (fact is null)
+            return Diagnostic(rule, now, RuleEvaluationDiagnosticStatus.SubjectUnavailable, "当前主体不可用，暂时无法评估。", metadata: metadata);
+
+        var expected = PresenceStateFor(rule.Condition);
+        metadata = metadata with { LastEventAt = evaluation.LastEventAt };
+        var candidates = evaluation.CandidateEvents;
+        if (candidates.Count == 0)
+            return Diagnostic(rule, now, RuleEvaluationDiagnosticStatus.WaitingForNewEvent,
+                $"正在监听新的“{PresenceDurationFormatter.StateText(expected)}”事件。\n最近事件：{NotificationTemplateRenderer.FormatTime(metadata.LastEventAt)}。",
+                fact, metadata: metadata);
+
+        var detected = candidates[0];
+        var episodeId = EventEpisodeId(detected.Id);
+        var deliveries = allDeliveries.Where(value => string.Equals(value.EpisodeId, episodeId, StringComparison.Ordinal)).ToArray();
+        var deliveryStatus = DeliveryDiagnosticStatus(deliveries, targets);
+        if (deliveryStatus is not null)
+            return Diagnostic(rule, now, deliveryStatus.Value, DeliveryExplanation(deliveryStatus.Value), fact, detected.EffectiveAt, NonNegative(now - detected.EffectiveAt), 1, metadata, deliveries);
+        if (fact.CurrentState != expected)
+            return Diagnostic(rule, now, RuleEvaluationDiagnosticStatus.WaitingForState,
+                $"检测到新的事件，但主体当前已处于{PresenceDurationFormatter.StateText(fact.CurrentState)}，等待状态重新确认。",
+                fact, detected.EffectiveAt, NonNegative(now - detected.EffectiveAt), 1, metadata, deliveries);
+        return Diagnostic(rule, now, RuleEvaluationDiagnosticStatus.ThresholdReached,
+            $"当前条件已满足。\n最近检查：{detected.ObservedAt.ToLocalTime():HH:mm:ss}。\n如果这是一个新的状态 Episode，规则将发送给：\n{string.Join("\n", targets.Select(value => $"• {value.DisplayName ?? NotificationSettingsText(value)}"))}",
+            fact, detected.EffectiveAt, NonNegative(now - detected.EffectiveAt), 1, metadata with { LastEventAt = detected.ObservedAt }, deliveries);
+    }
+
+    private async Task<NotificationRuleState> ReadRuleStateAsync(NotificationRule rule, CancellationToken cancellationToken)
+    {
+        var state = await repository.GetNotificationRuleStateAsync(rule.Id, cancellationToken);
+        if (state is not null) return state;
+        var latest = await repository.GetLatestSubjectPresenceEventIdAsync(rule.SubjectId, cancellationToken) ?? 0;
+        return new NotificationRuleState(rule.Id, null, null, false, null, false, null, null, DateTimeOffset.MinValue, latest);
+    }
+
+    private async Task<bool> IsUserPausedEventAsync(SubjectPresenceEvent value, CancellationToken cancellationToken)
+    {
+        if (value.MonitoringGapId is not { } gapId) return false;
+        var gaps = await repository.GetMonitoringGapsAsync(DateTimeOffset.MinValue, DateTimeOffset.MaxValue, cancellationToken);
+        return gaps.FirstOrDefault(gap => gap.Id == gapId)?.Reason is "UserPaused" or "用户暂停监控";
+    }
+
+    private async Task<ContinuousConditionEvaluation> ReadContinuousConditionAsync(
+        NotificationRule rule,
+        PresenceState expectedState,
+        DateTimeOffset now,
+        NotificationRuleState state,
+        CancellationToken cancellationToken)
+    {
+        var fact = await presence.GetCurrentFactAsync(rule.SubjectId, now, cancellationToken);
+        var allDeliveries = await repository.GetNotificationDeliveriesForRuleAsync(rule.Id, cancellationToken);
+        var targets = await ResolveTargetsAsync(rule, cancellationToken);
+        var matches = fact is { CurrentState: var current } && current == expectedState && fact.StateSince is not null;
+        if (!matches)
+            return new(fact, state, allDeliveries, targets, expectedState, false, null, string.Empty, [], TimeSpan.Zero, TimeSpan.FromSeconds(Math.Max(0, rule.ThresholdSeconds)), 0, false);
+
+        var stateSince = fact!.StateSince!.Value;
+        var threshold = TimeSpan.FromSeconds(Math.Max(0, rule.ThresholdSeconds));
+        var duration = NonNegative(now - stateSince);
+        var episodeId = StateEpisodeId(expectedState, stateSince);
+        var deliveries = FindEpisodeDeliveries(rule, episodeId, stateSince, now, allDeliveries, expectedState);
+        var progress = threshold <= TimeSpan.Zero ? 1 : Math.Clamp(duration.TotalSeconds / threshold.TotalSeconds, 0, 1);
+        return new(fact, state, allDeliveries, targets, expectedState, true, stateSince, episodeId, deliveries, duration, threshold, progress, duration >= threshold);
+    }
+
+    private async Task<DetectedConditionEvaluation> ReadDetectedConditionAsync(
+        NotificationRule rule,
+        PresenceState expectedState,
+        DateTimeOffset now,
+        NotificationRuleState state,
+        bool includeHistory,
+        CancellationToken cancellationToken)
+    {
+        var fact = await presence.GetCurrentFactAsync(rule.SubjectId, now, cancellationToken);
+        var afterEventId = state.LastProcessedSubjectEventId ?? 0;
+        var newEvents = (await repository.GetSubjectPresenceEventsAfterIdAsync(rule.SubjectId, afterEventId, cancellationToken))
+            .OrderBy(value => value.Id)
+            .ToArray();
+        var candidates = new List<SubjectPresenceEvent>();
+        foreach (var value in newEvents.Where(value => EventMatches(value, expectedState)))
+            if (!await IsUserPausedEventAsync(value, cancellationToken)) candidates.Add(value);
+
+        DateTimeOffset? lastEventAt = null;
+        if (includeHistory)
+        {
+            var history = await repository.GetSubjectPresenceEventsAsync(rule.SubjectId, DateTimeOffset.MinValue, DateTimeOffset.MaxValue, cancellationToken);
+            lastEventAt = history.Where(value => EventMatches(value, expectedState))
+                .Select(value => (DateTimeOffset?)value.ObservedAt)
+                .DefaultIfEmpty()
+                .Max();
+        }
+        return new(fact, state, newEvents, candidates, lastEventAt);
+    }
+
+    private static IReadOnlyList<NotificationDelivery> FindEpisodeDeliveries(
+        NotificationRule rule,
+        string episodeId,
+        DateTimeOffset since,
+        DateTimeOffset now,
+        IReadOnlyList<NotificationDelivery> allDeliveries,
+        PresenceState expected)
+    {
+        var result = allDeliveries.Where(value => string.Equals(value.EpisodeId, episodeId, StringComparison.Ordinal)).ToList();
+        if (result.Count > 0) return result;
+        var legacy = LegacyStateEpisodeId(expected, since);
+        result = allDeliveries.Where(value => string.Equals(value.EpisodeId, legacy, StringComparison.Ordinal)).ToList();
+        if (result.Count > 0) return result;
+        return allDeliveries.Where(value => value.Status is not NotificationDeliveryStatus.Canceled && value.CreatedAt >= since && value.CreatedAt <= now && IsStateEpisode(value.EpisodeId, expected)).ToList();
+    }
+
+    private static RuleEvaluationDiagnosticStatus? DeliveryDiagnosticStatus(
+        IReadOnlyList<NotificationDelivery> deliveries,
+        IReadOnlyList<NotificationRecipientTarget> targets)
+    {
+        if (deliveries.Any(value => value.Status == NotificationDeliveryStatus.Failed)) return RuleEvaluationDiagnosticStatus.DeliveryFailed;
+        if (deliveries.Any(value => value.Status == NotificationDeliveryStatus.Pending)) return RuleEvaluationDiagnosticStatus.PendingDelivery;
+        if (targets.Count > 0 && targets.All(target => deliveries.Any(value => value.Status == NotificationDeliveryStatus.Delivered && MatchesTarget(value, target))))
+            return RuleEvaluationDiagnosticStatus.AlreadyTriggeredForEpisode;
+        return null;
+    }
+
+    private static string DeliveryExplanation(RuleEvaluationDiagnosticStatus status) => status switch
+    {
+        RuleEvaluationDiagnosticStatus.DeliveryFailed => "规则条件已满足，但最近一次 QQ 投递失败，等待重试。",
+        RuleEvaluationDiagnosticStatus.PendingDelivery => "规则条件已满足，QQ 投递正在等待发送。",
+        RuleEvaluationDiagnosticStatus.AlreadyTriggeredForEpisode => "当前状态 Episode 已经触发过，等待状态变化后才会再次触发。",
+        _ => ""
+    };
+
+    private static RuleEvaluationDiagnostic Diagnostic(
+        NotificationRule rule,
+        DateTimeOffset now,
+        RuleEvaluationDiagnosticStatus status,
+        string explanation,
+        SubjectPresenceFact? fact = null,
+        DateTimeOffset? since = null,
+        TimeSpan duration = default,
+        double progress = 0,
+        DiagnosticMetadata? metadata = null,
+        IReadOnlyList<NotificationDelivery>? deliveries = null,
+        TimeSpan? remaining = null) => new(
+        rule.Id, rule.SubjectId, rule.Condition, status, now, DiagnosticTitle(status), explanation,
+        fact?.CurrentState ?? PresenceState.Unknown, since ?? fact?.StateSince, duration, remaining, progress,
+        now, metadata?.LastTriggeredAt, metadata?.LastSentAt, metadata?.LastError,
+        metadata?.LastEventAt, metadata?.Targets);
+
+    private static string DiagnosticTitle(RuleEvaluationDiagnosticStatus status) => status switch
+    {
+        RuleEvaluationDiagnosticStatus.WaitingForState => "等待状态",
+        RuleEvaluationDiagnosticStatus.AccumulatingDuration => "正在累计",
+        RuleEvaluationDiagnosticStatus.ThresholdReached => "条件已满足",
+        RuleEvaluationDiagnosticStatus.AlreadyTriggeredForEpisode => "本次 Episode 已触发",
+        RuleEvaluationDiagnosticStatus.WaitingForNewEvent => "等待新事件",
+        RuleEvaluationDiagnosticStatus.Disabled => "规则已关闭",
+        RuleEvaluationDiagnosticStatus.SubjectUnavailable => "主体不可用",
+        RuleEvaluationDiagnosticStatus.RecipientUnavailable => "接收人不可用",
+        RuleEvaluationDiagnosticStatus.PendingDelivery => "等待发送",
+        RuleEvaluationDiagnosticStatus.DeliveryFailed => "发送失败",
+        RuleEvaluationDiagnosticStatus.Delivered => "已发送",
+        _ => "未知"
+    };
+
+    private static string NotificationSettingsText(NotificationRecipientTarget target) =>
+        $"QQ {target.TargetType switch { NotificationTargetType.Group => "群聊", _ => "私聊" }} {MaskTarget(target.TargetId)}";
+
+    private static string MaskTarget(string value) => value.Length <= 6 ? value : $"{value[..3]}****{value[^3..]}";
+    private static TimeSpan NonNegative(TimeSpan value) => value < TimeSpan.Zero ? TimeSpan.Zero : value;
+    private sealed record DiagnosticMetadata(DateTimeOffset? LastEvaluationAt, DateTimeOffset? LastTriggeredAt, DateTimeOffset? LastSentAt, string? LastError, IReadOnlyList<NotificationRecipientTarget> Targets, DateTimeOffset? LastEventAt = null);
+    private sealed record ContinuousConditionEvaluation(
+        SubjectPresenceFact? Fact,
+        NotificationRuleState State,
+        IReadOnlyList<NotificationDelivery> AllDeliveries,
+        IReadOnlyList<NotificationRecipientTarget> Targets,
+        PresenceState ExpectedState,
+        bool StateMatches,
+        DateTimeOffset? StateSince,
+        string EpisodeId,
+        IReadOnlyList<NotificationDelivery> EpisodeDeliveries,
+        TimeSpan Duration,
+        TimeSpan Threshold,
+        double Progress,
+        bool ThresholdReached);
+    private sealed record DetectedConditionEvaluation(
+        SubjectPresenceFact? Fact,
+        NotificationRuleState State,
+        IReadOnlyList<SubjectPresenceEvent> NewEvents,
+        IReadOnlyList<SubjectPresenceEvent> CandidateEvents,
+        DateTimeOffset? LastEventAt);
+
     public async Task<IReadOnlyList<NotificationRequest>> EvaluateAsync(DateTimeOffset now, CancellationToken cancellationToken)
     {
         await _gate.WaitAsync(cancellationToken);
@@ -60,54 +360,22 @@ public sealed class NotificationRuleService(
         DateTimeOffset now,
         CancellationToken cancellationToken)
     {
-        var fact = await presence.GetCurrentFactAsync(rule.SubjectId, now, cancellationToken);
         var state = await GetRuleStateAsync(rule, now, cancellationToken);
-        if (fact is null || fact.CurrentState != expectedState || fact.StateSince is null)
+        var evaluation = await ReadContinuousConditionAsync(rule, expectedState, now, state, cancellationToken);
+        if (!evaluation.StateMatches)
         {
             await repository.UpsertNotificationRuleStateAsync(
                 await ResetInactiveRuleStateAsync(state, now, cancellationToken), cancellationToken);
             return [];
         }
 
-        var stateSince = fact.StateSince.Value;
-        var episodeId = StateEpisodeId(expectedState, stateSince);
-        var allDeliveries = await repository.GetNotificationDeliveriesForRuleAsync(rule.Id, cancellationToken);
-        var episodeDeliveries = allDeliveries
-            .Where(value => string.Equals(value.EpisodeId, episodeId, StringComparison.Ordinal))
-            .ToList();
-        // Builds before the confirmed-subject migration used "1:<ticks>"
-        // and "2:<ticks>" as duration episode IDs. Reuse one of those rows
-        // when present so a delivered legacy reminder is not sent again after
-        // upgrade/restart.
-        if (episodeDeliveries.Count == 0)
-        {
-            var legacyEpisodeId = LegacyStateEpisodeId(expectedState, stateSince);
-            if (!string.Equals(legacyEpisodeId, episodeId, StringComparison.Ordinal))
-                episodeDeliveries = allDeliveries
-                    .Where(value => string.Equals(value.EpisodeId, legacyEpisodeId, StringComparison.Ordinal))
-                    .ToList();
-            if (episodeDeliveries.Count > 0) episodeId = episodeDeliveries[0].EpisodeId;
-        }
-        if (episodeDeliveries.Count == 0)
-        {
-            // A legacy delivery can carry the old boundary in its episode ID
-            // even when the one-time subject reconciliation corrected
-            // StateSince. Match only a delivery created inside the current
-            // confirmed state window and with the same state prefix; an
-            // earlier episode can therefore never suppress a new reminder.
-            episodeDeliveries = allDeliveries
-                .Where(value => value.Status is not NotificationDeliveryStatus.Canceled
-                    && value.CreatedAt >= stateSince && value.CreatedAt <= now
-                    && IsStateEpisode(value.EpisodeId, expectedState))
-                .OrderBy(value => value.CreatedAt)
-                .ThenBy(value => value.Id)
-                .ToList();
-            if (episodeDeliveries.Count > 0) episodeId = episodeDeliveries[0].EpisodeId;
-        }
-        var targets = await ResolveTargetsAsync(rule, cancellationToken);
-        var thresholdReached = now >= stateSince && now - stateSince >= TimeSpan.FromSeconds(rule.ThresholdSeconds);
+        var fact = evaluation.Fact!;
+        var stateSince = evaluation.StateSince!.Value;
+        var episodeId = evaluation.EpisodeId;
+        var episodeDeliveries = evaluation.EpisodeDeliveries.ToList();
+        var targets = evaluation.Targets;
         var deliveries = new List<NotificationDelivery>();
-        if (thresholdReached)
+        if (evaluation.ThresholdReached)
         {
             foreach (var target in targets)
             {
@@ -135,19 +403,17 @@ public sealed class NotificationRuleService(
         DateTimeOffset now,
         CancellationToken cancellationToken)
     {
-        var fact = await presence.GetCurrentFactAsync(rule.SubjectId, now, cancellationToken);
         var state = await GetRuleStateAsync(rule, now, cancellationToken);
+        var evaluation = await ReadDetectedConditionAsync(rule, expectedState, now, state, includeHistory: false, cancellationToken: cancellationToken);
+        var fact = evaluation.Fact;
         if (fact is null)
         {
             await repository.UpsertNotificationRuleStateAsync(state with { UpdatedAt = now }, cancellationToken);
             return [];
         }
 
-        var afterEventId = state.LastProcessedSubjectEventId ?? 0;
-        var events = (await repository.GetSubjectPresenceEventsAfterIdAsync(rule.SubjectId, afterEventId, cancellationToken))
-            .OrderBy(value => value.Id)
-            .ToArray();
-        if (events.Length == 0)
+        var events = evaluation.NewEvents;
+        if (events.Count == 0)
         {
             await repository.UpsertNotificationRuleStateAsync(
                 await ResetInactiveRuleStateAsync(state, now, cancellationToken), cancellationToken);
@@ -161,7 +427,7 @@ public sealed class NotificationRuleService(
             // initial or opposite-state events.  They are consumed history,
             // not a reason to keep scanning and replaying them forever.
             state = state with { LastProcessedSubjectEventId = detected.Id };
-            if (!EventMatches(detected, expectedState)) continue;
+            if (!evaluation.CandidateEvents.Any(value => value.Id == detected.Id)) continue;
 
             var episodeId = EventEpisodeId(detected.Id);
             var episodeDeliveries = (await repository.GetNotificationDeliveriesForEpisodeAsync(rule.Id, episodeId, cancellationToken)).ToList();
@@ -343,6 +609,13 @@ public sealed class NotificationRuleService(
         PresenceState.Online => value.EventType is SubjectPresenceEventType.ConfirmedOnline or SubjectPresenceEventType.DetectedOnlineAfterGap,
         PresenceState.Offline => value.EventType is SubjectPresenceEventType.ConfirmedOffline or SubjectPresenceEventType.DetectedOfflineAfterGap,
         _ => false
+    };
+
+    private static PresenceState PresenceStateFor(NotificationCondition condition) => condition switch
+    {
+        NotificationCondition.DetectedOnline => PresenceState.Online,
+        NotificationCondition.DetectedOffline => PresenceState.Offline,
+        _ => throw new ArgumentOutOfRangeException(nameof(condition), condition, "事件规则条件无效。")
     };
 
     private static bool IsDue(NotificationDelivery delivery, DateTimeOffset now) => delivery.NextAttemptAt is null || delivery.NextAttemptAt <= now;

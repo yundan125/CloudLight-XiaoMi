@@ -46,6 +46,21 @@ public enum NotificationConnectionState
     Stopping
 }
 
+public enum RuleEvaluationDiagnosticStatus
+{
+    WaitingForState,
+    AccumulatingDuration,
+    ThresholdReached,
+    AlreadyTriggeredForEpisode,
+    WaitingForNewEvent,
+    Disabled,
+    SubjectUnavailable,
+    RecipientUnavailable,
+    PendingDelivery,
+    DeliveryFailed,
+    Delivered
+}
+
 /// <summary>
 /// A saved QQ OpenID.  OpenIDs remain ordinary local data so they can be
 /// edited and reused; presentation code is responsible for masking them.
@@ -82,6 +97,28 @@ public sealed record Router(
     string? RoomId,
     DateTimeOffset CreatedAt,
     DateTimeOffset LastSeenAt);
+
+/// <summary>
+/// Persisted capability evidence for one router. It records what the
+/// endpoint actually returned, not a model-name based support guess.
+/// </summary>
+public sealed record RouterCapabilityDiagnostic(
+    long RouterId,
+    string RouterDid,
+    string Model,
+    bool HasPartnerId,
+    string Endpoint,
+    int? LastApiCode,
+    bool ClientListAvailable,
+    IReadOnlyList<string> SuccessfulFields,
+    DateTimeOffset? LastSuccessAt,
+    bool PresenceAvailable,
+    string? Error,
+    DateTimeOffset UpdatedAt);
+
+public sealed record RouterPresenceProbeResult(
+    IReadOnlyList<ObservedNetworkDevice> Devices,
+    RouterCapabilityDiagnostic Diagnostic);
 
 public sealed record NetworkDevice(
     long Id,
@@ -151,7 +188,8 @@ public sealed record MonitoringGap(
     long Id,
     DateTimeOffset StartedAt,
     DateTimeOffset? EndedAt,
-    string Reason);
+    string Reason,
+    long? RouterId = null);
 
 /// <summary>
 /// The aggregate state captured before a monitoring gap is first reconciled.
@@ -243,6 +281,36 @@ public sealed record NotificationRuleState(
     string? LastDeliveryError,
     DateTimeOffset UpdatedAt,
     long? LastProcessedSubjectEventId = null);
+
+/// <summary>
+/// A read-only explanation of what a saved rule would do at one point in
+/// time. It is separate from NotificationRuleState so a UI check cannot
+/// become a notification side effect.
+/// </summary>
+public sealed record RuleEvaluationDiagnostic(
+    long RuleId,
+    long SubjectId,
+    NotificationCondition Condition,
+    RuleEvaluationDiagnosticStatus Status,
+    DateTimeOffset EvaluatedAt,
+    string Title,
+    string Explanation,
+    PresenceState CurrentState = PresenceState.Unknown,
+    DateTimeOffset? StateSince = null,
+    TimeSpan CurrentDuration = default,
+    TimeSpan? RemainingDuration = null,
+    double Progress = 0,
+    DateTimeOffset? LastEvaluationAt = null,
+    DateTimeOffset? LastTriggeredAt = null,
+    DateTimeOffset? LastSentAt = null,
+    string? LastError = null,
+    DateTimeOffset? LastEventAt = null,
+    IReadOnlyList<NotificationRecipientTarget>? Targets = null)
+{
+    public bool HasProgress => Condition is NotificationCondition.OnlineFor or NotificationCondition.OfflineFor;
+    public int ProgressPercentage => (int)Math.Round(Math.Clamp(Progress, 0, 1) * 100, MidpointRounding.AwayFromZero);
+    public bool IsEventRule => Condition is NotificationCondition.DetectedOnline or NotificationCondition.DetectedOffline;
+}
 
 public sealed record NotificationDelivery(
     long Id,
@@ -352,12 +420,20 @@ public sealed record PresenceStatistics(
     public TimeSpan KnownDuration => KnownOnlineDuration + KnownOfflineDuration;
     public double Coverage => WindowDuration.TotalSeconds <= 0 ? 0 : KnownDuration.TotalSeconds / WindowDuration.TotalSeconds;
     public double OnlinePercentageOfKnownTime => KnownDuration.TotalSeconds <= 0 ? 0 : KnownOnlineDuration.TotalSeconds / KnownDuration.TotalSeconds;
+    public double OnlineRate => WindowDuration.TotalSeconds <= 0 ? 0 : KnownOnlineDuration.TotalSeconds / WindowDuration.TotalSeconds;
     public TimeSpan WindowDuration => To > From ? To - From : TimeSpan.Zero;
 }
 
-public sealed record PresenceTimelineSegment(DateTimeOffset Start, DateTimeOffset End, PresenceState State);
+public sealed record PresenceTimelineSegment(
+    DateTimeOffset Start,
+    DateTimeOffset End,
+    PresenceState State,
+    string? UnobservedReason = null);
 
-public sealed record SubjectActivityItem(DateTimeOffset OccurredAtUtc, SubjectActivityType Type);
+public sealed record SubjectActivityItem(
+    DateTimeOffset OccurredAtUtc,
+    SubjectActivityType Type,
+    string? UnobservedReason = null);
 
 public sealed record ObservedNetworkDevice(
     string MacAddress,

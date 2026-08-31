@@ -5,9 +5,11 @@ using CloudLight.Presence.Core.Presence;
 using CloudLight.Presence.Core.Models;
 using CloudLight.Presence.Core.Services;
 using CloudLight.Presence.Infrastructure.Database;
+using CloudLight.Presence.Infrastructure.Diagnostics;
 using CloudLight.Presence.Infrastructure.Notifications;
 using CloudLight.Presence.Infrastructure.SecureStorage;
 using CloudLight.Presence.Infrastructure.Settings;
+using CloudLight.Presence.Infrastructure.Updates;
 using CloudLight.Presence.Xiaomi;
 
 namespace CloudLight.Presence.App;
@@ -37,7 +39,12 @@ public partial class App : System.Windows.Application
             Shutdown(); return;
         }
         var repository = new SqlitePresenceRepository(paths); var settings = new JsonSettingsStore(paths); var startup = new StartupRegistrationService();
-        await repository.InitializeAsync(CancellationToken.None);
+        try { await repository.InitializeAsync(CancellationToken.None); }
+        catch (Exception exception)
+        {
+            CloudLightDialogs.Info(null, "数据库初始化失败", "数据库迁移已停止；如果本次启动需要迁移，原数据库和迁移前备份均已保留。\n\n" + exception.Message, warning: true);
+            Shutdown(); return;
+        }
         var runId = await repository.StartApplicationRunAsync(DateTimeOffset.UtcNow, CancellationToken.None);
         var initialSettings = await settings.LoadAsync(CancellationToken.None);
         startup.Apply(initialSettings.StartWithWindows);
@@ -70,6 +77,7 @@ public partial class App : System.Windows.Application
         }
         if (qqInitializationError is not null) qqChannel.ReportConfigurationError(qqInitializationError.Message);
         var ruleService = new NotificationRuleService(repository, subjectPresence, notificationDiagnostics);
+        var updateService = new GitHubReleaseUpdateService(currentVersion: typeof(App).Assembly.GetName().Version?.ToString(3));
         var dispatcher = new NotificationDispatcher(repository, [qqChannel], notificationDiagnostics);
         var notificationRuntime = new NotificationRuntime(monitor, ruleService, dispatcher, notificationDiagnostics);
         var connectionAlerts = new XiaomiConnectionAlertService(monitor, repository, dispatcher, async token =>
@@ -83,14 +91,18 @@ public partial class App : System.Windows.Application
                     defaultTargets.Add(new(recipient.Id, recipient.TargetType, recipient.OpenId, recipient.DisplayName));
             return new ConnectionAlertConfiguration(alerts, qq.DefaultTargetType, qq.DefaultTargetId, defaultTargets);
         }, diagnostics: notificationDiagnostics);
-        var notificationSettings = new NotificationSettingsViewModel(repository, settings, qqSecretStore, qqChannel);
+        var notificationSettings = new NotificationSettingsViewModel(repository, settings, qqSecretStore, qqChannel, ruleService);
+        notificationRuntime.EvaluationCompleted += (_, _) => _ = notificationSettings.RefreshRuleDiagnosticsAsync(CancellationToken.None);
         var viewModel = new MainViewModel(repository, subjectPresence, source, monitor, settings, notificationSettings, source);
-        var window = new MainWindow(viewModel, repository, subjectPresence, monitor, new PresenceDataTransferService(paths), startup, paths, runId, notificationRuntime, connectionAlerts, qqChannel, dispatcher); MainWindow = window;
+        var databaseBackup = new SqliteDatabaseBackupService(paths);
+        var diagnosticsExport = new DiagnosticsExportService(paths, repository, monitor, notificationRuntime, qqChannel, settings, databaseBackup, typeof(App).Assembly);
+        var window = new MainWindow(viewModel, repository, subjectPresence, monitor, new PresenceDataTransferService(paths), startup, paths, runId, notificationRuntime, connectionAlerts, qqChannel, dispatcher, updateService, diagnosticsExport); MainWindow = window;
         var startupLaunch = e.Args.Any(value => string.Equals(value, "--startup", StringComparison.OrdinalIgnoreCase));
-        if (!startupLaunch) window.Show();
+        if (!startupLaunch || !initialSettings.StartMinimized) window.Show();
         await notificationRuntime.StartAsync(CancellationToken.None);
         if (qqSettings is { Enabled: true, AutoConnect: true } && qqChannel.Status.Configured) await qqChannel.StartAsync(CancellationToken.None);
         await viewModel.InitializeAsync(CancellationToken.None);
+        _ = CheckUpdatesDailyAsync(updateService, settings);
     }
 
     protected override void OnExit(ExitEventArgs e)
@@ -99,5 +111,20 @@ public partial class App : System.Windows.Application
         _singleInstanceMutex?.Dispose();
         _singleInstanceMutex = null;
         base.OnExit(e);
+    }
+
+    private static async Task CheckUpdatesDailyAsync(GitHubReleaseUpdateService updater, JsonSettingsStore settings)
+    {
+        try
+        {
+            var current = await settings.LoadAsync(CancellationToken.None);
+            if (current.LastUpdateCheckAt is { } last && last > DateTimeOffset.UtcNow.AddDays(-1)) return;
+            var result = await updater.CheckAsync(CancellationToken.None);
+            await settings.SaveAsync(current with { LastUpdateCheckAt = result.CheckedAt }, CancellationToken.None);
+        }
+        catch
+        {
+            // Update availability must never affect Presence startup or runtime.
+        }
     }
 }

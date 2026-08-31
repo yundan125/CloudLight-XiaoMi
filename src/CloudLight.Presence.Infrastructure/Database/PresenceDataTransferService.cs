@@ -31,8 +31,8 @@ public sealed class PresenceDataTransferService(IAppDataPaths paths)
             model.Events.Add(new ExportEvent(reader.GetString(0), reader.GetString(1), reader.GetInt32(2), Time(reader, 3), reader.GetInt32(4))), cancellationToken);
         await ReadAsync(connection, "SELECT r.MiotDid,d.MacAddress,s.StartedAt,s.EndedAt,s.StartKnown,s.EndKnown FROM PresenceSession s JOIN NetworkDevice d ON d.Id=s.DeviceId JOIN Router r ON r.Id=d.RouterId", reader =>
             model.Sessions.Add(new ExportSession(reader.GetString(0), reader.GetString(1), Time(reader, 2), NullableTime(reader, 3), reader.GetInt32(4) != 0, reader.GetInt32(5) != 0)), cancellationToken);
-        await ReadAsync(connection, "SELECT StartedAt,EndedAt,Reason FROM MonitoringGap", reader =>
-            model.MonitoringGaps.Add(new ExportGap(Time(reader, 0), NullableTime(reader, 1), reader.GetString(2))), cancellationToken);
+        await ReadAsync(connection, "SELECT g.StartedAt,g.EndedAt,g.Reason,r.MiotDid FROM MonitoringGap g LEFT JOIN Router r ON r.Id=g.RouterId", reader =>
+            model.MonitoringGaps.Add(new ExportGap(Time(reader, 0), NullableTime(reader, 1), reader.GetString(2), Text(reader, 3))), cancellationToken);
         await ReadAsync(connection, "SELECT ExportId,DisplayName,Note,CreatedAt,UpdatedAt FROM PresenceSubject", reader =>
             model.Subjects!.Add(new ExportSubject(Guid.Parse(reader.GetString(0)), reader.GetString(1), Text(reader, 2), Time(reader, 3), Time(reader, 4))), cancellationToken);
         await ReadAsync(connection, "SELECT s.ExportId,r.MiotDid,d.MacAddress,m.CreatedAt FROM SubjectDeviceMembership m JOIN PresenceSubject s ON s.Id=m.SubjectId JOIN NetworkDevice d ON d.Id=m.NetworkDeviceId JOIN Router r ON r.Id=d.RouterId", reader =>
@@ -49,8 +49,8 @@ public sealed class PresenceDataTransferService(IAppDataPaths paths)
         }, cancellationToken);
         await ReadAsync(connection, "SELECT r.Id,s.ExportId,r.Enabled,r.RuleCondition,r.ThresholdSeconds,r.Channel,r.TargetType,r.TargetId,r.MessageTemplate,r.CreatedAt,r.UpdatedAt FROM NotificationRule r JOIN PresenceSubject s ON s.Id=r.SubjectId", reader =>
             model.NotificationRules!.Add(new ExportNotificationRule(Guid.Parse(reader.GetString(1)), reader.GetInt32(2) != 0, reader.GetInt32(3), reader.GetInt64(4), reader.GetInt32(5), reader.GetInt32(6), reader.GetString(7), reader.GetString(8), Time(reader, 9), Time(reader, 10), reader.GetInt64(0), ruleTargets.GetValueOrDefault(reader.GetInt64(0)))), cancellationToken);
-        await ReadAsync(connection, "SELECT s.ExportId,e.EventType,e.ObservedAt,g.StartedAt,g.Reason,e.StateSince FROM SubjectPresenceEvent e JOIN PresenceSubject s ON s.Id=e.SubjectId LEFT JOIN MonitoringGap g ON g.Id=e.MonitoringGapId", reader =>
-            model.SubjectPresenceEvents!.Add(new ExportSubjectPresenceEvent(Guid.Parse(reader.GetString(0)), reader.GetInt32(1), Time(reader, 2), NullableTime(reader, 3), Text(reader, 4), NullableTime(reader, 5))), cancellationToken);
+        await ReadAsync(connection, "SELECT s.ExportId,e.EventType,e.ObservedAt,g.StartedAt,g.Reason,e.StateSince,r.MiotDid FROM SubjectPresenceEvent e JOIN PresenceSubject s ON s.Id=e.SubjectId LEFT JOIN MonitoringGap g ON g.Id=e.MonitoringGapId LEFT JOIN Router r ON r.Id=g.RouterId", reader =>
+            model.SubjectPresenceEvents!.Add(new ExportSubjectPresenceEvent(Guid.Parse(reader.GetString(0)), reader.GetInt32(1), Time(reader, 2), NullableTime(reader, 3), Text(reader, 4), NullableTime(reader, 5), Text(reader, 6))), cancellationToken);
         await transaction.CommitAsync(cancellationToken);
 
         var temporary = targetPath + ".new";
@@ -114,11 +114,12 @@ public sealed class PresenceDataTransferService(IAppDataPaths paths)
         }
         foreach (var value in document.MonitoringGaps)
         {
-            var changed = await InsertOrIgnoreAsync(connection, "INSERT OR IGNORE INTO MonitoringGap(StartedAt,EndedAt,Reason) VALUES($start,$end,$reason)", [("$start", Iso(value.StartedAt)), ("$end", value.EndedAt is null ? null : Iso(value.EndedAt.Value)), ("$reason", value.Reason)], cancellationToken);
+            var routerId = ResolveRouterId(routers, value.RouterMiotDid);
+            var changed = await InsertOrIgnoreAsync(connection, "INSERT OR IGNORE INTO MonitoringGap(StartedAt,EndedAt,Reason,RouterId) VALUES($start,$end,$reason,$router)", [("$start", Iso(value.StartedAt)), ("$end", value.EndedAt is null ? null : Iso(value.EndedAt.Value)), ("$reason", value.Reason), ("$router", routerId)], cancellationToken);
             if (changed == 0)
             {
-                await ExecuteAsync(connection, "UPDATE MonitoringGap SET EndedAt=CASE WHEN EndedAt IS NULL THEN $end WHEN $end IS NULL THEN EndedAt WHEN EndedAt < $end THEN $end ELSE EndedAt END WHERE StartedAt=$start AND Reason=$reason",
-                    [("$start", Iso(value.StartedAt)), ("$end", value.EndedAt is null ? null : Iso(value.EndedAt.Value)), ("$reason", value.Reason)], cancellationToken);
+                await ExecuteAsync(connection, "UPDATE MonitoringGap SET EndedAt=CASE WHEN EndedAt IS NULL THEN $end WHEN $end IS NULL THEN EndedAt WHEN EndedAt < $end THEN $end ELSE EndedAt END WHERE StartedAt=$start AND Reason=$reason AND ((RouterId=$router) OR ($router IS NULL AND RouterId IS NULL))",
+                    [("$start", Iso(value.StartedAt)), ("$end", value.EndedAt is null ? null : Iso(value.EndedAt.Value)), ("$reason", value.Reason), ("$router", routerId)], cancellationToken);
                 skipped++;
             }
         }
@@ -149,9 +150,10 @@ public sealed class PresenceDataTransferService(IAppDataPaths paths)
             long? gapId = null;
             if (value.MonitoringGapStartedAt is { } gapStartedAt && !string.IsNullOrWhiteSpace(value.MonitoringGapReason))
             {
+                var gapRouterId = ResolveRouterId(routers, value.MonitoringGapRouterMiotDid);
                 var resolvedGapId = await ScalarLongAsync(connection,
-                    "SELECT Id FROM MonitoringGap WHERE StartedAt=$start AND Reason=$reason LIMIT 1",
-                    [("$start", Iso(gapStartedAt)), ("$reason", value.MonitoringGapReason)], cancellationToken);
+                    "SELECT Id FROM MonitoringGap WHERE StartedAt=$start AND Reason=$reason AND ((RouterId=$router) OR ($router IS NULL AND RouterId IS NULL)) LIMIT 1",
+                    [("$start", Iso(gapStartedAt)), ("$reason", value.MonitoringGapReason), ("$router", gapRouterId)], cancellationToken);
                 if (resolvedGapId == 0)
                 {
                     skipped++;
@@ -214,6 +216,7 @@ public sealed class PresenceDataTransferService(IAppDataPaths paths)
         if (document.Manifest.Format != Format || document.Manifest.Version is < 1 or > 2 || document.Manifest.ContainsAuthentication) throw new InvalidDataException("不支持或不安全的 CloudLight XiaoMi 备份格式。 ");
         if (document.Routers.Any(value => string.IsNullOrWhiteSpace(value.MiotDid) || string.IsNullOrWhiteSpace(value.PartnerId))) throw new InvalidDataException("路由器数据不完整。 ");
         var routerIds = document.Routers.Select(value => value.MiotDid).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (document.MonitoringGaps.Any(value => !string.IsNullOrWhiteSpace(value.RouterMiotDid) && !routerIds.Contains(value.RouterMiotDid))) throw new InvalidDataException("监控 Gap 引用了不存在的路由器。 ");
         if (document.Devices.Any(value => !routerIds.Contains(value.RouterMiotDid))) throw new InvalidDataException("设备引用了不存在的路由器。 ");
         var deviceKeys = document.Devices.Select(value => Key(value.RouterMiotDid, PresenceStateMachine.NormalizeMac(value.MacAddress))).ToHashSet(StringComparer.OrdinalIgnoreCase);
         if (document.Events.Any(value => !deviceKeys.Contains(Key(value.RouterMiotDid, PresenceStateMachine.NormalizeMac(value.MacAddress)))) || document.Sessions.Any(value => !deviceKeys.Contains(Key(value.RouterMiotDid, PresenceStateMachine.NormalizeMac(value.MacAddress))))) throw new InvalidDataException("历史记录引用了不存在的设备。 ");
@@ -236,6 +239,13 @@ public sealed class PresenceDataTransferService(IAppDataPaths paths)
     }
 
     private static List<(string, object?)> DeviceParameters(ExportDevice value, long routerId, string mac) => [("$router", routerId), ("$mac", mac), ("$original", value.OriginalName), ("$origin", value.OriginName), ("$custom", value.CustomName), ("$note", value.Note), ("$ip", value.LastIp), ("$connection", value.ConnectionType), ("$signal", value.Signal), ("$state", value.CurrentState), ("$first", Iso(value.FirstSeenAt)), ("$last", Iso(value.LastSeenAt)), ("$changed", value.LastStateChangedAt is null ? null : Iso(value.LastStateChangedAt.Value)), ("$historical", value.LastKnownHistoricalState ?? value.CurrentState)];
+    private static long? ResolveRouterId(IReadOnlyDictionary<string, long> routers, string? routerMiotDid)
+    {
+        if (string.IsNullOrWhiteSpace(routerMiotDid)) return null;
+        if (routers.TryGetValue(routerMiotDid, out var routerId)) return routerId;
+        throw new InvalidDataException($"监控 Gap 引用了不存在的路由器：{routerMiotDid}。 ");
+    }
+
     private static async Task<DeviceRuntime> ReadDeviceRuntimeAsync(SqliteConnection connection, long id, CancellationToken cancellationToken)
     {
         await using var command = Command(connection, "SELECT CurrentState,FirstSeenAt,LastSeenAt,LastStateChangedAt,LastKnownHistoricalState FROM NetworkDevice WHERE Id=$id", [("$id", id)]);
@@ -284,12 +294,12 @@ public sealed class PresenceDataTransferService(IAppDataPaths paths)
     public sealed record ExportDevice(string RouterMiotDid, string MacAddress, string? OriginalName, string? OriginName, string? CustomName, string? Note, string? LastIp, string? ConnectionType, int? Signal, int CurrentState, DateTimeOffset FirstSeenAt, DateTimeOffset LastSeenAt, DateTimeOffset? LastStateChangedAt, int? LastKnownHistoricalState = null);
     public sealed record ExportEvent(string RouterMiotDid, string MacAddress, int EventType, DateTimeOffset ObservedAt, int Source);
     public sealed record ExportSession(string RouterMiotDid, string MacAddress, DateTimeOffset StartedAt, DateTimeOffset? EndedAt, bool StartKnown, bool EndKnown);
-    public sealed record ExportGap(DateTimeOffset StartedAt, DateTimeOffset? EndedAt, string Reason);
+    public sealed record ExportGap(DateTimeOffset StartedAt, DateTimeOffset? EndedAt, string Reason, string? RouterMiotDid = null);
     public sealed record ExportSubject(Guid ExportId, string DisplayName, string? Note, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
     public sealed record ExportSubjectDeviceMembership(Guid SubjectExportId, string RouterMiotDid, string MacAddress, DateTimeOffset CreatedAt);
     public sealed record ExportNotificationRule(Guid SubjectExportId, bool Enabled, int Condition, long ThresholdSeconds, int Channel, int TargetType, string TargetId, string? MessageTemplate, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, long SourceRuleId = 0, List<ExportNotificationRecipientTarget>? Recipients = null);
     public sealed record ExportNotificationRecipient(string Note, string OpenId, int TargetType, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
     public sealed record ExportNotificationRecipientTarget(int TargetType, string TargetId);
-    public sealed record ExportSubjectPresenceEvent(Guid SubjectExportId, int EventType, DateTimeOffset ObservedAt, DateTimeOffset? MonitoringGapStartedAt, string? MonitoringGapReason, DateTimeOffset? StateSince = null);
+    public sealed record ExportSubjectPresenceEvent(Guid SubjectExportId, int EventType, DateTimeOffset ObservedAt, DateTimeOffset? MonitoringGapStartedAt, string? MonitoringGapReason, DateTimeOffset? StateSince = null, string? MonitoringGapRouterMiotDid = null);
     public sealed record ExportSubjectCurrentState(Guid SubjectExportId, int CurrentState, DateTimeOffset StateSince, DateTimeOffset LastObservedAt, DateTimeOffset? PendingOfflineSince = null);
 }
