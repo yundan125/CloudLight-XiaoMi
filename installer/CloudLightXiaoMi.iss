@@ -1,7 +1,7 @@
 #define AppName "CloudLight XiaoMi"
-#define AppVersion "2.1.1"
+#define AppVersion "2.1.2"
 #define AppExeName "CloudLight.XiaoMi.exe"
-#define PublishDir "..\artifacts\release\2.1.1"
+#define PublishDir "..\artifacts\release\2.1.2"
 
 [Setup]
 AppId={{8E701BE1-0F30-4C52-89FA-AB72D2E5E126}
@@ -15,7 +15,7 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\artifacts
-OutputBaseFilename=CloudLight-XiaoMi-Setup-2.1.1
+OutputBaseFilename=CloudLight-XiaoMi-Setup-2.1.2
 SetupIconFile=..\src\CloudLight.Presence.App\Assets\CloudLightPresence.ico
 UninstallDisplayIcon={app}\{#AppExeName}
 Compression=lzma2/ultra64
@@ -23,8 +23,8 @@ SolidCompression=yes
 WizardStyle=modern
 CloseApplications=yes
 RestartApplications=no
-VersionInfoVersion=2.1.1.0
-VersionInfoProductVersion=2.1.1.0
+VersionInfoVersion=2.1.2.0
+VersionInfoProductVersion=2.1.2.0
 VersionInfoProductName={#AppName}
 VersionInfoDescription={#AppName} installer
 

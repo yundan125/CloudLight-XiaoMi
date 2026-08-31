@@ -1,4 +1,4 @@
-# CloudLight XiaoMi 2.1.1
+# CloudLight XiaoMi 2.1.2
 
 CloudLight XiaoMi is a Windows desktop application that records the observed
 online/offline presence of devices connected to a Xiaomi router owned by the signed-in
@@ -17,7 +17,7 @@ DPAPI for authentication storage, and SQLite for local history.
 
 For compatibility with existing 1.0.0 data, user data stays under the legacy storage
 path `%USERPROFILE%\Documents\CloudLight\CloudLight XiaoMi` (resolved through the actual Windows Documents known folder). Existing data from `%LocalAppData%\CloudLight Presence` is copied and verified automatically on first launch; the old directory is retained and is not removed by the
-installer or uninstaller. The 2.1.1 installer contains a private Python 3.14 runtime and
+installer or uninstaller. The 2.1.2 installer contains a private Python 3.14 runtime and
 MiForge/migate 1.1.10; it does not install or modify system Python.
 
 ## Build
@@ -27,10 +27,10 @@ dotnet build -c Release
 dotnet test -c Release
 dotnet publish .\src\CloudLight.Presence.App\CloudLight.Presence.App.csproj `
   -c Release -r win-x64 --self-contained true `
-  -o .\artifacts\release\2.1.1
+  -o .\artifacts\release\2.1.2
 
 .\installer\Prepare-MigateRuntime.ps1 `
-  -PublishDirectory .\artifacts\release\2.1.1
+  -PublishDirectory .\artifacts\release\2.1.2
 
 # Use the ISCC.exe path from the local Inno Setup 6 installation.
 & '<path-to-Inno-Setup-6>\ISCC.exe' `
@@ -38,7 +38,7 @@ dotnet publish .\src\CloudLight.Presence.App\CloudLight.Presence.App.csproj `
 ```
 
 The generated installer is
-`artifacts\CloudLight-XiaoMi-Setup-2.1.1.exe`.
+`artifacts\CloudLight-XiaoMi-Setup-2.1.2.exe`.
 
 The desktop application must be started through `CloudLight.XiaoMi.exe` (the WPF
 `WinExe` apphost). Do not launch the GUI with `dotnet CloudLight.XiaoMi.dll`;
