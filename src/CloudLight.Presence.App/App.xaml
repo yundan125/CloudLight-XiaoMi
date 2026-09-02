@@ -28,6 +28,7 @@
     <SolidColorBrush x:Key="DangerSoftBrush" Color="#FEF0EF"/>
     <SolidColorBrush x:Key="DangerBorderBrush" Color="#F6C8C3"/>
     <SolidColorBrush x:Key="SidebarBorderBrush" Color="#E0E6F0"/>
+    <SolidColorBrush x:Key="SidebarHoverBrush" Color="#F4F7FD"/>
     <SolidColorBrush x:Key="DividerBrush" Color="#DCE3ED"/>
 
     <FontFamily x:Key="AppFontFamily">Microsoft YaHei UI</FontFamily>
@@ -111,7 +112,8 @@
       </Style.Triggers>
     </Style>
     <Style x:Key="SidebarButtonStyle" TargetType="Button" BasedOn="{StaticResource ButtonStyle}">
-      <Setter Property="HorizontalContentAlignment" Value="Left"/>
+      <Setter Property="HorizontalAlignment" Value="Stretch"/>
+      <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
       <Setter Property="Padding" Value="13,10"/>
       <Setter Property="Margin" Value="0,2,0,2"/>
       <Setter Property="Foreground" Value="#334155"/>
@@ -131,31 +133,42 @@
                     Padding="{TemplateBinding Padding}">
               <Grid>
                 <Grid.ColumnDefinitions><ColumnDefinition Width="3"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-                <Border x:Name="ActiveIndicator" Background="{DynamicResource AccentBrush}" CornerRadius="2" Visibility="Collapsed"/>
+                  <Border x:Name="ActiveIndicator"
+                          Background="{DynamicResource AccentBrush}"
+                          CornerRadius="2"
+                          Visibility="{Binding Tag, RelativeSource={RelativeSource TemplatedParent}, Converter={StaticResource BooleanToVisibility}}"/>
                 <ContentPresenter Grid.Column="1"
                                   HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
                                   VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
                                   RecognizesAccessKey="True"/>
+                <Border x:Name="FocusVisual"
+                        Grid.ColumnSpan="2"
+                        BorderBrush="{DynamicResource AccentBrush}"
+                        BorderThickness="1"
+                        CornerRadius="{DynamicResource ControlCornerRadius}"
+                        Visibility="Collapsed"
+                        IsHitTestVisible="False"/>
               </Grid>
             </Border>
             <ControlTemplate.Triggers>
-              <Trigger Property="IsMouseOver" Value="True">
-                <Setter TargetName="Root" Property="Background" Value="#F6F8FF"/>
-              </Trigger>
-              <DataTrigger Binding="{Binding Tag, RelativeSource={RelativeSource TemplatedParent}}" Value="True">
-                <Setter TargetName="Root" Property="Background" Value="{DynamicResource AccentSoftBrush}"/>
-                <Setter TargetName="Root" Property="BorderBrush" Value="{DynamicResource AccentSoftBrush}"/>
-                <Setter TargetName="ActiveIndicator" Property="Visibility" Value="Visible"/>
-                <Setter Property="Foreground" Value="{DynamicResource AccentBrush}"/>
-                <Setter Property="FontWeight" Value="SemiBold"/>
-              </DataTrigger>
               <Trigger Property="IsPressed" Value="True"><Setter TargetName="Root" Property="Opacity" Value="0.76"/></Trigger>
-              <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Root" Property="BorderBrush" Value="{DynamicResource AccentBrush}"/></Trigger>
+              <Trigger Property="IsKeyboardFocusWithin" Value="True"><Setter TargetName="FocusVisual" Property="Visibility" Value="Visible"/></Trigger>
               <Trigger Property="IsEnabled" Value="False"><Setter TargetName="Root" Property="Opacity" Value="0.45"/></Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
         </Setter.Value>
       </Setter>
+      <Style.Triggers>
+        <Trigger Property="IsMouseOver" Value="True">
+          <Setter Property="Background" Value="{DynamicResource SidebarHoverBrush}"/>
+        </Trigger>
+        <DataTrigger Binding="{Binding Tag, RelativeSource={RelativeSource Self}}" Value="True">
+          <Setter Property="Background" Value="{DynamicResource AccentSoftBrush}"/>
+          <Setter Property="BorderBrush" Value="{DynamicResource AccentSoftBrush}"/>
+          <Setter Property="Foreground" Value="{DynamicResource AccentBrush}"/>
+          <Setter Property="FontWeight" Value="SemiBold"/>
+        </DataTrigger>
+      </Style.Triggers>
     </Style>
     <Style x:Key="SidebarSubItemStyle" TargetType="Button" BasedOn="{StaticResource SidebarButtonStyle}">
       <Setter Property="Padding" Value="30,8,10,8"/>
@@ -165,7 +178,6 @@
     <Style x:Key="SidebarDeviceItemStyle" TargetType="Button" BasedOn="{StaticResource SidebarButtonStyle}">
       <Setter Property="Padding" Value="13,8,10,8"/>
       <Setter Property="FontSize" Value="13"/>
-      <Setter Property="BorderThickness" Value="1,0,0,0"/>
     </Style>
 
     <Style x:Key="CardStyle" TargetType="Border">
@@ -219,6 +231,26 @@
       <Setter Property="Foreground" Value="{DynamicResource MutedBrush}"/>
       <Setter Property="FontSize" Value="13"/>
       <Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
+    <Style x:Key="InfoSectionTitleStyle" TargetType="TextBlock">
+      <Setter Property="FontSize" Value="14"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}"/>
+    </Style>
+    <Style x:Key="EndpointSurfaceStyle" TargetType="Border">
+      <Setter Property="Background" Value="{DynamicResource WindowBackgroundBrush}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource ControlBorderBrush}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="{DynamicResource ControlCornerRadius}"/>
+      <Setter Property="Padding" Value="12,9"/>
+    </Style>
+    <Style x:Key="ExposedFieldBadgeStyle" TargetType="Border">
+      <Setter Property="Background" Value="{DynamicResource AccentSoftBrush}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource AccentSoftBrush}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="6"/>
+      <Setter Property="Padding" Value="8,4"/>
+      <Setter Property="Margin" Value="0,0,6,6"/>
     </Style>
     <Style x:Key="DialogTitleStyle" TargetType="TextBlock">
       <Setter Property="FontSize" Value="25"/>

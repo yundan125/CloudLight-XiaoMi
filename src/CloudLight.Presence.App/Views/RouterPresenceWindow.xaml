@@ -23,37 +23,130 @@
         <Button Content="{Binding RefreshButtonText}" Command="{Binding RefreshCommand}" Style="{DynamicResource SecondaryButtonStyle}" Padding="12,7" Margin="14,0,0,0"/>
       </WrapPanel>
 
-      <Border Style="{DynamicResource CardStyle}" Margin="0,16,0,0">
+      <Border x:Name="RouterCompatibilityCard" Style="{DynamicResource CardStyle}" Margin="0,16,0,0">
         <StackPanel>
-          <TextBlock Text="路由器兼容性" Style="{DynamicResource CardTitleStyle}"/>
-          <TextBlock Text="{Binding RouterCompatibilityText}" Foreground="{DynamicResource TextBrush}" Margin="0,8,0,0" TextWrapping="Wrap"/>
-          <Grid Margin="0,12,0,0">
-            <Grid.ColumnDefinitions><ColumnDefinition Width="130"/><ColumnDefinition Width="*"/><ColumnDefinition Width="130"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-            <Grid.RowDefinitions><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
+          <Grid>
+            <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+            <StackPanel>
+              <TextBlock x:Name="RouterCompatibilityTitle" Text="路由器兼容性" Style="{DynamicResource CardTitleStyle}"/>
+              <TextBlock x:Name="RouterCompatibilitySummaryText" Text="{Binding RouterCompatibilitySummary}" Foreground="{DynamicResource TextBrush}" Margin="0,8,0,0" TextWrapping="Wrap"/>
+              <TextBlock x:Name="RouterCompatibilityLastSuccessText" Text="{Binding LastSuccessText, StringFormat=最近成功 {0}}" Foreground="{DynamicResource MutedBrush}" Margin="0,5,0,0"/>
+            </StackPanel>
+            <Border Grid.Column="1" Margin="18,0,0,0">
+              <Border.Style>
+                <Style TargetType="Border" BasedOn="{StaticResource StatusBadgeStyle}">
+                  <Setter Property="Background" Value="{DynamicResource SuccessSoftBrush}"/>
+                  <Style.Triggers>
+                    <DataTrigger Binding="{Binding IsCompatibilityAvailable}" Value="False"><Setter Property="Background" Value="{DynamicResource WarningSoftBrush}"/></DataTrigger>
+                  </Style.Triggers>
+                </Style>
+              </Border.Style>
+              <StackPanel Orientation="Horizontal">
+                <Ellipse Width="7" Height="7" Fill="{DynamicResource SuccessBrush}" Margin="0,0,6,0" VerticalAlignment="Center"/>
+                <TextBlock Text="{Binding CompatibilityStatusText}" FontWeight="SemiBold">
+                  <TextBlock.Style>
+                    <Style TargetType="TextBlock">
+                      <Setter Property="Foreground" Value="{DynamicResource SuccessBrush}"/>
+                      <Style.Triggers>
+                        <DataTrigger Binding="{Binding IsCompatibilityAvailable}" Value="False"><Setter Property="Foreground" Value="{DynamicResource WarningBrush}"/></DataTrigger>
+                      </Style.Triggers>
+                    </Style>
+                  </TextBlock.Style>
+                </TextBlock>
+              </StackPanel>
+            </Border>
+          </Grid>
+
+          <Border Height="1" Background="{DynamicResource DividerBrush}" Margin="0,18,0,16"/>
+
+          <TextBlock Text="基础信息" Style="{DynamicResource InfoSectionTitleStyle}"/>
+          <Grid x:Name="CompatibilityBasicInfoGrid" Margin="0,10,0,0">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="96"/><ColumnDefinition Width="*"/><ColumnDefinition Width="28"/>
+              <ColumnDefinition Width="96"/><ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
             <TextBlock Text="Model" Style="{DynamicResource FieldLabelStyle}"/>
-            <TextBlock Grid.Column="1" Text="{Binding Router.MiotModel}" TextTrimming="CharacterEllipsis" ToolTip="{Binding Router.MiotModel}"/>
-            <TextBlock Grid.Column="2" Text="DID" Style="{DynamicResource FieldLabelStyle}"/>
-            <TextBlock Grid.Column="3" Text="{Binding RouterDidText}" TextTrimming="CharacterEllipsis"/>
-            <TextBlock Grid.Row="1" Text="partner_id" Style="{DynamicResource FieldLabelStyle}" Margin="0,8,0,0"/>
-            <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding PartnerIdText}" Margin="0,8,0,0" TextTrimming="CharacterEllipsis"/>
-            <TextBlock Grid.Row="1" Grid.Column="2" Text="partner_id 状态" Style="{DynamicResource FieldLabelStyle}" Margin="0,8,0,0"/>
-            <TextBlock Grid.Row="1" Grid.Column="3" Text="{Binding PartnerIdStatus}" Margin="0,8,0,0"/>
-            <TextBlock Grid.Row="2" Text="Endpoint" Style="{DynamicResource FieldLabelStyle}" Margin="0,8,0,0"/>
-            <TextBlock Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="3" Text="{Binding RouterDiagnostic.Endpoint}" Foreground="{DynamicResource MutedBrush}" Margin="0,8,0,0" TextTrimming="CharacterEllipsis" ToolTip="{Binding RouterDiagnostic.Endpoint}"/>
-            <TextBlock Grid.Row="3" Text="客户端列表" Style="{DynamicResource FieldLabelStyle}" Margin="0,8,0,0"/>
-            <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding ClientListStatus}" Margin="0,8,0,0"/>
-            <TextBlock Grid.Row="3" Grid.Column="2" Text="Presence" Style="{DynamicResource FieldLabelStyle}" Margin="0,8,0,0"/>
-            <TextBlock Grid.Row="3" Grid.Column="3" Text="{Binding PresenceStatus}" Margin="0,8,0,0"/>
+            <TextBlock Grid.Column="1" Text="{Binding Router.MiotModel}" TextTrimming="CharacterEllipsis" ToolTip="{Binding Router.MiotModel}" MinWidth="0"/>
+            <TextBlock Grid.Column="3" Text="DID" Style="{DynamicResource FieldLabelStyle}"/>
+            <TextBlock Grid.Column="4" Text="{Binding RouterDidText}" TextTrimming="CharacterEllipsis" ToolTip="{Binding RouterDidText}" MinWidth="0"/>
+            <TextBlock Grid.Row="1" Text="Router ID" Style="{DynamicResource FieldLabelStyle}" Margin="0,8,0,0"/>
+            <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Router.Id}" Margin="0,8,0,0" TextTrimming="CharacterEllipsis" MinWidth="0"/>
+            <TextBlock Grid.Row="1" Grid.Column="3" Text="路由器名称" Style="{DynamicResource FieldLabelStyle}" Margin="0,8,0,0"/>
+            <TextBlock Grid.Row="1" Grid.Column="4" Text="{Binding Router.Name}" Margin="0,8,0,0" TextTrimming="CharacterEllipsis" ToolTip="{Binding Router.Name}" MinWidth="0"/>
           </Grid>
-          <Grid Margin="0,10,0,0">
-            <Grid.ColumnDefinitions><ColumnDefinition Width="130"/><ColumnDefinition Width="*"/><ColumnDefinition Width="130"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-            <TextBlock Text="最近 API code" Style="{DynamicResource FieldLabelStyle}"/>
-            <TextBlock Grid.Column="1" Text="{Binding ApiCodeText}"/>
-            <TextBlock Grid.Column="2" Text="最近成功" Style="{DynamicResource FieldLabelStyle}"/>
-            <TextBlock Grid.Column="3" Text="{Binding LastSuccessText}"/>
-            <TextBlock Grid.Row="1" Text="成功字段" Style="{DynamicResource FieldLabelStyle}" Margin="0,8,0,0"/>
-            <TextBlock Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="3" Text="{Binding SuccessfulFieldsText}" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" Margin="0,8,0,0"/>
+
+          <Border Height="1" Background="{DynamicResource DividerBrush}" Margin="0,18,0,16"/>
+
+          <TextBlock Text="Router Cloud" Style="{DynamicResource InfoSectionTitleStyle}"/>
+          <Grid x:Name="CompatibilityCloudGrid" Margin="0,10,0,0">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="96"/><ColumnDefinition Width="*"/><ColumnDefinition Width="28"/>
+              <ColumnDefinition Width="96"/><ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Text="partner_id" Style="{DynamicResource FieldLabelStyle}"/>
+            <TextBlock Grid.Column="1" Text="{Binding PartnerIdText}" TextTrimming="CharacterEllipsis" ToolTip="{Binding PartnerIdText}" MinWidth="0"/>
+            <TextBlock Grid.Column="3" Text="partner_id 状态" Style="{DynamicResource FieldLabelStyle}"/>
+            <TextBlock Grid.Column="4" Text="{Binding PartnerIdStatus}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" MinWidth="0"/>
           </Grid>
+
+          <Border Height="1" Background="{DynamicResource DividerBrush}" Margin="0,18,0,16"/>
+
+          <TextBlock Text="能力" Style="{DynamicResource InfoSectionTitleStyle}"/>
+          <Grid x:Name="CompatibilityCapabilityGrid" Margin="0,10,0,0">
+            <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="14"/><ColumnDefinition Width="*"/><ColumnDefinition Width="14"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+            <Border Grid.Column="0" Background="{DynamicResource SuccessSoftBrush}" CornerRadius="8" Padding="10,8">
+              <StackPanel Orientation="Horizontal">
+                <Ellipse Width="7" Height="7" Fill="{DynamicResource SuccessBrush}" Margin="0,0,6,0" VerticalAlignment="Center"/>
+                <TextBlock Text="客户端列表"/>
+                <TextBlock Text="{Binding ClientListStatus}" Foreground="{DynamicResource SuccessBrush}" FontWeight="SemiBold" Margin="6,0,0,0" TextTrimming="CharacterEllipsis"/>
+              </StackPanel>
+            </Border>
+            <Border Grid.Column="2" Background="{DynamicResource SuccessSoftBrush}" CornerRadius="8" Padding="10,8">
+              <StackPanel Orientation="Horizontal">
+                <Ellipse Width="7" Height="7" Fill="{DynamicResource SuccessBrush}" Margin="0,0,6,0" VerticalAlignment="Center"/>
+                <TextBlock Text="Presence"/>
+                <TextBlock Text="{Binding PresenceStatus}" Foreground="{DynamicResource SuccessBrush}" FontWeight="SemiBold" Margin="6,0,0,0" TextTrimming="CharacterEllipsis"/>
+              </StackPanel>
+            </Border>
+            <Border Grid.Column="4" Background="{DynamicResource AccentSoftBrush}" CornerRadius="8" Padding="10,8">
+              <StackPanel Orientation="Horizontal">
+                <TextBlock Text="API Code"/>
+                <TextBlock Text="{Binding ApiCodeText}" Foreground="{DynamicResource AccentBrush}" FontWeight="SemiBold" Margin="6,0,0,0" TextTrimming="CharacterEllipsis"/>
+              </StackPanel>
+            </Border>
+          </Grid>
+
+          <Border Height="1" Background="{DynamicResource DividerBrush}" Margin="0,18,0,16"/>
+
+          <TextBlock Text="接口" Style="{DynamicResource InfoSectionTitleStyle}"/>
+          <Border x:Name="EndpointSurface" Style="{DynamicResource EndpointSurfaceStyle}" Margin="0,10,0,0" ToolTip="{Binding EndpointToolTip}">
+            <TextBlock x:Name="EndpointText" Text="{Binding EndpointDisplayText}" TextTrimming="CharacterEllipsis" Foreground="{DynamicResource TextBrush}"/>
+          </Border>
+          <TextBlock Text="完整 Endpoint 可查看详情" Style="{DynamicResource MutedTextStyle}" FontSize="12" Margin="0,6,0,0" ToolTip="{Binding EndpointToolTip}"/>
+
+          <Border Height="1" Background="{DynamicResource DividerBrush}" Margin="0,18,0,16"/>
+
+          <Grid x:Name="ExposedFieldsHeaderGrid">
+            <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+            <StackPanel>
+              <TextBlock Text="返回字段" Style="{DynamicResource InfoSectionTitleStyle}"/>
+              <TextBlock x:Name="ExposedFieldsSummaryText" Text="{Binding ExposedFieldsSummaryText}" Style="{DynamicResource MutedTextStyle}" Margin="0,5,0,0"/>
+            </StackPanel>
+            <Button x:Name="ToggleExposedFieldsButton" Grid.Column="1" Content="{Binding ExposedFieldsToggleText}" Command="{Binding ToggleExposedFieldsCommand}" Style="{DynamicResource SecondaryButtonStyle}" Padding="12,6" Margin="14,0,0,0"/>
+          </Grid>
+          <ScrollViewer x:Name="ExposedFieldsViewer" Visibility="{Binding IsExposedFieldsExpanded, Converter={StaticResource BooleanToVisibility}}" MaxHeight="132" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Margin="0,10,0,0" CanContentScroll="False">
+            <ItemsControl ItemsSource="{Binding ExposedFields}">
+              <ItemsControl.ItemsPanel><ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
+              <ItemsControl.ItemTemplate>
+                <DataTemplate>
+                  <Border Style="{DynamicResource ExposedFieldBadgeStyle}" ToolTip="{Binding}">
+                    <TextBlock Text="{Binding}" TextTrimming="CharacterEllipsis" MaxWidth="220"/>
+                  </Border>
+                </DataTemplate>
+              </ItemsControl.ItemTemplate>
+            </ItemsControl>
+          </ScrollViewer>
         </StackPanel>
       </Border>
 

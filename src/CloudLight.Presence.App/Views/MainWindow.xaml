@@ -36,14 +36,14 @@
           <Grid>
             <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
             <Button x:Name="DevicesNavButton" Content="设备" Command="{Binding ShowDeviceListCommand}" Style="{DynamicResource SidebarButtonStyle}"/>
-            <Button x:Name="ToggleDevicesButton" Grid.Column="1" Content="{Binding DevicesToggleGlyph}" Command="{Binding ToggleDevicesCommand}" Style="{DynamicResource SidebarButtonStyle}" Padding="10,8" Margin="0" ToolTip="展开或折叠设备列表"/>
+            <Button x:Name="ToggleDevicesButton" Grid.Column="1" Content="{Binding DevicesToggleGlyph}" Command="{Binding ToggleDevicesCommand}" Style="{DynamicResource SidebarButtonStyle}" Padding="10,8" Margin="0" HorizontalContentAlignment="Center" ToolTip="展开或折叠设备列表"/>
           </Grid>
           <Button x:Name="OverviewNavButton" Grid.Row="1" Content="总览" Command="{Binding ShowDeviceListCommand}" Tag="{Binding IsOverviewActive}" Style="{DynamicResource SidebarSubItemStyle}"/>
           <ScrollViewer x:Name="SidebarDeviceScrollViewer" Grid.Row="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" CanContentScroll="False">
-            <ItemsControl ItemsSource="{Binding SidebarDevices}" Visibility="{Binding IsDevicesExpanded, Converter={StaticResource BooleanToVisibility}}">
+            <ItemsControl ItemsSource="{Binding SidebarDevices}" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch" Visibility="{Binding IsDevicesExpanded, Converter={StaticResource BooleanToVisibility}}">
               <ItemsControl.ItemTemplate>
                 <DataTemplate>
-                  <Button Command="{Binding OpenCommand}" Tag="{Binding IsActive}" Style="{DynamicResource SidebarDeviceItemStyle}" ToolTip="{Binding SecondaryText}">
+                  <Button Command="{Binding OpenCommand}" Tag="{Binding IsActive}" HorizontalAlignment="Stretch" Style="{DynamicResource SidebarDeviceItemStyle}" ToolTip="{Binding SecondaryText}">
                     <StackPanel>
                       <StackPanel Orientation="Horizontal">
                         <Ellipse Width="7" Height="7" Fill="{DynamicResource SubtleBrush}" Margin="1,0,9,0" VerticalAlignment="Center"/>

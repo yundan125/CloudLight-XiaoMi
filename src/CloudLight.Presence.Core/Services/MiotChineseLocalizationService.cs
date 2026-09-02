@@ -52,7 +52,9 @@ public sealed class MiotChineseLocalizationService : IMiotLocalizationService
         ["manufacturer"] = "制造商",
         ["model"] = "型号",
         ["serial-number"] = "序列号",
-        ["serial-no"] = "序列号",
+        // Some devices expose both serial-number and the legacy serial-no
+        // alias. Keep both properties visible while making the labels distinct.
+        ["serial-no"] = "设备序列号",
         ["firmware-revision"] = "固件版本",
         ["power-consumption"] = "功率",
         ["electric-power"] = "功率",
