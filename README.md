@@ -1,4 +1,4 @@
-# CloudLight XiaoMi 2.1.2
+# CloudLight XiaoMi 2.1.3
 
 CloudLight XiaoMi is a Windows desktop application that records the observed
 online/offline presence of devices connected to a Xiaomi router owned by the signed-in
@@ -12,12 +12,14 @@ DPAPI for authentication storage, and SQLite for local history.
 - 24-hour, 3-day, 7-day, and 30-day statistics and presence timelines
 - Explicit Unknown periods for monitoring gaps
 - PresenceSubject-based QQ alerts for continuous online/offline thresholds
+- QQ contacts can keep a different OpenID binding for each Bot/AppID
+- Changing the active QQ Bot never falls back to an OpenID from another Bot
 - Versioned `.clpresence` export/import without Xiaomi credentials
 - Per-user startup registration and per-user installation
 
 For compatibility with existing 1.0.0 data, user data stays under the legacy storage
 path `%USERPROFILE%\Documents\CloudLight\CloudLight XiaoMi` (resolved through the actual Windows Documents known folder). Existing data from `%LocalAppData%\CloudLight Presence` is copied and verified automatically on first launch; the old directory is retained and is not removed by the
-installer or uninstaller. The 2.1.2 installer contains a private Python 3.14 runtime and
+installer or uninstaller. The 2.1.3 installer contains a private Python 3.14 runtime and
 MiForge/migate 1.1.10; it does not install or modify system Python.
 
 ## Build
@@ -27,10 +29,10 @@ dotnet build -c Release
 dotnet test -c Release
 dotnet publish .\src\CloudLight.Presence.App\CloudLight.Presence.App.csproj `
   -c Release -r win-x64 --self-contained true `
-  -o .\artifacts\release\2.1.2
+  -o .\artifacts\release\2.1.3
 
 .\installer\Prepare-MigateRuntime.ps1 `
-  -PublishDirectory .\artifacts\release\2.1.2
+  -PublishDirectory .\artifacts\release\2.1.3
 
 # Use the ISCC.exe path from the local Inno Setup 6 installation.
 & '<path-to-Inno-Setup-6>\ISCC.exe' `
@@ -38,7 +40,15 @@ dotnet publish .\src\CloudLight.Presence.App\CloudLight.Presence.App.csproj `
 ```
 
 The generated installer is
-`artifacts\CloudLight-XiaoMi-Setup-2.1.2.exe`.
+`artifacts\CloudLight-XiaoMi-Setup-2.1.3.exe`.
+
+## QQ multi-Bot bindings
+
+Each QQ contact is a logical recipient. Its OpenID is stored in a separate
+Bot/AppID binding, so the same contact can use a different OpenID when the
+active QQ Bot changes. Rules continue to reference the logical recipient; if
+the active Bot has no binding, the rule records a binding-required diagnostic
+and does not send or reuse another Bot's OpenID.
 
 The desktop application must be started through `CloudLight.XiaoMi.exe` (the WPF
 `WinExe` apphost). Do not launch the GUI with `dotnet CloudLight.XiaoMi.dll`;

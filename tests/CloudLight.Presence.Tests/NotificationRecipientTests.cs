@@ -1,8 +1,11 @@
+using CloudLight.Presence.App.ViewModels;
 using CloudLight.Presence.Core.Interfaces;
 using CloudLight.Presence.Core.Models;
 using CloudLight.Presence.Core.Presence;
 using CloudLight.Presence.Core.Services;
 using CloudLight.Presence.Infrastructure.Database;
+using CloudLight.Presence.Infrastructure.Notifications;
+using CloudLight.Presence.Infrastructure.SecureStorage;
 using CloudLight.Presence.Infrastructure.Settings;
 using Xunit;
 
@@ -78,6 +81,89 @@ public sealed class NotificationRecipientTests
         Assert.All(final, value => Assert.Equal(NotificationDeliveryStatus.Delivered, value.Status));
         Assert.Equal(1, channel.SendCount("openid-a"));
         Assert.Equal(2, channel.SendCount("openid-b"));
+    }
+
+    [Fact]
+    public async Task TerminalRecipientFailureIsNotRetriedAndDoesNotBlockAnotherRecipient()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        var onlineAt = fixture.Start.AddMinutes(1);
+        var offlineObservedAt = onlineAt.AddMinutes(2);
+        await fixture.ApplyAsync(onlineAt, true);
+        await fixture.ApplyAsync(offlineObservedAt, false);
+        await fixture.ApplyAsync(offlineObservedAt + SubjectPresenceService.DefaultOfflineGracePeriod, false);
+
+        var first = await fixture.Repository.CreateNotificationRecipientAsync(Recipient("我的 QQ", "openid-a", NotificationTargetType.Private), CancellationToken.None);
+        var second = await fixture.Repository.CreateNotificationRecipientAsync(Recipient("家庭群", "openid-b", NotificationTargetType.Group), CancellationToken.None);
+        await fixture.Repository.CreateNotificationRuleAsync(
+            new NotificationRule(0, fixture.Subject.Id, true, NotificationCondition.OfflineFor, 60, NotificationChannelType.QQ,
+                first.TargetType, first.OpenId, "{name}", fixture.Start, fixture.Start)
+            {
+                RecipientIds = [first.Id, second.Id]
+            },
+            CancellationToken.None);
+
+        var service = new NotificationRuleService(fixture.Repository, fixture.Presence);
+        var requests = await service.EvaluateAsync(offlineObservedAt.AddMinutes(2), CancellationToken.None);
+        var channel = new SelectiveChannel("openid-b") { TerminalFailure = true };
+        using var dispatcher = new NotificationDispatcher(fixture.Repository, [channel]);
+        foreach (var request in requests) await dispatcher.DispatchAsync(request, CancellationToken.None);
+
+        var deliveries = await fixture.Repository.GetRecentNotificationDeliveriesAsync(10, CancellationToken.None);
+        Assert.Equal(NotificationDeliveryStatus.Delivered, Assert.Single(deliveries, value => value.TargetId == "openid-a").Status);
+        var failed = Assert.Single(deliveries, value => value.TargetId == "openid-b");
+        Assert.Equal(NotificationDeliveryStatus.PermanentFailed, failed.Status);
+        Assert.Null(failed.NextAttemptAt);
+        Assert.Empty(await fixture.Repository.GetPendingNotificationDeliveriesAsync(DateTimeOffset.UtcNow.AddHours(1), CancellationToken.None));
+        var state = await fixture.Repository.GetNotificationRuleStateAsync(requests[0].RuleId, CancellationToken.None);
+        Assert.NotNull(state);
+        Assert.False(state!.PendingDelivery);
+        Assert.Null(state.PendingDeliveryId);
+        Assert.Contains("模拟接收人失败", state.LastDeliveryError, StringComparison.Ordinal);
+
+        await dispatcher.RetryPendingAsync(DateTimeOffset.UtcNow.AddHours(1), CancellationToken.None);
+        Assert.Equal(1, channel.SendCount("openid-b"));
+    }
+
+    [Fact]
+    public async Task EditingNoteWithMaskedOpenIdKeepsTheStoredRawOpenId()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "CloudLight-Recipient-Edit-Tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var paths = new AppPaths(root);
+            var repository = new SqlitePresenceRepository(paths);
+            await repository.InitializeAsync(CancellationToken.None);
+            var rawOpenId = "C47xxxxxxxxxxxxxxxxxxxxxxxxFD8";
+            var created = await repository.CreateNotificationRecipientAsync(Recipient("旧备注", rawOpenId, NotificationTargetType.Private), CancellationToken.None);
+            await using var channel = new QQNotificationChannel(paths.LogsDirectory);
+            using var viewModel = new NotificationSettingsViewModel(repository, new JsonSettingsStore(paths), new DpapiQqSecretStore(paths), channel);
+            await viewModel.LoadAsync(CancellationToken.None);
+
+            await viewModel.SaveRecipientAsync(
+                new NotificationRecipientDraft("新备注", "C47****FD8", NotificationTargetType.Private, OpenIdEdited: false),
+                created.Id,
+                CancellationToken.None);
+
+            var updated = await repository.GetNotificationRecipientAsync(created.Id, CancellationToken.None);
+            Assert.NotNull(updated);
+            Assert.Equal("新备注", updated!.Note);
+            Assert.Equal(rawOpenId, updated.OpenId);
+            Assert.DoesNotContain('*', updated.OpenId);
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
+    public async Task MaskedOpenIdCannotBeSavedAsANewRecipient()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        await Assert.ThrowsAsync<ArgumentException>(() => fixture.Repository.CreateNotificationRecipientAsync(
+            Recipient("错误脱敏值", "C47****FD8", NotificationTargetType.Private), CancellationToken.None));
     }
 
     [Fact]
@@ -161,6 +247,7 @@ public sealed class NotificationRecipientTests
     {
         private readonly List<string> _sentTargets = [];
         public string? FailTarget { get; set; } = failTarget;
+        public bool TerminalFailure { get; set; }
         public NotificationChannelType ChannelType => NotificationChannelType.QQ;
         public NotificationChannelStatus Status => new(NotificationChannelType.QQ, true, true, true, NotificationConnectionState.Connected);
         public event EventHandler<NotificationChannelStatus>? StatusChanged = delegate { };
@@ -171,7 +258,7 @@ public sealed class NotificationRecipientTests
         {
             _sentTargets.Add(request.TargetId);
             return Task.FromResult(request.TargetId == FailTarget
-                ? new NotificationSendResult(false, 0, 0, "模拟接收人失败")
+                ? new NotificationSendResult(false, 0, 0, "模拟接收人失败", FailureKind: TerminalFailure ? NotificationFailureKind.PermanentTarget : NotificationFailureKind.Unknown)
                 : new NotificationSendResult(true, 1, 1));
         }
         public int SendCount(string target) => _sentTargets.Count(value => value == target);

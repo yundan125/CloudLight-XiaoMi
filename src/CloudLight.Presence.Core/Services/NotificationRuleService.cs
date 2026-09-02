@@ -1,4 +1,5 @@
 using System.Text;
+using System.Security.Cryptography;
 using CloudLight.Presence.Core.Interfaces;
 using CloudLight.Presence.Core.Models;
 
@@ -7,10 +8,12 @@ namespace CloudLight.Presence.Core.Services;
 public sealed class NotificationRuleService(
     IPresenceRepository repository,
     ISubjectPresenceService presence,
-    INotificationDiagnostics? diagnostics = null) : INotificationRuleService
+    INotificationDiagnostics? diagnostics = null,
+    Func<string?>? currentBotAppIdProvider = null) : INotificationRuleService
 {
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly INotificationDiagnostics _diagnostics = diagnostics ?? NullNotificationDiagnostics.Instance;
+    private readonly Func<string?>? _currentBotAppIdProvider = currentBotAppIdProvider;
 
     public async Task<RuleEvaluationDiagnostic> EvaluateDiagnosticAsync(
         long ruleId,
@@ -49,7 +52,7 @@ public sealed class NotificationRuleService(
             .DefaultIfEmpty()
             .Max();
         var lastError = state.LastDeliveryError ?? allDeliveries
-            .Where(value => value.Status == NotificationDeliveryStatus.Failed && !string.IsNullOrWhiteSpace(value.Error))
+            .Where(value => value.Status is (NotificationDeliveryStatus.Failed or NotificationDeliveryStatus.PermanentFailed) && !string.IsNullOrWhiteSpace(value.Error))
             .OrderByDescending(value => value.CreatedAt)
             .Select(value => value.Error)
             .FirstOrDefault();
@@ -58,10 +61,23 @@ public sealed class NotificationRuleService(
             state.TriggeredAt ?? (lastDeliveryAt == default ? null : lastDeliveryAt),
             lastSentAt == default ? null : lastSentAt,
             lastError,
-            targets);
+            DisplayTargets(targets));
 
         if (!rule.Enabled)
             return Diagnostic(rule, now, RuleEvaluationDiagnosticStatus.Disabled, "规则已关闭。", metadata: metadata);
+        if (targets.Any(value => value.BindingMissing))
+        {
+            var missingNames = targets.Where(value => value.BindingMissing)
+                .Select(value => value.DisplayName)
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            var missingText = missingNames.Length == 0
+                ? "接收人尚未绑定当前 QQ Bot"
+                : $"接收人“{string.Join("”、“", missingNames)}”尚未绑定当前 QQ Bot";
+            return Diagnostic(rule, now, RuleEvaluationDiagnosticStatus.RecipientBindingMissing,
+                $"当前规则不会发送\n{missingText}，需要重新绑定后，新 Episode 才会发送。", metadata: metadata);
+        }
         if (targets.Count == 0 || targets.Any(value => string.IsNullOrWhiteSpace(value.TargetId)))
             return Diagnostic(rule, now, RuleEvaluationDiagnosticStatus.RecipientUnavailable, "没有可用的 QQ 接收人，规则不会触发。", metadata: metadata);
 
@@ -101,7 +117,7 @@ public sealed class NotificationRuleService(
         var deliveries = evaluation.EpisodeDeliveries;
         var status = DeliveryDiagnosticStatus(deliveries, targets);
         if (status is not null)
-            return Diagnostic(rule, now, status.Value, DeliveryExplanation(status.Value), fact, since, duration, progress, metadata, deliveries);
+            return Diagnostic(rule, now, status.Value, DeliveryExplanation(status.Value, deliveries), fact, since, duration, progress, metadata, deliveries);
         if (evaluation.ThresholdReached)
             return Diagnostic(rule, now, RuleEvaluationDiagnosticStatus.ThresholdReached,
                 $"当前条件已满足。\n{fact.Subject.DisplayName} 当前{PresenceDurationFormatter.StateText(expected)} {NotificationTemplateRenderer.FormatDuration(duration)}，已达到 {NotificationTemplateRenderer.FormatDuration(threshold)} 阈值。",
@@ -140,7 +156,7 @@ public sealed class NotificationRuleService(
         var deliveries = allDeliveries.Where(value => string.Equals(value.EpisodeId, episodeId, StringComparison.Ordinal)).ToArray();
         var deliveryStatus = DeliveryDiagnosticStatus(deliveries, targets);
         if (deliveryStatus is not null)
-            return Diagnostic(rule, now, deliveryStatus.Value, DeliveryExplanation(deliveryStatus.Value), fact, detected.EffectiveAt, NonNegative(now - detected.EffectiveAt), 1, metadata, deliveries);
+            return Diagnostic(rule, now, deliveryStatus.Value, DeliveryExplanation(deliveryStatus.Value, deliveries), fact, detected.EffectiveAt, NonNegative(now - detected.EffectiveAt), 1, metadata, deliveries);
         if (fact.CurrentState != expected)
             return Diagnostic(rule, now, RuleEvaluationDiagnosticStatus.WaitingForState,
                 $"检测到新的事件，但主体当前已处于{PresenceDurationFormatter.StateText(fact.CurrentState)}，等待状态重新确认。",
@@ -237,15 +253,19 @@ public sealed class NotificationRuleService(
         IReadOnlyList<NotificationDelivery> deliveries,
         IReadOnlyList<NotificationRecipientTarget> targets)
     {
-        if (deliveries.Any(value => value.Status == NotificationDeliveryStatus.Failed)) return RuleEvaluationDiagnosticStatus.DeliveryFailed;
+        if (deliveries.Any(value => value.Status == NotificationDeliveryStatus.BindingRequired)) return RuleEvaluationDiagnosticStatus.RecipientBindingMissing;
+        if (deliveries.Any(value => value.Status is NotificationDeliveryStatus.Failed or NotificationDeliveryStatus.PermanentFailed)) return RuleEvaluationDiagnosticStatus.DeliveryFailed;
         if (deliveries.Any(value => value.Status == NotificationDeliveryStatus.Pending)) return RuleEvaluationDiagnosticStatus.PendingDelivery;
         if (targets.Count > 0 && targets.All(target => deliveries.Any(value => value.Status == NotificationDeliveryStatus.Delivered && MatchesTarget(value, target))))
             return RuleEvaluationDiagnosticStatus.AlreadyTriggeredForEpisode;
         return null;
     }
 
-    private static string DeliveryExplanation(RuleEvaluationDiagnosticStatus status) => status switch
+    private static string DeliveryExplanation(RuleEvaluationDiagnosticStatus status, IReadOnlyList<NotificationDelivery> deliveries) => status switch
     {
+        RuleEvaluationDiagnosticStatus.RecipientBindingMissing => "当前 QQ Bot 尚未绑定此联系人；该 Episode 不会自动补发，完成绑定后新的 Episode 才会发送。",
+        RuleEvaluationDiagnosticStatus.DeliveryFailed when deliveries.Any(value => value.Status == NotificationDeliveryStatus.PermanentFailed)
+            => "规则条件已满足，但 QQ API 拒绝了接收目标请求；该投递不会自动重试，请检查错误码或重新绑定接收人。",
         RuleEvaluationDiagnosticStatus.DeliveryFailed => "规则条件已满足，但最近一次 QQ 投递失败，等待重试。",
         RuleEvaluationDiagnosticStatus.PendingDelivery => "规则条件已满足，QQ 投递正在等待发送。",
         RuleEvaluationDiagnosticStatus.AlreadyTriggeredForEpisode => "当前状态 Episode 已经触发过，等待状态变化后才会再次触发。",
@@ -279,6 +299,7 @@ public sealed class NotificationRuleService(
         RuleEvaluationDiagnosticStatus.Disabled => "规则已关闭",
         RuleEvaluationDiagnosticStatus.SubjectUnavailable => "主体不可用",
         RuleEvaluationDiagnosticStatus.RecipientUnavailable => "接收人不可用",
+        RuleEvaluationDiagnosticStatus.RecipientBindingMissing => "需要重新绑定接收人",
         RuleEvaluationDiagnosticStatus.PendingDelivery => "等待发送",
         RuleEvaluationDiagnosticStatus.DeliveryFailed => "发送失败",
         RuleEvaluationDiagnosticStatus.Delivered => "已发送",
@@ -392,7 +413,7 @@ public sealed class NotificationRuleService(
 
         await repository.UpsertNotificationRuleStateAsync(ToRuleState(state, episodeId, stateSince, deliveries, now), cancellationToken);
         return deliveries
-            .Where(value => value.Status is not (NotificationDeliveryStatus.Delivered or NotificationDeliveryStatus.Canceled) && IsDue(value, now))
+            .Where(value => IsRetryableDelivery(value) && IsDue(value, now))
             .Select(ToRequest)
             .ToArray();
     }
@@ -450,7 +471,7 @@ public sealed class NotificationRuleService(
                 }
 
                 deliveries.Add(delivery);
-                if (delivery.Status is not (NotificationDeliveryStatus.Delivered or NotificationDeliveryStatus.Canceled) && IsDue(delivery, now))
+                if (IsRetryableDelivery(delivery) && IsDue(delivery, now))
                     requests.Add(ToRequest(delivery));
             }
             state = ToRuleState(state, episodeId, detected.EffectiveAt, deliveries, now);
@@ -464,20 +485,74 @@ public sealed class NotificationRuleService(
     {
         var recipients = await repository.GetNotificationRuleRecipientsAsync(rule.Id, cancellationToken);
         if (recipients.Count > 0)
-            return recipients.Select(value => new NotificationRecipientTarget(value.Id, value.TargetType, value.OpenId, value.DisplayName)).ToArray();
+            return await ResolveRecipientTargetsAsync(recipients, cancellationToken);
 
         if (rule.RecipientIds.Count > 0)
         {
             var resolved = new List<NotificationRecipientTarget>();
             foreach (var recipientId in rule.RecipientIds.Distinct())
                 if (await repository.GetNotificationRecipientAsync(recipientId, cancellationToken) is { } recipient)
-                    resolved.Add(new(recipient.Id, recipient.TargetType, recipient.OpenId, recipient.DisplayName));
+                    resolved.Add(await ResolveRecipientTargetAsync(recipient, cancellationToken));
             if (resolved.Count > 0) return resolved;
         }
+
+        // Active application configuration is authoritative. A legacy rule
+        // without a recipient relationship cannot safely borrow its old target
+        // for a different Bot/AppID.
+        if (_currentBotAppIdProvider is not null)
+            return [];
 
         // Rules created by older versions have no relationship rows. Keep
         // their original target live until the migration or the next edit.
         return [new NotificationRecipientTarget(null, rule.TargetType, rule.TargetId)];
+    }
+
+    private async Task<IReadOnlyList<NotificationRecipientTarget>> ResolveRecipientTargetsAsync(
+        IReadOnlyList<NotificationRecipient> recipients,
+        CancellationToken cancellationToken)
+    {
+        var result = new List<NotificationRecipientTarget>(recipients.Count);
+        foreach (var recipient in recipients)
+            result.Add(await ResolveRecipientTargetAsync(recipient, cancellationToken));
+        return result;
+    }
+
+    private async Task<NotificationRecipientTarget> ResolveRecipientTargetAsync(
+        NotificationRecipient recipient,
+        CancellationToken cancellationToken)
+    {
+        if (_currentBotAppIdProvider is { } provider)
+        {
+            var appId = provider()?.Trim();
+            if (string.IsNullOrWhiteSpace(appId))
+                return new(recipient.Id, recipient.TargetType, string.Empty, recipient.DisplayName, BindingMissing: true);
+
+            var profile = await repository.GetQqBotProfileByAppIdAsync(appId, cancellationToken);
+            if (profile is null)
+                return new(recipient.Id, recipient.TargetType, string.Empty, recipient.DisplayName,
+                    BotAppIdFingerprint: SafeFingerprint(appId), BindingMissing: true);
+
+            var binding = await repository.GetNotificationRecipientBotBindingAsync(recipient.Id, profile.Id, cancellationToken);
+            if (binding is null)
+                return new(recipient.Id, recipient.TargetType, string.Empty, recipient.DisplayName, profile.Id,
+                    BindingMissing: true, BotAppIdFingerprint: SafeFingerprint(profile.AppId));
+
+            return new(recipient.Id, binding.TargetType, binding.OpenId, recipient.DisplayName, profile.Id, binding.Id,
+                BotAppIdFingerprint: SafeFingerprint(profile.AppId), MaskedTargetId: MaskTarget(binding.OpenId));
+        }
+
+        // Compatibility for existing callers/tests that do not yet provide an
+        // active Bot scope. Initialized legacy contacts have an explicit
+        // LegacyUnknown binding; the direct parent value is the final fallback
+        // only for pre-binding mock/fixture data.
+        var legacyProfile = await repository.GetQqBotProfileByAppIdAsync(QqBotProfile.LegacyUnknownAppId, cancellationToken);
+        if (legacyProfile is not null && await repository.GetNotificationRecipientBotBindingAsync(recipient.Id, legacyProfile.Id, cancellationToken) is { } legacyBinding)
+            return new(recipient.Id, legacyBinding.TargetType, legacyBinding.OpenId, recipient.DisplayName, legacyProfile.Id, legacyBinding.Id,
+                BotAppIdFingerprint: "legacy-unknown", MaskedTargetId: MaskTarget(legacyBinding.OpenId));
+        if (!string.IsNullOrWhiteSpace(recipient.LegacyOpenId) && !recipient.LegacyOpenId.Contains('*', StringComparison.Ordinal))
+            return new(recipient.Id, recipient.TargetType, recipient.LegacyOpenId, recipient.DisplayName,
+                MaskedTargetId: MaskTarget(recipient.LegacyOpenId));
+        return new(recipient.Id, recipient.TargetType, string.Empty, recipient.DisplayName, BindingMissing: true);
     }
 
     private async Task<NotificationDelivery> CreateDeliveryAsync(
@@ -488,8 +563,11 @@ public sealed class NotificationRuleService(
         string message,
         CancellationToken cancellationToken) =>
         await repository.CreateNotificationDeliveryAsync(new NotificationDelivery(
-            0, rule.Id, rule.SubjectId, episodeId, now, NotificationDeliveryStatus.Pending, null,
-            rule.Channel, target.TargetType, target.TargetId, message, null, 0, 0, null, now, target.RecipientId), cancellationToken);
+            0, rule.Id, rule.SubjectId, episodeId, now,
+            target.BindingMissing ? NotificationDeliveryStatus.BindingRequired : NotificationDeliveryStatus.Pending,
+            null, rule.Channel, target.TargetType, target.TargetId, message,
+            target.BindingMissing ? "当前 QQ Bot 尚未绑定此联系人。" : null, 0, 0, null,
+            target.BindingMissing ? null : now, target.RecipientId, target.BotProfileId, target.BindingId), cancellationToken);
 
     private static bool MatchesTarget(NotificationDelivery delivery, NotificationRecipientTarget target) =>
         target.RecipientId is { } recipientId
@@ -618,6 +696,7 @@ public sealed class NotificationRuleService(
         _ => throw new ArgumentOutOfRangeException(nameof(condition), condition, "事件规则条件无效。")
     };
 
+    private static bool IsRetryableDelivery(NotificationDelivery delivery) => delivery.Status is NotificationDeliveryStatus.Pending or NotificationDeliveryStatus.Failed;
     private static bool IsDue(NotificationDelivery delivery, DateTimeOffset now) => delivery.NextAttemptAt is null || delivery.NextAttemptAt <= now;
     private static string StateEpisodeId(PresenceState state, DateTimeOffset stateSince) => $"state:{(int)state}:{stateSince.UtcTicks}";
     private static string LegacyStateEpisodeId(PresenceState state, DateTimeOffset stateSince) => $"{(int)state}:{stateSince.UtcTicks}";
@@ -635,6 +714,21 @@ public sealed class NotificationRuleService(
     private static NotificationRequest ToRequest(NotificationDelivery delivery) => new(
         delivery.Id, delivery.RuleId!.Value, delivery.SubjectId!.Value, delivery.EpisodeId, delivery.Channel,
         delivery.TargetType, delivery.TargetId, delivery.Message, delivery.CreatedAt);
+
+    private static IReadOnlyList<NotificationRecipientTarget> DisplayTargets(IReadOnlyList<NotificationRecipientTarget> targets) =>
+        targets.Select(value => value with
+        {
+            TargetId = value.BindingMissing
+                ? string.Empty
+                : value.MaskedTargetId ?? MaskTarget(value.TargetId),
+            MaskedTargetId = value.BindingMissing ? null : value.MaskedTargetId ?? MaskTarget(value.TargetId)
+        }).ToArray();
+
+    private static string SafeFingerprint(string value)
+    {
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
+        return $"len:{value.Length};sha256:{hash[..12]}";
+    }
 }
 
 public static class NotificationTemplateRenderer

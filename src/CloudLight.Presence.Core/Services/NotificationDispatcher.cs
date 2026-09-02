@@ -27,7 +27,7 @@ public sealed class NotificationDispatcher : INotificationDispatcher, IDisposabl
         try
         {
             var delivery = await _repository.GetNotificationDeliveryAsync(request.DeliveryId, cancellationToken);
-            if (delivery is null || delivery.Status == NotificationDeliveryStatus.Delivered) return;
+            if (delivery is null || delivery.Status is NotificationDeliveryStatus.Delivered or NotificationDeliveryStatus.PermanentFailed or NotificationDeliveryStatus.BindingRequired) return;
             if (delivery.RuleId is not { } ruleId) return;
             var rule = await _repository.GetNotificationRuleAsync(ruleId, cancellationToken);
             if (rule is null || !rule.Enabled)
@@ -62,7 +62,7 @@ public sealed class NotificationDispatcher : INotificationDispatcher, IDisposabl
         try
         {
             var current = await _repository.GetSystemNotificationDeliveryAsync(delivery.Id, cancellationToken);
-            if (current is null || current.Status is NotificationDeliveryStatus.Delivered or NotificationDeliveryStatus.Canceled) return;
+            if (current is null || current.Status is NotificationDeliveryStatus.Delivered or NotificationDeliveryStatus.Canceled or NotificationDeliveryStatus.PermanentFailed or NotificationDeliveryStatus.BindingRequired) return;
             if (!_channels.TryGetValue(current.Channel, out var channel))
             {
                 await RecordSystemFailureAsync(current, "没有可用的通知通道。", cancellationToken);
@@ -157,20 +157,27 @@ public sealed class NotificationDispatcher : INotificationDispatcher, IDisposabl
                 LastAttemptAt = now,
                 NextAttemptAt = null
             }, cancellationToken);
+            await UpdateBindingStatusAsync(delivery.BotProfileId, delivery.RecipientBindingId, now, null, cancellationToken);
             if (delivery.RuleId is { } ruleId) await MarkDeliveredStateAsync(ruleId, delivery with { DeliveredAt = now }, cancellationToken);
         }
         else
         {
+            var terminal = IsTerminalFailure(result.FailureKind);
             await _repository.UpdateNotificationDeliveryAsync(delivery with
             {
-                Status = NotificationDeliveryStatus.Failed,
+                Status = terminal ? NotificationDeliveryStatus.PermanentFailed : NotificationDeliveryStatus.Failed,
                 Error = SafeError(result.Error ?? "通知发送失败。"),
                 SentParts = sent,
                 TotalParts = total,
                 LastAttemptAt = now,
-                NextAttemptAt = now.Add(RetryDelay)
+                NextAttemptAt = terminal ? null : now.Add(RetryDelay)
             }, cancellationToken);
-            if (delivery.RuleId is { } ruleId) await MarkPendingStateAsync(ruleId, delivery.Id, result.Error, cancellationToken);
+            await UpdateBindingStatusAsync(delivery.BotProfileId, delivery.RecipientBindingId, now, result, cancellationToken);
+            if (delivery.RuleId is { } ruleId)
+            {
+                if (terminal) await MarkTerminalFailureStateAsync(ruleId, delivery.Id, result.Error, cancellationToken);
+                else await MarkPendingStateAsync(ruleId, delivery.Id, result.Error, cancellationToken);
+            }
             await _diagnostics.RecordAsync("dispatch_result", new InvalidOperationException(result.Error ?? "通知发送失败。"), delivery.RuleId, delivery.Id, cancellationToken);
         }
     }
@@ -179,6 +186,8 @@ public sealed class NotificationDispatcher : INotificationDispatcher, IDisposabl
     {
         var now = DateTimeOffset.UtcNow;
         await _repository.UpdateNotificationDeliveryAsync(delivery with { Status = NotificationDeliveryStatus.Failed, Error = SafeError(error), LastAttemptAt = now, NextAttemptAt = now.Add(RetryDelay) }, cancellationToken);
+        await UpdateBindingStatusAsync(delivery.BotProfileId, delivery.RecipientBindingId, now,
+            new NotificationSendResult(false, 0, delivery.TotalParts, SafeError(error)), cancellationToken);
         if (delivery.RuleId is { } ruleId) await MarkPendingStateAsync(ruleId, delivery.Id, error, cancellationToken);
         await _diagnostics.RecordAsync("dispatch_channel", new InvalidOperationException(error), delivery.RuleId, delivery.Id, cancellationToken);
     }
@@ -192,10 +201,13 @@ public sealed class NotificationDispatcher : INotificationDispatcher, IDisposabl
         {
             total = Math.Max(total, sent); sent = total;
             await _repository.UpdateSystemNotificationDeliveryAsync(delivery with { Status = NotificationDeliveryStatus.Delivered, DeliveredAt = now, Error = null, SentParts = sent, TotalParts = total, LastAttemptAt = now, NextAttemptAt = null }, cancellationToken);
+            await UpdateBindingStatusAsync(delivery.BotProfileId, delivery.RecipientBindingId, now, null, cancellationToken);
         }
         else
         {
-            await _repository.UpdateSystemNotificationDeliveryAsync(delivery with { Status = NotificationDeliveryStatus.Failed, Error = SafeError(result.Error ?? "通知发送失败。"), SentParts = sent, TotalParts = total, LastAttemptAt = now, NextAttemptAt = now.Add(RetryDelay) }, cancellationToken);
+            var terminal = IsTerminalFailure(result.FailureKind);
+            await _repository.UpdateSystemNotificationDeliveryAsync(delivery with { Status = terminal ? NotificationDeliveryStatus.PermanentFailed : NotificationDeliveryStatus.Failed, Error = SafeError(result.Error ?? "通知发送失败。"), SentParts = sent, TotalParts = total, LastAttemptAt = now, NextAttemptAt = terminal ? null : now.Add(RetryDelay) }, cancellationToken);
+            await UpdateBindingStatusAsync(delivery.BotProfileId, delivery.RecipientBindingId, now, result, cancellationToken);
             await _diagnostics.RecordAsync("system_dispatch_result", new InvalidOperationException(result.Error ?? "通知发送失败。"), null, delivery.Id, cancellationToken);
         }
     }
@@ -204,12 +216,14 @@ public sealed class NotificationDispatcher : INotificationDispatcher, IDisposabl
     {
         var now = DateTimeOffset.UtcNow;
         await _repository.UpdateSystemNotificationDeliveryAsync(delivery with { Status = NotificationDeliveryStatus.Failed, Error = SafeError(error), LastAttemptAt = now, NextAttemptAt = now.Add(RetryDelay) }, cancellationToken);
+        await UpdateBindingStatusAsync(delivery.BotProfileId, delivery.RecipientBindingId, now,
+            new NotificationSendResult(false, 0, delivery.TotalParts, SafeError(error)), cancellationToken);
         await _diagnostics.RecordAsync("system_dispatch_channel", new InvalidOperationException(error), null, delivery.Id, cancellationToken);
     }
 
     private async Task CancelDisabledRuleDeliveryAsync(NotificationDelivery delivery, CancellationToken cancellationToken)
     {
-        if (delivery.Status is NotificationDeliveryStatus.Delivered or NotificationDeliveryStatus.Canceled) return;
+        if (delivery.Status is NotificationDeliveryStatus.Delivered or NotificationDeliveryStatus.Canceled or NotificationDeliveryStatus.PermanentFailed or NotificationDeliveryStatus.BindingRequired) return;
         var now = DateTimeOffset.UtcNow;
         await _repository.UpdateNotificationDeliveryAsync(delivery with
         {
@@ -223,7 +237,7 @@ public sealed class NotificationDispatcher : INotificationDispatcher, IDisposabl
 
     private async Task CancelInvalidEventDeliveryAsync(NotificationDelivery delivery, CancellationToken cancellationToken)
     {
-        if (delivery.Status is NotificationDeliveryStatus.Delivered or NotificationDeliveryStatus.Canceled) return;
+        if (delivery.Status is NotificationDeliveryStatus.Delivered or NotificationDeliveryStatus.Canceled or NotificationDeliveryStatus.PermanentFailed or NotificationDeliveryStatus.BindingRequired) return;
         var now = DateTimeOffset.UtcNow;
         await _repository.UpdateNotificationDeliveryAsync(delivery with
         {
@@ -298,6 +312,46 @@ public sealed class NotificationDispatcher : INotificationDispatcher, IDisposabl
         var state = await _repository.GetNotificationRuleStateAsync(ruleId, cancellationToken);
         if (state is null) return;
         await _repository.UpsertNotificationRuleStateAsync(state with { PendingDelivery = true, PendingDeliveryId = deliveryId, LastDeliveryError = SafeError(error ?? "通知发送失败。"), UpdatedAt = DateTimeOffset.UtcNow }, cancellationToken);
+    }
+
+    private async Task MarkTerminalFailureStateAsync(long ruleId, long deliveryId, string? error, CancellationToken cancellationToken)
+    {
+        var state = await _repository.GetNotificationRuleStateAsync(ruleId, cancellationToken);
+        if (state is null) return;
+        var isCurrentPending = state.PendingDeliveryId == deliveryId;
+        await _repository.UpsertNotificationRuleStateAsync(state with
+        {
+            PendingDelivery = isCurrentPending ? false : state.PendingDelivery,
+            PendingDeliveryId = isCurrentPending ? null : state.PendingDeliveryId,
+            LastDeliveryError = SafeError(error ?? "通知发送失败，需要处理。"),
+            UpdatedAt = DateTimeOffset.UtcNow
+        }, cancellationToken);
+    }
+
+    private static bool IsTerminalFailure(NotificationFailureKind failureKind) =>
+        failureKind is NotificationFailureKind.Authentication
+            or NotificationFailureKind.PermanentTarget
+            or NotificationFailureKind.InvalidRequest;
+
+    private async Task UpdateBindingStatusAsync(
+        long? botProfileId,
+        long? bindingId,
+        DateTimeOffset now,
+        NotificationSendResult? result,
+        CancellationToken cancellationToken)
+    {
+        if (bindingId is not { } id) return;
+        if (result is null || result.Success)
+        {
+            await _repository.UpdateNotificationRecipientBotBindingStatusAsync(id, now, now, "sent", null, cancellationToken);
+            if (botProfileId is { } profileId)
+                await _repository.TouchQqBotProfileLastUsedAsync(profileId, now, cancellationToken);
+            return;
+        }
+
+        var status = IsTerminalFailure(result.FailureKind) ? "permanent-failed" : "failed";
+        await _repository.UpdateNotificationRecipientBotBindingStatusAsync(
+            id, now, null, status, result.QqErrorCode, cancellationToken);
     }
 
     private static string SafeError(string error)

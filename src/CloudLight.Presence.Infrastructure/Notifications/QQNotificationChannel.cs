@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.WebSockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using CloudLight.Presence.Core.Interfaces;
@@ -12,9 +13,9 @@ namespace CloudLight.Presence.Infrastructure.Notifications;
 
 public sealed class QQNotificationChannel : INotificationChannel, IAsyncDisposable
 {
-    private const string ApiBaseUrl = "https://api.sgroup.qq.com";
-    private const string TokenEndpoint = "https://bots.qq.com/app/getAppAccessToken";
-    private const string UserAgent = "CloudLight-XiaoMi/2.1.2";
+    private const string ApiBaseUrl = "https://api.bot.qq.com";
+    private const string TokenEndpoint = "https://api.bot.qq.com/app/getAppAccessToken";
+    private const string UserAgent = "CloudLight-XiaoMi/2.1.3";
     private const int GroupAndC2CIntent = 1 << 25;
     private const int DefaultRequestTimeoutSeconds = 15;
     private const int DefaultConnectTimeoutSeconds = 20;
@@ -46,6 +47,7 @@ public sealed class QQNotificationChannel : INotificationChannel, IAsyncDisposab
 
     public NotificationChannelType ChannelType => NotificationChannelType.QQ;
     public NotificationChannelStatus Status { get { lock (_sync) return _status; } }
+    public string CurrentAppId { get { lock (_sync) return _settings.AppId; } }
     public bool IsRunning => Status.Running;
     public event EventHandler<NotificationChannelStatus>? StatusChanged;
 
@@ -142,13 +144,14 @@ public sealed class QQNotificationChannel : INotificationChannel, IAsyncDisposab
 
     public async Task<NotificationSendResult> SendAsync(NotificationRequest request, int startPart, CancellationToken cancellationToken)
     {
-        if (request.Channel != NotificationChannelType.QQ) return Failed("通知通道类型不匹配。", 0, 0);
-        if (string.IsNullOrWhiteSpace(request.TargetId)) return Failed("QQ 通知目标为空。", 0, 0);
-        if (request.TargetType is not (NotificationTargetType.Private or NotificationTargetType.Group)) return Failed("QQ 通知目标类型无效。", 0, 0);
+        if (request.Channel != NotificationChannelType.QQ) return Failed("通知通道类型不匹配。", 0, 0, NotificationFailureKind.InvalidRequest);
+        if (string.IsNullOrWhiteSpace(request.TargetId)) return Failed("QQ 通知目标为空。", 0, 0, NotificationFailureKind.InvalidRequest);
+        if (request.TargetId.Contains('*', StringComparison.Ordinal)) return Failed("QQ 通知目标不能使用脱敏占位符，请输入完整 OpenID。", 0, 0, NotificationFailureKind.InvalidRequest);
+        if (request.TargetType is not (NotificationTargetType.Private or NotificationTargetType.Group)) return Failed("QQ 通知目标类型无效。", 0, 0, NotificationFailureKind.InvalidRequest);
         var status = Status;
-        if (!status.Connected) return Failed("QQ 当前未连接，通知已等待重试。", 0, 0);
+        if (!status.Connected) return Failed("QQ 当前未连接，通知已等待重试。", 0, 0, NotificationFailureKind.Transient);
         var parts = QQMessageSplitter.Split(request.Message, 5000);
-        if (parts.Count == 0) return Failed("通知内容为空。", 0, 0);
+        if (parts.Count == 0) return Failed("通知内容为空。", 0, 0, NotificationFailureKind.InvalidRequest);
         startPart = Math.Clamp(startPart, 0, parts.Count);
         var sent = 0; var ids = new List<string>();
         for (var index = startPart; index < parts.Count; index++)
@@ -160,17 +163,33 @@ public sealed class QQNotificationChannel : INotificationChannel, IAsyncDisposab
                 sent++;
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch (QQNotificationException exception)
+            {
+                var safeError = SafeError(exception.Message, request.TargetId);
+                LogError("send_failure", FormatSendFailureLog(request, exception));
+                SetLastError(safeError);
+                return new NotificationSendResult(false, sent, parts.Count, safeError, ids,
+                    exception.FailureKind, exception.HttpStatusCode, exception.QqErrorCode,
+                    exception.TraceId, exception.EndpointCategory);
+            }
             catch (Exception exception)
             {
-                SetLastError(SafeError(exception.Message));
-                return new NotificationSendResult(false, sent, parts.Count, SafeError(exception.Message), ids);
+                var safeError = SafeError(exception.Message, request.TargetId);
+                LogError("send_failure", $"endpoint={QQNotificationEndpoint.CategoryFor(request.TargetType)}; method=POST; targetLength={request.TargetId.Length}; targetSha256={Fingerprint(request.TargetId)}; failureKind={NotificationFailureKind.Unknown}; message={safeError}");
+                SetLastError(safeError);
+                return new NotificationSendResult(false, sent, parts.Count, safeError, ids, NotificationFailureKind.Unknown,
+                    EndpointCategory: QQNotificationEndpoint.CategoryFor(request.TargetType));
             }
         }
+        LogError("send_success", FormatSendSuccessLog(request, parts.Count, sent));
         return new NotificationSendResult(true, sent, parts.Count, null, ids);
     }
 
     public Task<NotificationSendResult> SendTestAsync(NotificationTargetType targetType, string targetId, CancellationToken cancellationToken) =>
-        SendAsync(new NotificationRequest(0, 0, 0, "test", NotificationChannelType.QQ, targetType, targetId, "CloudLight XiaoMi QQ 通知测试成功。", DateTimeOffset.UtcNow), 0, cancellationToken);
+        SendTestAsync(targetType, targetId, "CloudLight XiaoMi QQ 通知测试成功。", cancellationToken);
+
+    public Task<NotificationSendResult> SendTestAsync(NotificationTargetType targetType, string targetId, string message, CancellationToken cancellationToken) =>
+        SendAsync(new NotificationRequest(0, 0, 0, "test", NotificationChannelType.QQ, targetType, targetId, message, DateTimeOffset.UtcNow), 0, cancellationToken);
 
     public async Task TestConnectionAsync(CancellationToken cancellationToken)
     {
@@ -361,7 +380,8 @@ public sealed class QQNotificationChannel : INotificationChannel, IAsyncDisposab
 
     private async Task<string> SendTextPartAsync(NotificationTargetType targetType, string targetId, string text, CancellationToken cancellationToken)
     {
-        var path = targetType == NotificationTargetType.Group ? $"/v2/groups/{Uri.EscapeDataString(targetId)}/messages" : $"/v2/users/{Uri.EscapeDataString(targetId)}/messages";
+        var endpointCategory = QQNotificationEndpoint.CategoryFor(targetType);
+        var path = QQNotificationEndpoint.BuildMessagePath(targetType, targetId);
         for (var attempt = 0; attempt < 2; attempt++)
         {
             var token = await GetAccessTokenAsync(forceRefresh: false, cancellationToken);
@@ -371,16 +391,25 @@ public sealed class QQNotificationChannel : INotificationChannel, IAsyncDisposab
             {
                 using var response = await HttpClient.SendAsync(request, cancellationToken); var raw = await response.Content.ReadAsStringAsync(cancellationToken);
                 if (response.StatusCode == HttpStatusCode.Unauthorized && attempt == 0) { InvalidateAccessToken(); continue; }
-                if (!response.IsSuccessStatusCode) throw CreateApiException(response.StatusCode, raw, "QQ 消息发送失败。");
+                if (!response.IsSuccessStatusCode) throw CreateApiException(response.StatusCode, raw, "QQ 消息发送失败。", endpointCategory: endpointCategory, responseTraceId: ReadTraceHeader(response));
                 if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
-                using var document = JsonDocument.Parse(raw);
-                return ReadString(document.RootElement, "id") ?? ReadString(document.RootElement, "msg_id") ?? string.Empty;
+                try
+                {
+                    using var document = JsonDocument.Parse(raw);
+                    return ReadString(document.RootElement, "id") ?? ReadString(document.RootElement, "msg_id") ?? string.Empty;
+                }
+                catch (JsonException exception)
+                {
+                    throw new QQNotificationException("protocol_incompatible", "QQ API 成功响应格式无效。", exception,
+                        NotificationFailureKind.Transient, (int)response.StatusCode, traceId: ReadTraceHeader(response), endpointCategory: endpointCategory);
+                }
             }
             catch (QQNotificationException) { throw; }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
-            catch (HttpRequestException exception) { throw new QQNotificationException("network_error", "QQ 消息发送网络请求失败。", exception); }
+            catch (OperationCanceledException) { throw new QQNotificationException("network_timeout", "QQ 消息发送请求超时。", null, NotificationFailureKind.Transient, endpointCategory: endpointCategory); }
+            catch (HttpRequestException exception) { throw new QQNotificationException("network_error", "QQ 消息发送网络请求失败。", exception, NotificationFailureKind.Transient, endpointCategory: endpointCategory); }
         }
-        throw new QQNotificationException("token_expired", "QQ Access Token 已失效。", null);
+        throw new QQNotificationException("token_expired", "QQ Access Token 已失效。", null, NotificationFailureKind.Authentication, endpointCategory: "token");
     }
 
     private async Task<string> GetGatewayUrlAsync(CancellationToken cancellationToken)
@@ -393,16 +422,17 @@ public sealed class QQNotificationChannel : INotificationChannel, IAsyncDisposab
             {
                 using var response = await HttpClient.SendAsync(request, cancellationToken); var raw = await response.Content.ReadAsStringAsync(cancellationToken);
                 if (response.StatusCode == HttpStatusCode.Unauthorized && attempt == 0) { InvalidateAccessToken(); continue; }
-                if (!response.IsSuccessStatusCode) throw CreateApiException(response.StatusCode, raw, "获取 QQ Gateway 失败。", gateway: true);
+                if (!response.IsSuccessStatusCode) throw CreateApiException(response.StatusCode, raw, "获取 QQ Gateway 失败。", gateway: true, responseTraceId: ReadTraceHeader(response), endpointCategory: "gateway");
                 using var document = JsonDocument.Parse(raw); var url = ReadString(document.RootElement, "url")?.Trim();
                 if (string.IsNullOrWhiteSpace(url) || !Uri.TryCreate(url, UriKind.Absolute, out var parsed) || parsed.Scheme != Uri.UriSchemeWss || string.IsNullOrWhiteSpace(parsed.Host)) throw new QQNotificationException("gateway_response_invalid", "QQ Gateway 地址无效。", null);
                 return url;
             }
             catch (QQNotificationException) { throw; }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
-            catch (HttpRequestException exception) { throw new QQNotificationException("network_error", "无法获取 QQ Gateway。", exception); }
+            catch (OperationCanceledException) { throw new QQNotificationException("network_timeout", "获取 QQ Gateway 请求超时。", null, NotificationFailureKind.Transient, endpointCategory: "gateway"); }
+            catch (HttpRequestException exception) { throw new QQNotificationException("network_error", "无法获取 QQ Gateway。", exception, NotificationFailureKind.Transient, endpointCategory: "gateway"); }
         }
-        throw new QQNotificationException("token_expired", "QQ Access Token 已失效。", null);
+        throw new QQNotificationException("token_expired", "QQ Access Token 已失效。", null, NotificationFailureKind.Authentication, endpointCategory: "token");
     }
 
     private async Task<string> GetAccessTokenAsync(bool forceRefresh, CancellationToken cancellationToken)
@@ -419,16 +449,14 @@ public sealed class QQNotificationChannel : INotificationChannel, IAsyncDisposab
                 if (!forceRefresh && !string.IsNullOrWhiteSpace(_accessToken) && DateTimeOffset.UtcNow < _accessTokenExpiresAt.AddMinutes(-TokenRefreshMarginMinutes)) return _accessToken;
             }
             string appId, secret; lock (_sync) { appId = _settings.AppId; secret = _secret; }
-            if (string.IsNullOrWhiteSpace(appId) || string.IsNullOrWhiteSpace(secret)) throw new QQNotificationException("credentials_missing", "缺少 QQ AppID 或 AppSecret。", null);
+            if (string.IsNullOrWhiteSpace(appId) || string.IsNullOrWhiteSpace(secret)) throw new QQNotificationException("credentials_missing", "缺少 QQ AppID 或 AppSecret。", null, NotificationFailureKind.Authentication, endpointCategory: "token");
             using var request = new HttpRequestMessage(HttpMethod.Post, TokenEndpoint) { Content = new StringContent(JsonSerializer.Serialize(new { appId, clientSecret = secret }), Encoding.UTF8, "application/json") }; request.Headers.UserAgent.ParseAdd(UserAgent);
             try
             {
                 using var response = await HttpClient.SendAsync(request, cancellationToken); var raw = await response.Content.ReadAsStringAsync(cancellationToken);
                 if (!response.IsSuccessStatusCode)
                 {
-                    if (response.StatusCode is HttpStatusCode.BadRequest or HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
-                        throw new QQNotificationException("secret_invalid", "QQ AppID 或 AppSecret 无效，认证未通过。", null);
-                    throw CreateApiException(response.StatusCode, raw, "QQ 凭据认证失败。");
+                    throw CreateApiException(response.StatusCode, raw, "QQ 凭据认证失败。", responseTraceId: ReadTraceHeader(response), endpointCategory: "token");
                 }
                 using var document = JsonDocument.Parse(raw); var token = ReadString(document.RootElement, "access_token")?.Trim();
                 var expiresIn = ReadLong(document.RootElement, "expires_in");
@@ -440,7 +468,8 @@ public sealed class QQNotificationChannel : INotificationChannel, IAsyncDisposab
             }
             catch (QQNotificationException) { throw; }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
-            catch (HttpRequestException exception) { throw new QQNotificationException("network_error", "无法连接 QQ Token 服务。", exception); }
+            catch (OperationCanceledException) { throw new QQNotificationException("network_timeout", "QQ Token 请求超时。", null, NotificationFailureKind.Transient, endpointCategory: "token"); }
+            catch (HttpRequestException exception) { throw new QQNotificationException("network_error", "无法连接 QQ Token 服务。", exception, NotificationFailureKind.Transient, endpointCategory: "token"); }
         }
         finally { _tokenGate.Release(); }
     }
@@ -481,7 +510,10 @@ public sealed class QQNotificationChannel : INotificationChannel, IAsyncDisposab
 
     private void SetConnectionFailure(QQNotificationException exception, bool reconnectEnabled)
     {
-        var state = exception.Code is "credentials_missing" or "secret_invalid" or "auth_failed" ? NotificationConnectionState.AuthenticationFailed : reconnectEnabled ? NotificationConnectionState.Reconnecting : NotificationConnectionState.GatewayFailed;
+        var state = exception.FailureKind == NotificationFailureKind.Authentication
+            || exception.Code is "credentials_missing" or "secret_invalid" or "auth_failed"
+            ? NotificationConnectionState.AuthenticationFailed
+            : reconnectEnabled ? NotificationConnectionState.Reconnecting : NotificationConnectionState.GatewayFailed;
         var safe = SafeError(exception.Message);
         LogError($"connection/{exception.Code}", safe);
         PublishStatus(Status with { Running = reconnectEnabled, Connected = false, ConnectionState = state, LastError = safe });
@@ -550,7 +582,7 @@ public sealed class QQNotificationChannel : INotificationChannel, IAsyncDisposab
         }
     }
 
-    private static NotificationSendResult Failed(string error, int sent, int total) => new(false, sent, total, error);
+    private static NotificationSendResult Failed(string error, int sent, int total, NotificationFailureKind failureKind) => new(false, sent, total, error, FailureKind: failureKind);
     private static string? ReadString(JsonElement element, string property) => element.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
     private static long ReadLong(JsonElement element, string property)
     {
@@ -559,15 +591,83 @@ public sealed class QQNotificationChannel : INotificationChannel, IAsyncDisposab
         return value.ValueKind == JsonValueKind.String && long.TryParse(value.GetString(), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var textNumber) ? textNumber : 0;
     }
     private static int ReadInt(JsonElement element, string property) => element.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var number) ? number : 0;
-    private static QQNotificationException CreateApiException(HttpStatusCode status, string raw, string fallback, bool gateway = false)
+    private static QQNotificationException CreateApiException(
+        HttpStatusCode status,
+        string raw,
+        string fallback,
+        bool gateway = false,
+        string? responseTraceId = null,
+        string? endpointCategory = null)
     {
-        string? detail = null;
-        try { using var document = JsonDocument.Parse(raw); detail = ReadString(document.RootElement, "message"); } catch { }
+        var apiError = QQNotificationApiErrorParser.Parse(raw);
+        var traceId = string.IsNullOrWhiteSpace(apiError.TraceId) ? responseTraceId : apiError.TraceId;
+        var failureKind = QQNotificationFailureClassifier.Classify(status, apiError.ErrorCode, endpointCategory);
         var code = gateway
-            ? status switch { HttpStatusCode.Unauthorized => "gateway_auth_failed", HttpStatusCode.Forbidden => "gateway_permission_denied", HttpStatusCode.NotFound => "gateway_endpoint_not_found", (HttpStatusCode)429 => "rate_limited", _ => "gateway_lookup_failed" }
-            : status switch { HttpStatusCode.Unauthorized => "token_expired", HttpStatusCode.Forbidden => "permission_not_granted", HttpStatusCode.BadRequest => "protocol_incompatible", (HttpStatusCode)429 => "rate_limited", _ => "qq_api_error" };
-        return new QQNotificationException(code, string.IsNullOrWhiteSpace(detail) ? fallback : SafeError(detail), null);
+            ? status switch { HttpStatusCode.Unauthorized => "gateway_auth_failed", HttpStatusCode.Forbidden => "gateway_permission_denied", HttpStatusCode.NotFound => "gateway_endpoint_not_found", (HttpStatusCode)429 => "rate_limited", _ => "qq_api_error" }
+            : failureKind switch
+            {
+                NotificationFailureKind.Authentication => endpointCategory == "token" ? "secret_invalid" : "auth_failed",
+                NotificationFailureKind.PermanentTarget => "permanent_target",
+                NotificationFailureKind.InvalidRequest => "qq_invalid_request",
+                NotificationFailureKind.Transient when status == (HttpStatusCode)429 => "rate_limited",
+                _ => "qq_api_error"
+            };
+        var detail = string.IsNullOrWhiteSpace(apiError.Message) ? fallback : SafeError(apiError.Message);
+        var message = BuildApiErrorMessage(failureKind, detail, status, apiError.ErrorCode, traceId, gateway);
+        return new QQNotificationException(code, message, null, failureKind, (int)status, apiError.ErrorCode,
+            SafeError(traceId ?? string.Empty), endpointCategory);
     }
+
+    private static string BuildApiErrorMessage(
+        NotificationFailureKind failureKind,
+        string detail,
+        HttpStatusCode status,
+        int? qqErrorCode,
+        string? traceId,
+        bool gateway)
+    {
+        var prefix = gateway
+            ? "QQ Gateway 请求失败。"
+            : failureKind switch
+            {
+                NotificationFailureKind.PermanentTarget => "QQ API 未找到当前接收目标。可能原因包括 OpenID 已失效、当前 Bot 与目标关系发生变化，或目标与当前 AppID 不匹配。",
+                NotificationFailureKind.Authentication => "QQ API 认证或权限检查失败。",
+                NotificationFailureKind.InvalidRequest => "QQ API 拒绝了这次请求，请根据错误码检查接收目标、Bot 关系、权限和请求参数。",
+                NotificationFailureKind.Transient => "QQ API 暂时不可用或请求受限。",
+                _ => "QQ API 请求失败。"
+            };
+        var code = qqErrorCode is { } value ? value.ToString(System.Globalization.CultureInfo.InvariantCulture) : "未知";
+        var trace = string.IsNullOrWhiteSpace(traceId) ? "无" : SafeError(traceId);
+        return $"{prefix} QQ API 返回：{detail}；HTTP 状态：{(int)status}；QQ 错误码：{code}；Trace ID：{trace}";
+    }
+
+    private string FormatSendFailureLog(NotificationRequest request, QQNotificationException exception) =>
+        $"endpoint={exception.EndpointCategory ?? QQNotificationEndpoint.CategoryFor(request.TargetType)}; method=POST; pathTemplate={FailurePathTemplate(request, exception)}; appIdLength={CurrentAppIdLength()}; appIdSha256={CurrentAppIdFingerprint()}; targetLength={request.TargetId.Length}; targetSha256={Fingerprint(request.TargetId)}; httpStatus={exception.HttpStatusCode?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "unknown"}; qqCode={exception.QqErrorCode?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "unknown"}; traceId={SafeError(exception.TraceId ?? string.Empty)}; failureKind={exception.FailureKind}; code={exception.Code}; message={SafeError(exception.Message, request.TargetId)}";
+
+    private string FormatSendSuccessLog(NotificationRequest request, int totalParts, int sentParts) =>
+        $"endpoint={QQNotificationEndpoint.CategoryFor(request.TargetType)}; method=POST; pathTemplate={QQNotificationEndpoint.MessagePathTemplate(request.TargetType)}; appIdLength={CurrentAppIdLength()}; appIdSha256={CurrentAppIdFingerprint()}; targetLength={request.TargetId.Length}; targetSha256={Fingerprint(request.TargetId)}; payload=msg_type=0,content; sentParts={sentParts}; totalParts={totalParts}";
+
+    private int CurrentAppIdLength()
+    {
+        lock (_sync) return _settings.AppId.Length;
+    }
+
+    private string CurrentAppIdFingerprint()
+    {
+        lock (_sync) return Fingerprint(_settings.AppId);
+    }
+
+    private static string FailurePathTemplate(NotificationRequest request, QQNotificationException exception) => exception.EndpointCategory switch
+    {
+        "token" => "/app/getAppAccessToken",
+        "gateway" => "/gateway",
+        _ => QQNotificationEndpoint.MessagePathTemplate(request.TargetType)
+    };
+
+    private static string ReadTraceHeader(HttpResponseMessage response) =>
+        response.Headers.TryGetValues("X-Tps-trace-ID", out var values) ? values.FirstOrDefault() ?? string.Empty : string.Empty;
+
+    private static string Fingerprint(string value) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)))[..12];
 
     private static QQNotificationException GatewayCloseError(WebSocketCloseStatus? status, string? description)
     {
@@ -575,17 +675,119 @@ public sealed class QQNotificationChannel : INotificationChannel, IAsyncDisposab
         return new QQNotificationException(code, string.IsNullOrWhiteSpace(description) ? "QQ Gateway 连接已关闭。" : SafeError(description), null);
     }
 
-    private static string SafeError(string value)
+    private static string SafeError(string value, string? targetId = null)
     {
         var sanitized = new string((value ?? string.Empty).Trim().Select(character => character is '\r' or '\n' or '\t' || character < 0x20 ? ' ' : character).ToArray());
         sanitized = DiagnosticsRedaction.RedactText(sanitized);
+        if (!string.IsNullOrWhiteSpace(targetId))
+        {
+            var rawTarget = targetId.Trim();
+            sanitized = sanitized.Replace(rawTarget, DiagnosticsRedaction.MaskOpenId(rawTarget), StringComparison.Ordinal);
+        }
         return sanitized.Length > 500 ? sanitized[..500] : sanitized;
     }
 }
 
-public sealed class QQNotificationException(string code, string message, Exception? innerException) : Exception(message, innerException)
+public sealed class QQNotificationException(
+    string code,
+    string message,
+    Exception? innerException,
+    NotificationFailureKind failureKind = NotificationFailureKind.Unknown,
+    int? httpStatusCode = null,
+    int? qqErrorCode = null,
+    string? traceId = null,
+    string? endpointCategory = null) : Exception(message, innerException)
 {
     public string Code { get; } = code;
+    public NotificationFailureKind FailureKind { get; } = failureKind;
+    public int? HttpStatusCode { get; } = httpStatusCode;
+    public int? QqErrorCode { get; } = qqErrorCode;
+    public string? TraceId { get; } = traceId;
+    public string? EndpointCategory { get; } = endpointCategory;
+}
+
+public static class QQNotificationEndpoint
+{
+    public static string CategoryFor(NotificationTargetType targetType) => targetType switch
+    {
+        NotificationTargetType.Private => "private-user",
+        NotificationTargetType.Group => "group",
+        _ => "unknown"
+    };
+
+    public static string BuildMessagePath(NotificationTargetType targetType, string targetId) => targetType switch
+    {
+        NotificationTargetType.Private => $"/v2/users/{Uri.EscapeDataString(targetId)}/messages",
+        NotificationTargetType.Group => $"/v2/groups/{Uri.EscapeDataString(targetId)}/messages",
+        _ => throw new ArgumentOutOfRangeException(nameof(targetType), targetType, "QQ 通知目标类型无效。")
+    };
+
+    public static string MessagePathTemplate(NotificationTargetType targetType) => targetType switch
+    {
+        NotificationTargetType.Private => "/v2/users/{openid}/messages",
+        NotificationTargetType.Group => "/v2/groups/{group_openid}/messages",
+        _ => "unknown"
+    };
+}
+
+public sealed record QQNotificationApiError(int? ErrorCode, string? Message, string? TraceId);
+
+public static class QQNotificationApiErrorParser
+{
+    public static QQNotificationApiError Parse(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return new(null, null, null);
+        try
+        {
+            using var document = JsonDocument.Parse(raw);
+            var root = document.RootElement;
+            var code = ReadInt(root, "err_code") ?? ReadInt(root, "code") ?? ReadInt(root, "error_code");
+            var message = ReadString(root, "message") ?? ReadString(root, "error");
+            var trace = ReadString(root, "trace_id") ?? ReadString(root, "traceId") ?? ReadString(root, "request_id");
+            return new(code, message, trace);
+        }
+        catch (JsonException)
+        {
+            return new(null, null, null);
+        }
+    }
+
+    private static string? ReadString(JsonElement element, string property) =>
+        element.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+
+    private static int? ReadInt(JsonElement element, string property)
+    {
+        if (!element.TryGetProperty(property, out var value)) return null;
+        if (value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var number)) return number;
+        return value.ValueKind == JsonValueKind.String && int.TryParse(value.GetString(), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var textNumber)
+            ? textNumber
+            : null;
+    }
+}
+
+public static class QQNotificationFailureClassifier
+{
+    public static NotificationFailureKind Classify(HttpStatusCode status, int? qqErrorCode, string? endpointCategory)
+    {
+        if (IsPermanentTarget(qqErrorCode, endpointCategory)) return NotificationFailureKind.PermanentTarget;
+        if (IsAuthentication(status, qqErrorCode, endpointCategory)) return NotificationFailureKind.Authentication;
+        if (status == (HttpStatusCode)429 || status == HttpStatusCode.RequestTimeout || (int)status >= 500 || IsTransientQqCode(qqErrorCode)) return NotificationFailureKind.Transient;
+        if (status is HttpStatusCode.BadRequest or HttpStatusCode.NotFound or HttpStatusCode.MethodNotAllowed || IsInvalidRequestQqCode(qqErrorCode)) return NotificationFailureKind.InvalidRequest;
+        return NotificationFailureKind.Transient;
+    }
+
+    private static bool IsPermanentTarget(int? code, string? endpointCategory) =>
+        (endpointCategory == "private-user" && code is 40054004 or 40054013)
+        || (endpointCategory == "group" && code is 40034101 or 40054003);
+
+    private static bool IsAuthentication(HttpStatusCode status, int? code, string? endpointCategory) =>
+        status is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden
+        || (endpointCategory == "token" && code is 100007 or 100016 or 10004)
+        || code is 11251 or 11253 or 11254 or 11274 or 40034105;
+
+    private static bool IsTransientQqCode(int? code) => code is 11252 or 11263 or 11281 or 11242 or 40054006 or 40054016 or 40034100 or 50055002;
+
+    private static bool IsInvalidRequestQqCode(int? code) => code is 12002 or 50006 or 50035 or 22006 or 40054007 or 40054018;
 }
 
 public static class QQMessageSplitter

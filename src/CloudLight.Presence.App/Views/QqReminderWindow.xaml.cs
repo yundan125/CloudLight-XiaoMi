@@ -62,7 +62,7 @@ public partial class QqReminderWindow : System.Windows.Controls.UserControl
                     ConnectionAlertRecoveryBox.IsChecked == true,
                     ConnectionAlertUseDefaultBox.IsChecked == true,
                     first?.TargetType ?? current.TargetType,
-                    first?.OpenId ?? current.TargetId)
+                    string.Empty)
                 {
                     RecipientIds = selected.Select(value => value.Id).ToArray()
                 },
@@ -93,7 +93,7 @@ public partial class QqReminderWindow : System.Windows.Controls.UserControl
             if (draft.RecipientId is { } recipientId)
                 await _notifications.SendTestMessageAsync(recipientId, CancellationToken.None);
             else
-                await _notifications.SendTestMessageAsync(draft.TargetType, draft.TargetId, CancellationToken.None);
+                throw new InvalidOperationException("测试消息必须选择一个已绑定当前 QQ Bot 的联系人。");
         }
         catch (Exception exception) { _notifications.OperationStatus = $"测试消息发送失败：{exception.Message}"; }
     }
@@ -110,7 +110,7 @@ public partial class QqReminderWindow : System.Windows.Controls.UserControl
     private async void EditRecipientClicked(object sender, RoutedEventArgs e)
     {
         if (GetRecipientItem(sender) is not { } item || OwnerWindow is not { } owner) return;
-        var draft = NotificationRecipientDialog.Show(owner, item.Recipient);
+        var draft = NotificationRecipientDialog.Show(owner, item.Recipient, item.CurrentBinding);
         if (draft is null) return;
         try { await _notifications.SaveRecipientAsync(draft, item.Id, CancellationToken.None); }
         catch (Exception exception) { _notifications.OperationStatus = $"接收人保存失败：{exception.Message}"; }
@@ -141,6 +141,43 @@ public partial class QqReminderWindow : System.Windows.Controls.UserControl
         if (GetRecipientItem(sender) is not { } item) return;
         try { await _notifications.SendTestMessageAsync(item.Id, CancellationToken.None); }
         catch (Exception exception) { _notifications.OperationStatus = $"测试消息发送失败：{exception.Message}"; }
+    }
+
+    private async void ManageRecipientBindingsClicked(object sender, RoutedEventArgs e)
+    {
+        if (GetRecipientItem(sender) is not { } item || OwnerWindow is not { } owner) return;
+        while (true)
+        {
+            var result = NotificationRecipientBindingsDialog.Show(owner, item, _notifications.QqBotProfiles);
+            if (result is null) return;
+            try
+            {
+                if (result.Delete)
+                {
+                    var usage = await _notifications.GetRecipientUsageCountAsync(item.Id, CancellationToken.None);
+                    if (item.CurrentBinding?.Id == result.BindingId && usage > 0)
+                    {
+                        CloudLightDialogs.Info(owner, "联系人仍被规则使用",
+                            $"此联系人被 {usage} 条自动提醒使用。\n\n删除当前 Bot 绑定后，这些规则仍会保留，但无法通过当前 Bot 向该联系人发送消息。", warning: true);
+                        continue;
+                    }
+                    if (!CloudLightDialogs.Confirm(owner, "删除 QQ Bot 绑定", "删除这个 Bot 绑定？\n\n联系人、自动提醒和发送历史都会保留。", danger: true, accept: "删除"))
+                        continue;
+                    await _notifications.DeleteRecipientBindingAsync(result.BindingId!.Value, CancellationToken.None);
+                }
+                else if (result.Draft is { } draft)
+                    await _notifications.SaveRecipientBindingAsync(item.Id, draft, result.BindingId, CancellationToken.None);
+                else continue;
+                var refreshed = _notifications.FindRecipientItem(item.Id);
+                if (refreshed is null) return;
+                item = refreshed;
+            }
+            catch (Exception exception)
+            {
+                _notifications.OperationStatus = $"Bot 绑定未保存：{exception.Message}";
+                return;
+            }
+        }
     }
 
     private async void AddRuleClicked(object sender, RoutedEventArgs e)

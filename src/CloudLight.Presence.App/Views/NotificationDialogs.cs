@@ -41,7 +41,13 @@ public static class QqConfigurationDialog
 
         var enabled = new CheckBox { Content = "启用 QQ 自动提醒", IsChecked = settings.Enabled, Margin = new Thickness(0, 18, 0, 18) };
         DialogUi.UseStyle(enabled, "ToggleSwitchStyle");
-        var appId = new TextBox { Text = settings.AppId, MaxLength = 32 };
+        var maskedAppId = NotificationSettingsViewModelFormatting.MaskTarget(settings.AppId);
+        var appId = new TextBox
+        {
+            Text = string.IsNullOrWhiteSpace(settings.AppId) ? "" : maskedAppId,
+            MaxLength = 32,
+            ToolTip = "已有 AppID 仅显示脱敏值；如需更换 Bot，请直接粘贴新的完整数字 AppID。"
+        };
         var appSecret = new PasswordBox { MaxLength = 256 };
         var secretHint = DialogUi.Hint(secretConfigured ? "留空表示继续使用已保存的密钥。" : "密钥只保存在当前 Windows 用户的 DPAPI 加密文件中。");
 
@@ -60,7 +66,7 @@ public static class QqConfigurationDialog
         connectionPanel.Children.Add(reconnect);
         panel.Children.Add(DialogUi.Card(connectionPanel));
 
-        var recipientOptions = recipients.Select(value => new RecipientOption(value)).ToArray();
+        var recipientOptions = recipients.Where(value => value.HasCurrentBinding).Select(value => new RecipientOption(value)).ToArray();
         var defaultRecipients = new ListBox
         {
             MaxHeight = 220,
@@ -74,7 +80,7 @@ public static class QqConfigurationDialog
         NestedScrollBehavior.SetBubbleMouseWheelAtBoundary(defaultRecipients, true);
         foreach (var option in recipientOptions.Where(value => settings.DefaultRecipientIds.Contains(value.Item.Id)))
             defaultRecipients.SelectedItems.Add(option);
-        var noRecipients = DialogUi.EmptyState("还没有 QQ 接收人", "先在 QQ 提醒页面保存常用 OpenID，之后就能在这里设为默认接收人。");
+        var noRecipients = DialogUi.EmptyState("还没有当前 Bot 绑定", "只有已绑定当前 QQ Bot 的联系人才能作为默认发送目标。");
         noRecipients.Visibility = recipientOptions.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
         defaultRecipients.Visibility = recipientOptions.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
         var defaultPanel = new StackPanel();
@@ -112,7 +118,10 @@ public static class QqConfigurationDialog
         panel.Children.Add(DialogUi.Actions(window, "保存", validate: () =>
         {
             var mode = (proxyMode.SelectedItem as ComboBoxItem)?.Tag?.ToString() ?? "environment";
-            if (enabled.IsChecked == true && (appId.Text.Trim().Length < 5 || appId.Text.Trim().Any(value => value is < '0' or > '9')))
+            var displayedExistingAppId = !string.IsNullOrWhiteSpace(settings.AppId)
+                && string.Equals(appId.Text.Trim(), maskedAppId, StringComparison.Ordinal);
+            var selectedAppId = displayedExistingAppId ? settings.AppId : appId.Text.Trim();
+            if (enabled.IsChecked == true && (selectedAppId.Length < 5 || selectedAppId.Length > 32 || selectedAppId.Any(value => value is < '0' or > '9')))
             {
                 error.Text = "启用 QQ 时请输入有效的数字 AppID。";
                 return false;
@@ -126,18 +135,13 @@ public static class QqConfigurationDialog
             var selected = defaultRecipients.SelectedItems.OfType<RecipientOption>().Select(value => value.Item).ToArray();
             var first = selected.FirstOrDefault()?.Recipient;
             var defaultType = first?.TargetType ?? settings.DefaultTargetType;
-            var defaultId = first?.OpenId ?? settings.DefaultTargetId;
-            if (defaultId.Any(char.IsWhiteSpace))
-            {
-                error.Text = "默认 OpenID 不能包含空格。";
-                return false;
-            }
+            var defaultId = string.Empty;
 
             result = new(
                 new QqNotificationSettings(
                     enabled.IsChecked == true,
                     autoConnect.IsChecked == true,
-                    appId.Text.Trim(),
+                    selectedAppId,
                     reconnect.IsChecked == true,
                     mode,
                     mode == "custom-http" ? proxyUrl.Text.Trim() : "",
@@ -168,7 +172,7 @@ public static class QqTestDialog
         panel.Children.Add(DialogUi.Title("发送测试消息"));
         panel.Children.Add(DialogUi.Subtitle("选择一个接收人，确认 QQ Bot 可以正常发送通知。"));
 
-        var options = recipients.Select(value => new RecipientOption(value)).ToArray();
+        var options = recipients.Where(value => value.HasCurrentBinding).Select(value => new RecipientOption(value)).ToArray();
         var recipient = new ComboBox { ItemsSource = options, DisplayMemberPath = nameof(RecipientOption.DisplayText) };
         recipient.SelectedItem = options.FirstOrDefault(value => value.Item.Id == selectedRecipientId) ?? options.FirstOrDefault();
         var recipientCard = new StackPanel();
@@ -176,20 +180,9 @@ public static class QqTestDialog
         if (options.Length > 0)
             recipientCard.Children.Add(DialogUi.Field("接收人", recipient));
 
-        var type = new ComboBox { IsEnabled = options.Length == 0 };
-        AddItem(type, "私聊", NotificationTargetType.Private);
-        AddItem(type, "群聊", NotificationTargetType.Group);
-        type.SelectedIndex = 0;
-        var target = new TextBox { IsEnabled = options.Length == 0, FontFamily = new System.Windows.Media.FontFamily("Consolas") };
-        if (options.Length == 0)
-        {
-            recipientCard.Children.Add(DialogUi.Field("类型", type));
-            recipientCard.Children.Add(DialogUi.Field("OpenID", target, "还没有保存联系人；可以直接填写 QQ 开放平台提供的 OpenID。"));
-        }
-        else
-        {
-            recipientCard.Children.Add(DialogUi.Hint("发送目标只显示已保存联系人的备注和脱敏 OpenID。"));
-        }
+        recipientCard.Children.Add(options.Length == 0
+            ? DialogUi.EmptyState("没有可测试的联系人", "请先为联系人添加当前 QQ Bot 的 OpenID 绑定。")
+            : DialogUi.Hint("发送目标只显示当前 Bot 已绑定联系人的备注和脱敏 OpenID。"));
         panel.Children.Add(DialogUi.Card(recipientCard));
 
         var error = DialogUi.Error();
@@ -199,27 +192,21 @@ public static class QqTestDialog
         {
             if (recipient.SelectedItem is RecipientOption selected)
             {
-                result = new(selected.Item.Recipient.TargetType, selected.Item.Recipient.OpenId, selected.Item.Id);
+                result = new(selected.Item.Recipient.TargetType, selected.Item.OpenId, selected.Item.Id);
                 return true;
             }
-            if (string.IsNullOrWhiteSpace(target.Text) || target.Text.Any(char.IsWhiteSpace))
-            {
-                error.Text = "请输入有效的 OpenID。";
-                return false;
-            }
-            result = new((type.SelectedItem as ComboBoxItem)?.Tag is NotificationTargetType value ? value : NotificationTargetType.Private, target.Text.Trim());
-            return true;
+            error.Text = "当前没有已绑定当前 Bot 的联系人。";
+            return false;
         }));
         window.Content = DialogUi.MainScroll(panel);
         return window.ShowDialog() == true ? result : null;
     }
 
-    private static void AddItem(ComboBox box, string text, object tag) => box.Items.Add(new ComboBoxItem { Content = text, Tag = tag });
 }
 
 public static class NotificationRecipientDialog
 {
-    public static NotificationRecipientDraft? Show(Window owner, NotificationRecipient? existing = null)
+    public static NotificationRecipientDraft? Show(Window owner, NotificationRecipient? existing = null, NotificationRecipientBotBinding? currentBinding = null)
     {
         var isEditing = existing is not null;
         var window = DialogUi.CreateWindow(owner, isEditing ? "编辑 QQ 接收人" : "添加 QQ 接收人", 540);
@@ -230,11 +217,11 @@ public static class NotificationRecipientDialog
         var note = new TextBox { Text = existing?.Note ?? "", ToolTip = "例如：我的 QQ、家庭群" };
         var openId = new TextBox
         {
-            Text = existing?.OpenId ?? "",
+            Text = currentBinding is null ? "" : NotificationSettingsViewModelFormatting.MaskTarget(currentBinding.OpenId),
             MaxLength = 256,
             FontFamily = new System.Windows.Media.FontFamily("Consolas"),
             HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
-            ToolTip = "QQ 官方开放平台提供的 OpenID，不是普通 QQ 号"
+            ToolTip = "已有接收人的 OpenID 仅显示脱敏值；如需重新绑定，请粘贴新的完整 OpenID"
         };
         var type = new ComboBox();
         type.Items.Add(new ComboBoxItem { Content = "私聊", Tag = NotificationTargetType.Private });
@@ -244,7 +231,9 @@ public static class NotificationRecipientDialog
         var info = new StackPanel();
         info.Children.Add(DialogUi.Section("接收人信息"));
         info.Children.Add(DialogUi.Field("备注", note, "用容易识别的名称，例如“我的 QQ”或“家庭群”。"));
-        info.Children.Add(DialogUi.Field("OpenID", openId, "OpenID 由 QQ 开放平台提供；输入框支持横向滚动，不会撑大窗口。"));
+        info.Children.Add(DialogUi.Field("当前 Bot OpenID", openId, isEditing
+            ? currentBinding is null ? "当前 Bot 尚未绑定；请输入新的完整 OpenID，或稍后使用绑定管理。" : "当前值仅作显示；不更换 OpenID 时请保持不变。要重新绑定，请输入新的完整 OpenID。"
+            : "OpenID 由 QQ 开放平台提供；输入框支持横向滚动，不会撑大窗口。"));
         info.Children.Add(DialogUi.Field("类型", type));
         panel.Children.Add(DialogUi.Card(info));
 
@@ -254,13 +243,151 @@ public static class NotificationRecipientDialog
         panel.Children.Add(DialogUi.Actions(window, "保存", validate: () =>
         {
             if (string.IsNullOrWhiteSpace(note.Text)) { error.Text = "请输入备注。"; return false; }
-            if (string.IsNullOrWhiteSpace(openId.Text) || openId.Text.Any(char.IsWhiteSpace)) { error.Text = "请输入不含空格的 OpenID。"; return false; }
             var selectedType = (type.SelectedItem as ComboBoxItem)?.Tag is NotificationTargetType value ? value : NotificationTargetType.Private;
-            result = new(note.Text.Trim(), openId.Text.Trim(), selectedType);
+            var displayedExistingOpenId = existing is not null && currentBinding is not null
+                && selectedType == existing.TargetType
+                && string.Equals(openId.Text, NotificationSettingsViewModelFormatting.MaskTarget(currentBinding.OpenId), StringComparison.Ordinal);
+            if (displayedExistingOpenId)
+            {
+                result = new(note.Text.Trim(), openId.Text, selectedType, OpenIdEdited: false);
+                return true;
+            }
+            if (string.IsNullOrWhiteSpace(openId.Text) || openId.Text.Any(char.IsWhiteSpace) || openId.Text.Contains('*', StringComparison.Ordinal))
+            {
+                error.Text = "请输入新的完整 OpenID，不能保存脱敏占位符。";
+                return false;
+            }
+            result = new(note.Text.Trim(), openId.Text.Trim(), selectedType, OpenIdEdited: true);
             return true;
         }));
         window.Content = DialogUi.MainScroll(panel);
         return window.ShowDialog() == true ? result : null;
+    }
+}
+
+public sealed record NotificationRecipientBindingDialogResult(
+    long? BindingId,
+    NotificationRecipientBindingDraft? Draft,
+    bool Delete = false);
+
+public static class NotificationRecipientBindingsDialog
+{
+    public static NotificationRecipientBindingDialogResult? Show(
+        Window owner,
+        NotificationRecipientItemViewModel recipient,
+        IReadOnlyList<QqBotProfile> profiles)
+    {
+        var window = DialogUi.CreateWindow(owner, "管理 QQ Bot 绑定", 640);
+        var panel = DialogUi.Panel();
+        panel.Children.Add(DialogUi.Title($"管理 QQ Bot 绑定 · {recipient.Note}"));
+        panel.Children.Add(DialogUi.Subtitle("同一个联系人可以在不同 QQ Bot 下保存不同 OpenID；这里显示的值均已脱敏。"));
+
+        var bindings = recipient.BindingItems.ToArray();
+        var bindingOptions = bindings.Select(value => new BindingOption(value)).ToArray();
+        var bindingList = new ListBox
+        {
+            ItemsSource = bindingOptions,
+            DisplayMemberPath = nameof(BindingOption.DisplayText),
+            MaxHeight = 170
+        };
+        bindingList.SelectedItem = bindingOptions.FirstOrDefault();
+        panel.Children.Add(DialogUi.Card(new StackPanel
+        {
+            Children =
+            {
+                DialogUi.Section("已有绑定"),
+                bindingList,
+                DialogUi.Hint("删除绑定不会删除联系人、自动提醒或发送历史。")
+            }
+        }));
+
+        var profileOptions = profiles
+            .Where(value => !value.IsLegacyUnknown)
+            .OrderByDescending(value => value.LastUsedAt)
+            .ThenBy(value => value.DisplayName, StringComparer.CurrentCultureIgnoreCase)
+            .Select(value => new ProfileOption(value))
+            .ToArray();
+        var profile = new ComboBox { ItemsSource = profileOptions, DisplayMemberPath = nameof(ProfileOption.DisplayText) };
+        var openId = new TextBox
+        {
+            MaxLength = 256,
+            FontFamily = new System.Windows.Media.FontFamily("Consolas"),
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Auto
+        };
+        var selectedBinding = bindingList.SelectedItem as BindingOption;
+        void LoadSelection(BindingOption? option)
+        {
+            selectedBinding = option;
+            profile.SelectedItem = profileOptions.FirstOrDefault(value => value.Profile.Id == option?.Item.Profile?.Id
+                || value.Profile.Id == option?.Item.Binding.BotProfileId);
+            openId.Text = option is null ? "" : option.Item.OpenIdText;
+        }
+        bindingList.SelectionChanged += (_, _) => LoadSelection(bindingList.SelectedItem as BindingOption);
+        LoadSelection(selectedBinding);
+
+        var newBinding = DialogUi.Button("＋ 添加绑定", "SecondaryButtonStyle");
+        newBinding.Click += (_, _) =>
+        {
+            bindingList.SelectedItem = null;
+            LoadSelection(null);
+            profile.SelectedItem = profileOptions.FirstOrDefault(value => value.Profile.Id == recipient.CurrentBotProfileId);
+            openId.Text = "";
+            openId.Focus();
+        };
+        var bindingEditor = new StackPanel();
+        bindingEditor.Children.Add(DialogUi.Section("添加或更新绑定"));
+        bindingEditor.Children.Add(newBinding);
+        bindingEditor.Children.Add(DialogUi.Field("QQ Bot", profile, "只允许选择已记录的实际 Bot；旧 AppID 未记录的历史绑定不能伪造关联。"));
+        bindingEditor.Children.Add(DialogUi.Field("OpenID", openId, "已有值保持不变时请不要替换脱敏文本；如需更新，请粘贴新的完整 OpenID。"));
+        panel.Children.Add(DialogUi.Card(bindingEditor));
+
+        var error = DialogUi.Error();
+        panel.Children.Add(error);
+        NotificationRecipientBindingDialogResult? result = null;
+        var actions = DialogUi.Actions(window, "保存绑定", validate: () =>
+        {
+            if (profile.SelectedItem is not ProfileOption selectedProfile)
+            {
+                error.Text = "请选择 QQ Bot。";
+                return false;
+            }
+            var unchanged = selectedBinding is not null
+                && selectedBinding.Item.Binding.BotProfileId == selectedProfile.Profile.Id
+                && string.Equals(openId.Text, selectedBinding.Item.OpenIdText, StringComparison.Ordinal);
+            if (!unchanged && (string.IsNullOrWhiteSpace(openId.Text) || openId.Text.Any(char.IsWhiteSpace) || openId.Text.Contains('*', StringComparison.Ordinal)))
+            {
+                error.Text = "请输入新的完整 OpenID，不能保存脱敏占位符。";
+                return false;
+            }
+            result = new(selectedBinding?.Item.Binding.Id,
+                new NotificationRecipientBindingDraft(selectedProfile.Profile.Id, openId.Text.Trim(), !unchanged));
+            return true;
+        });
+        var delete = DialogUi.Button("删除选中绑定", "DangerButton");
+        delete.IsEnabled = selectedBinding is not null;
+        bindingList.SelectionChanged += (_, _) => delete.IsEnabled = bindingList.SelectedItem is BindingOption;
+        delete.Click += (_, _) =>
+        {
+            if (bindingList.SelectedItem is not BindingOption selected) return;
+            result = new(selected.Item.Binding.Id, null, Delete: true);
+            window.DialogResult = true;
+        };
+        var actionPanel = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = System.Windows.HorizontalAlignment.Right };
+        actionPanel.Children.Add(delete);
+        actionPanel.Children.Add(actions);
+        panel.Children.Add(actionPanel);
+        window.Content = DialogUi.MainScroll(panel);
+        return window.ShowDialog() == true ? result : null;
+    }
+
+    private sealed record BindingOption(NotificationRecipientBindingItemViewModel Item)
+    {
+        public string DisplayText => $"{Item.BotName} · {Item.AppIdText} · {Item.OpenIdText} · {Item.StatusText}";
+    }
+
+    private sealed record ProfileOption(QqBotProfile Profile)
+    {
+        public string DisplayText => $"{Profile.DisplayName} · AppID {NotificationSettingsViewModelFormatting.MaskTarget(Profile.AppId)}";
     }
 }
 
@@ -321,7 +448,7 @@ public static class NotificationRuleDialog
         recipientView.Filter = value => value is RecipientOption option &&
             (string.IsNullOrWhiteSpace(recipientSearch.Text)
              || option.Item.Note.Contains(recipientSearch.Text.Trim(), StringComparison.CurrentCultureIgnoreCase)
-             || option.Item.OpenId.Contains(recipientSearch.Text.Trim(), StringComparison.OrdinalIgnoreCase));
+             || option.Item.CurrentOpenIdText.Contains(recipientSearch.Text.Trim(), StringComparison.OrdinalIgnoreCase));
         recipientSearch.TextChanged += (_, _) => recipientView.Refresh();
         var recipientList = new ListBox
         {
@@ -336,7 +463,7 @@ public static class NotificationRuleDialog
         NestedScrollBehavior.SetBubbleMouseWheelAtBoundary(recipientList, true);
         var selectedIds = existing?.RecipientIds.ToHashSet() ?? [];
         if (selectedIds.Count == 0 && existing is not null)
-            selectedIds = recipients.Where(value => value.Recipient.TargetType == existing.TargetType && value.OpenId == existing.TargetId).Select(value => value.Id).ToHashSet();
+            selectedIds = recipients.Where(value => value.Recipient.TargetType == existing.TargetType).Select(value => value.Id).Take(1).ToHashSet();
         foreach (var option in recipientSource.Where(value => selectedIds.Contains(value.Item.Id))) recipientList.SelectedItems.Add(option);
         var addRecipient = DialogUi.Button("＋ 添加接收人", "SecondaryButtonStyle");
         var noRecipients = DialogUi.EmptyState("还没有 QQ 接收人", "保存常用 OpenID 后，添加提醒时可以直接多选。");
@@ -403,7 +530,7 @@ public static class NotificationRuleDialog
             if (selectedRecipients.Length == 0) { error.Text = "请至少选择一个 QQ 接收人。"; return false; }
             var first = selectedRecipients[0].Recipient;
             var now = DateTimeOffset.UtcNow;
-            result = new NotificationRule(existing?.Id ?? 0, selectedSubject.Subject.Id, existing?.Enabled ?? true, selectedCondition, seconds, NotificationChannelType.QQ, first.TargetType, first.OpenId, template.Text.Trim(), existing?.CreatedAt ?? now, now)
+            result = new NotificationRule(existing?.Id ?? 0, selectedSubject.Subject.Id, existing?.Enabled ?? true, selectedCondition, seconds, NotificationChannelType.QQ, first.TargetType, string.Empty, template.Text.Trim(), existing?.CreatedAt ?? now, now)
             {
                 RecipientIds = selectedRecipients.Select(value => value.Id).ToArray()
             };

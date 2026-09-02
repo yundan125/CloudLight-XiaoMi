@@ -61,6 +61,15 @@ public interface IPresenceRepository
     Task UpdateNotificationRecipientAsync(NotificationRecipient recipient, CancellationToken cancellationToken);
     Task DeleteNotificationRecipientAsync(long recipientId, CancellationToken cancellationToken);
     Task<int> GetNotificationRecipientUsageCountAsync(long recipientId, CancellationToken cancellationToken);
+    Task<IReadOnlyList<QqBotProfile>> GetQqBotProfilesAsync(CancellationToken cancellationToken);
+    Task<QqBotProfile?> GetQqBotProfileByAppIdAsync(string appId, CancellationToken cancellationToken);
+    Task<QqBotProfile> EnsureQqBotProfileAsync(string appId, string displayName, DateTimeOffset now, CancellationToken cancellationToken);
+    Task<IReadOnlyList<NotificationRecipientBotBinding>> GetNotificationRecipientBotBindingsAsync(long recipientId, CancellationToken cancellationToken);
+    Task<NotificationRecipientBotBinding?> GetNotificationRecipientBotBindingAsync(long recipientId, long botProfileId, CancellationToken cancellationToken);
+    Task<NotificationRecipientBotBinding> UpsertNotificationRecipientBotBindingAsync(NotificationRecipientBotBinding binding, CancellationToken cancellationToken);
+    Task DeleteNotificationRecipientBotBindingAsync(long bindingId, CancellationToken cancellationToken);
+    Task UpdateNotificationRecipientBotBindingStatusAsync(long bindingId, DateTimeOffset verifiedAt, DateTimeOffset? successfulSendAt, string status, int? errorCode, CancellationToken cancellationToken);
+    Task TouchQqBotProfileLastUsedAsync(long botProfileId, DateTimeOffset usedAt, CancellationToken cancellationToken);
     Task<IReadOnlyList<NotificationRecipient>> GetNotificationRuleRecipientsAsync(long ruleId, CancellationToken cancellationToken);
     Task SetNotificationRuleRecipientsAsync(long ruleId, IReadOnlyCollection<long> recipientIds, CancellationToken cancellationToken);
     Task<NotificationRuleState?> GetNotificationRuleStateAsync(long ruleId, CancellationToken cancellationToken);

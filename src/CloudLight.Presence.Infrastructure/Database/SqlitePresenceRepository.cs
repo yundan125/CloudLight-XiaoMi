@@ -107,12 +107,28 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
               MessageTemplate TEXT NOT NULL, CreatedAt TEXT NOT NULL, UpdatedAt TEXT NOT NULL,
               FOREIGN KEY(SubjectId) REFERENCES PresenceSubject(Id) ON DELETE CASCADE);
             CREATE INDEX IF NOT EXISTS IX_NotificationRule_Subject_Enabled ON NotificationRule(SubjectId,Enabled);
+            CREATE TABLE IF NOT EXISTS QqBotProfile (
+              Id INTEGER PRIMARY KEY AUTOINCREMENT, AppId TEXT NOT NULL UNIQUE,
+              DisplayName TEXT NOT NULL, ScopeKind INTEGER NOT NULL DEFAULT 0,
+              CreatedAt TEXT NOT NULL, UpdatedAt TEXT NOT NULL, LastUsedAt TEXT NULL);
+            CREATE INDEX IF NOT EXISTS IX_QqBotProfile_Used ON QqBotProfile(LastUsedAt DESC,Id DESC);
             CREATE TABLE IF NOT EXISTS NotificationRecipient (
               Id INTEGER PRIMARY KEY AUTOINCREMENT, Note TEXT NOT NULL DEFAULT '',
-              OpenId TEXT NOT NULL, TargetType INTEGER NOT NULL,
-              CreatedAt TEXT NOT NULL, UpdatedAt TEXT NOT NULL,
-              UNIQUE(TargetType,OpenId));
+              OpenId TEXT NOT NULL DEFAULT '', TargetType INTEGER NOT NULL,
+              CreatedAt TEXT NOT NULL, UpdatedAt TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS IX_NotificationRecipient_Updated ON NotificationRecipient(UpdatedAt DESC,Id DESC);
+            CREATE TABLE IF NOT EXISTS NotificationRecipientBotBinding (
+              Id INTEGER PRIMARY KEY AUTOINCREMENT, RecipientId INTEGER NOT NULL,
+              BotProfileId INTEGER NOT NULL, TargetType INTEGER NOT NULL,
+              OpenId TEXT NOT NULL, CreatedAt TEXT NOT NULL, UpdatedAt TEXT NOT NULL,
+              LastVerifiedAt TEXT NULL, LastSuccessfulSendAt TEXT NULL,
+              LastSendStatus TEXT NULL, LastErrorCode INTEGER NULL,
+              UNIQUE(RecipientId,BotProfileId),
+              UNIQUE(BotProfileId,TargetType,OpenId),
+              FOREIGN KEY(RecipientId) REFERENCES NotificationRecipient(Id) ON DELETE CASCADE,
+              FOREIGN KEY(BotProfileId) REFERENCES QqBotProfile(Id) ON DELETE CASCADE);
+            CREATE INDEX IF NOT EXISTS IX_NotificationRecipientBotBinding_Recipient ON NotificationRecipientBotBinding(RecipientId,UpdatedAt DESC);
+            CREATE INDEX IF NOT EXISTS IX_NotificationRecipientBotBinding_Bot ON NotificationRecipientBotBinding(BotProfileId,UpdatedAt DESC);
             CREATE TABLE IF NOT EXISTS NotificationRuleRecipient (
               RuleId INTEGER NOT NULL, RecipientId INTEGER NOT NULL, CreatedAt TEXT NOT NULL,
               PRIMARY KEY(RuleId,RecipientId),
@@ -130,12 +146,15 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
               Id INTEGER PRIMARY KEY AUTOINCREMENT, RuleId INTEGER NULL, SubjectId INTEGER NULL,
               EpisodeId TEXT NOT NULL, CreatedAt TEXT NOT NULL, Status INTEGER NOT NULL,
               DeliveredAt TEXT NULL, Channel INTEGER NOT NULL, TargetType INTEGER NOT NULL,
-              TargetId TEXT NOT NULL, RecipientId INTEGER NULL, Message TEXT NOT NULL, Error TEXT NULL,
+              TargetId TEXT NOT NULL, RecipientId INTEGER NULL, BotProfileId INTEGER NULL,
+              RecipientBindingId INTEGER NULL, Message TEXT NOT NULL, Error TEXT NULL,
               SentParts INTEGER NOT NULL DEFAULT 0, TotalParts INTEGER NOT NULL DEFAULT 0,
               LastAttemptAt TEXT NULL, NextAttemptAt TEXT NULL,
               FOREIGN KEY(RuleId) REFERENCES NotificationRule(Id) ON DELETE SET NULL,
               FOREIGN KEY(SubjectId) REFERENCES PresenceSubject(Id) ON DELETE SET NULL,
               FOREIGN KEY(RecipientId) REFERENCES NotificationRecipient(Id) ON DELETE SET NULL,
+              FOREIGN KEY(BotProfileId) REFERENCES QqBotProfile(Id) ON DELETE SET NULL,
+              FOREIGN KEY(RecipientBindingId) REFERENCES NotificationRecipientBotBinding(Id) ON DELETE SET NULL,
               UNIQUE(RuleId,EpisodeId,RecipientId));
             CREATE INDEX IF NOT EXISTS IX_NotificationDelivery_Pending ON NotificationDelivery(Status,NextAttemptAt);
             CREATE INDEX IF NOT EXISTS IX_NotificationDelivery_Created ON NotificationDelivery(CreatedAt DESC);
@@ -148,9 +167,12 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
               Id INTEGER PRIMARY KEY AUTOINCREMENT, Kind INTEGER NOT NULL, EpisodeId TEXT NOT NULL,
               CreatedAt TEXT NOT NULL, Status INTEGER NOT NULL, DeliveredAt TEXT NULL,
               Channel INTEGER NOT NULL, TargetType INTEGER NOT NULL, TargetId TEXT NOT NULL,
-              RecipientId INTEGER NULL, Message TEXT NOT NULL, Error TEXT NULL, SentParts INTEGER NOT NULL DEFAULT 0,
+              RecipientId INTEGER NULL, BotProfileId INTEGER NULL, RecipientBindingId INTEGER NULL,
+              Message TEXT NOT NULL, Error TEXT NULL, SentParts INTEGER NOT NULL DEFAULT 0,
               TotalParts INTEGER NOT NULL DEFAULT 0, LastAttemptAt TEXT NULL, NextAttemptAt TEXT NULL,
               FOREIGN KEY(RecipientId) REFERENCES NotificationRecipient(Id) ON DELETE SET NULL,
+              FOREIGN KEY(BotProfileId) REFERENCES QqBotProfile(Id) ON DELETE SET NULL,
+              FOREIGN KEY(RecipientBindingId) REFERENCES NotificationRecipientBotBinding(Id) ON DELETE SET NULL,
               UNIQUE(Kind,EpisodeId,RecipientId));
             CREATE INDEX IF NOT EXISTS IX_SystemNotificationDelivery_Pending ON SystemNotificationDelivery(Status,NextAttemptAt);
             CREATE INDEX IF NOT EXISTS IX_SystemNotificationDelivery_Created ON SystemNotificationDelivery(CreatedAt DESC);
@@ -161,9 +183,12 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
             await EnsureSubjectCurrentStateSchemaAsync(connection, sqliteTransaction, cancellationToken);
             await MigrateSubjectPresenceEventSchemaAsync(connection, sqliteTransaction, cancellationToken);
             await EnsureNotificationRuleStateSchemaAsync(connection, sqliteTransaction, cancellationToken);
-            await MigrateNotificationRecipientsAsync(connection, sqliteTransaction, cancellationToken);
             await MigrateNotificationDeliverySchemaAsync(connection, sqliteTransaction, cancellationToken);
+            await MigrateNotificationDeliveryBindingSchemaAsync(connection, sqliteTransaction, cancellationToken);
             await MigrateSystemNotificationDeliverySchemaAsync(connection, sqliteTransaction, cancellationToken);
+            await MigrateSystemNotificationDeliveryBindingSchemaAsync(connection, sqliteTransaction, cancellationToken);
+            await MigrateNotificationRecipientSchemaAsync(connection, sqliteTransaction, cancellationToken);
+            await MigrateNotificationRecipientsAsync(connection, sqliteTransaction, cancellationToken);
             await EnsureLegacyNotificationDeliveryUniqueIndexAsync(connection, sqliteTransaction, cancellationToken);
             await BackfillNotificationDeliveryRecipientsAsync(connection, sqliteTransaction, cancellationToken);
             await SetSchemaVersionAsync(connection, sqliteTransaction, cancellationToken);
@@ -1065,29 +1090,84 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
     {
         var normalized = NormalizeRecipient(recipient);
         await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
-        command.CommandText = "INSERT OR IGNORE INTO NotificationRecipient(Note,OpenId,TargetType,CreatedAt,UpdatedAt) VALUES($note,$openid,$type,$created,$updated)";
-        Add(command, "$note", normalized.Note);
-        Add(command, "$openid", normalized.OpenId);
-        Add(command, "$type", (int)normalized.TargetType);
-        Add(command, "$created", Time(normalized.CreatedAt));
-        Add(command, "$updated", Time(normalized.UpdatedAt));
-        await command.ExecuteNonQueryAsync(cancellationToken);
-        await using var select = connection.CreateCommand();
-        select.CommandText = "SELECT * FROM NotificationRecipient WHERE TargetType=$type AND OpenId=$openid";
-        Add(select, "$type", (int)normalized.TargetType);
-        Add(select, "$openid", normalized.OpenId);
-        await using var reader = await select.ExecuteReaderAsync(cancellationToken);
-        if (!await reader.ReadAsync(cancellationToken)) throw new InvalidOperationException("QQ 接收人保存失败。");
-        return ReadNotificationRecipient(reader);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        var sqliteTransaction = (SqliteTransaction)transaction;
+
+        // Keep callers compiled against the old model idempotent while moving
+        // their value into the legacy/unknown Bot scope. New contacts have no
+        // OpenID on the parent row and therefore are never deduplicated by it.
+        if (!string.IsNullOrWhiteSpace(normalized.LegacyOpenId))
+        {
+            var legacyProfileId = await EnsureLegacyUnknownBotProfileInTransactionAsync(connection, sqliteTransaction, cancellationToken);
+            var existingId = await ScalarLongInTransactionAsync(connection, sqliteTransaction,
+                "SELECT r.Id FROM NotificationRecipient r JOIN NotificationRecipientBotBinding b ON b.RecipientId=r.Id WHERE b.BotProfileId=$bot AND b.TargetType=$type AND b.OpenId=$openid ORDER BY r.Id LIMIT 1",
+                [("$bot", legacyProfileId), ("$type", (int)normalized.TargetType), ("$openid", normalized.LegacyOpenId)], cancellationToken);
+            if (existingId > 0)
+            {
+                await transaction.CommitAsync(cancellationToken);
+                return await GetNotificationRecipientAsync(existingId, cancellationToken)
+                    ?? throw new InvalidOperationException("QQ 接收人保存失败。");
+            }
+        }
+
+        NotificationRecipient created;
+        await using (var command = connection.CreateCommand())
+        {
+            command.Transaction = sqliteTransaction;
+            command.CommandText = "INSERT INTO NotificationRecipient(Note,OpenId,TargetType,CreatedAt,UpdatedAt) VALUES($note,$openid,$type,$created,$updated) RETURNING *";
+            Add(command, "$note", normalized.Note);
+            Add(command, "$openid", normalized.LegacyOpenId ?? string.Empty);
+            Add(command, "$type", (int)normalized.TargetType);
+            Add(command, "$created", Time(normalized.CreatedAt));
+            Add(command, "$updated", Time(normalized.UpdatedAt));
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            if (!await reader.ReadAsync(cancellationToken)) throw new InvalidOperationException("QQ 接收人保存失败。");
+            created = ReadNotificationRecipient(reader);
+        }
+
+        if (!string.IsNullOrWhiteSpace(normalized.LegacyOpenId) && !normalized.LegacyOpenId.Contains('*', StringComparison.Ordinal))
+        {
+            var legacyProfileId = await EnsureLegacyUnknownBotProfileInTransactionAsync(connection, sqliteTransaction, cancellationToken);
+            await ExecuteInTransactionAsync(connection, sqliteTransaction,
+                "INSERT OR IGNORE INTO NotificationRecipientBotBinding(RecipientId,BotProfileId,TargetType,OpenId,CreatedAt,UpdatedAt) VALUES($recipient,$bot,$type,$openid,$now,$now)",
+                [("$recipient", created.Id), ("$bot", legacyProfileId), ("$type", (int)created.TargetType), ("$openid", normalized.LegacyOpenId), ("$now", Time(normalized.CreatedAt))], cancellationToken);
+        }
+        await transaction.CommitAsync(cancellationToken);
+        return created;
     }
 
     public async Task UpdateNotificationRecipientAsync(NotificationRecipient recipient, CancellationToken cancellationToken)
     {
         if (recipient.Id <= 0) throw new ArgumentException("QQ 接收人编号无效。", nameof(recipient));
         var normalized = NormalizeRecipient(recipient);
-        await ExecuteAsync("UPDATE NotificationRecipient SET Note=$note,OpenId=$openid,TargetType=$type,UpdatedAt=$updated WHERE Id=$id",
-            [("$note", normalized.Note), ("$openid", normalized.OpenId), ("$type", (int)normalized.TargetType), ("$updated", Time(normalized.UpdatedAt)), ("$id", normalized.Id)], cancellationToken);
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        var sqliteTransaction = (SqliteTransaction)transaction;
+        var current = await ReadNotificationRecipientInTransactionAsync(connection, sqliteTransaction, normalized.Id, cancellationToken)
+            ?? throw new InvalidOperationException("所选 QQ 接收人不存在，请刷新后重试。");
+        await ExecuteInTransactionAsync(connection, sqliteTransaction,
+            "UPDATE NotificationRecipient SET Note=$note,TargetType=$type,UpdatedAt=$updated WHERE Id=$id",
+            [("$note", normalized.Note), ("$type", (int)normalized.TargetType), ("$updated", Time(normalized.UpdatedAt)), ("$id", normalized.Id)], cancellationToken);
+
+        if (current.TargetType != normalized.TargetType)
+            await ExecuteInTransactionAsync(connection, sqliteTransaction,
+                "UPDATE NotificationRecipientBotBinding SET TargetType=$type,UpdatedAt=$updated WHERE RecipientId=$recipient",
+                [("$type", (int)normalized.TargetType), ("$updated", Time(normalized.UpdatedAt)), ("$recipient", normalized.Id)], cancellationToken);
+
+        if (normalized.LegacyOpenId is not null && !string.Equals(normalized.LegacyOpenId, current.LegacyOpenId, StringComparison.Ordinal))
+        {
+            await ExecuteInTransactionAsync(connection, sqliteTransaction,
+                "UPDATE NotificationRecipient SET OpenId=$openid WHERE Id=$id",
+                [("$openid", normalized.LegacyOpenId), ("$id", normalized.Id)], cancellationToken);
+            if (!normalized.LegacyOpenId.Contains('*', StringComparison.Ordinal))
+            {
+                var legacyProfileId = await EnsureLegacyUnknownBotProfileInTransactionAsync(connection, sqliteTransaction, cancellationToken);
+                await ExecuteInTransactionAsync(connection, sqliteTransaction,
+                    "INSERT INTO NotificationRecipientBotBinding(RecipientId,BotProfileId,TargetType,OpenId,CreatedAt,UpdatedAt) VALUES($recipient,$bot,$type,$openid,$now,$now) ON CONFLICT(RecipientId,BotProfileId) DO UPDATE SET TargetType=$type,OpenId=$openid,UpdatedAt=$now",
+                    [("$recipient", normalized.Id), ("$bot", legacyProfileId), ("$type", (int)normalized.TargetType), ("$openid", normalized.LegacyOpenId), ("$now", Time(normalized.UpdatedAt))], cancellationToken);
+            }
+        }
+        await transaction.CommitAsync(cancellationToken);
     }
 
     public async Task DeleteNotificationRecipientAsync(long recipientId, CancellationToken cancellationToken)
@@ -1105,6 +1185,129 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         Add(command, "$id", recipientId);
         return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture);
     }
+
+    public async Task<IReadOnlyList<QqBotProfile>> GetQqBotProfilesAsync(CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT * FROM QqBotProfile ORDER BY ScopeKind,UpdatedAt DESC,Id";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var result = new List<QqBotProfile>();
+        while (await reader.ReadAsync(cancellationToken)) result.Add(ReadQqBotProfile(reader));
+        return result;
+    }
+
+    public async Task<QqBotProfile?> GetQqBotProfileByAppIdAsync(string appId, CancellationToken cancellationToken)
+    {
+        var normalized = (appId ?? string.Empty).Trim();
+        if (normalized.Length == 0) return null;
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT * FROM QqBotProfile WHERE AppId=$app LIMIT 1";
+        Add(command, "$app", normalized);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadQqBotProfile(reader) : null;
+    }
+
+    public async Task<QqBotProfile> EnsureQqBotProfileAsync(string appId, string displayName, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        var normalizedAppId = NormalizeActualAppId(appId);
+        var normalizedName = string.IsNullOrWhiteSpace(displayName) ? "当前 QQ Bot" : displayName.Trim();
+        if (normalizedName.Length > 120) throw new ArgumentException("QQ Bot 名称不能超过 120 个字符。", nameof(displayName));
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO QqBotProfile(AppId,DisplayName,ScopeKind,CreatedAt,UpdatedAt,LastUsedAt)
+            VALUES($app,$name,$scope,$created,$updated,NULL)
+            ON CONFLICT(AppId) DO UPDATE SET DisplayName=$name,ScopeKind=$scope,UpdatedAt=$updated
+            """;
+        Add(command, "$app", normalizedAppId); Add(command, "$name", normalizedName);
+        Add(command, "$scope", (int)QqBotProfileScopeKind.Actual);
+        Add(command, "$created", Time(now)); Add(command, "$updated", Time(now));
+        await command.ExecuteNonQueryAsync(cancellationToken);
+        return await GetQqBotProfileByAppIdAsync(normalizedAppId, cancellationToken)
+            ?? throw new InvalidOperationException("QQ Bot Profile 保存失败。");
+    }
+
+    public async Task<IReadOnlyList<NotificationRecipientBotBinding>> GetNotificationRecipientBotBindingsAsync(long recipientId, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT * FROM NotificationRecipientBotBinding WHERE RecipientId=$recipient ORDER BY UpdatedAt DESC,Id DESC";
+        Add(command, "$recipient", recipientId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var result = new List<NotificationRecipientBotBinding>();
+        while (await reader.ReadAsync(cancellationToken)) result.Add(ReadNotificationRecipientBotBinding(reader));
+        return result;
+    }
+
+    public async Task<NotificationRecipientBotBinding?> GetNotificationRecipientBotBindingAsync(long recipientId, long botProfileId, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT * FROM NotificationRecipientBotBinding WHERE RecipientId=$recipient AND BotProfileId=$bot LIMIT 1";
+        Add(command, "$recipient", recipientId); Add(command, "$bot", botProfileId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadNotificationRecipientBotBinding(reader) : null;
+    }
+
+    public async Task<NotificationRecipientBotBinding> UpsertNotificationRecipientBotBindingAsync(NotificationRecipientBotBinding binding, CancellationToken cancellationToken)
+    {
+        var normalized = NormalizeBotBinding(binding);
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        var sqliteTransaction = (SqliteTransaction)transaction;
+        var recipientType = await ScalarLongInTransactionAsync(connection, sqliteTransaction,
+            "SELECT TargetType FROM NotificationRecipient WHERE Id=$recipient LIMIT 1",
+            [("$recipient", normalized.RecipientId)], cancellationToken);
+        if (recipientType == 0) throw new ArgumentException("QQ 接收人不存在。", nameof(binding));
+        if (recipientType != (int)normalized.TargetType)
+            throw new ArgumentException("QQ Bot 绑定的目标类型与接收人不一致。", nameof(binding));
+        var botExists = await ScalarLongInTransactionAsync(connection, sqliteTransaction,
+            "SELECT EXISTS(SELECT 1 FROM QqBotProfile WHERE Id=$bot)", [("$bot", normalized.BotProfileId)], cancellationToken);
+        if (botExists == 0) throw new ArgumentException("QQ Bot Profile 不存在。", nameof(binding));
+
+        await ExecuteInTransactionAsync(connection, sqliteTransaction, """
+            INSERT INTO NotificationRecipientBotBinding(
+              RecipientId,BotProfileId,TargetType,OpenId,CreatedAt,UpdatedAt,
+              LastVerifiedAt,LastSuccessfulSendAt,LastSendStatus,LastErrorCode)
+            VALUES($recipient,$bot,$type,$openid,$created,$updated,$verified,$successful,$status,$error)
+            ON CONFLICT(RecipientId,BotProfileId) DO UPDATE SET
+              TargetType=$type,OpenId=$openid,UpdatedAt=$updated,
+              LastVerifiedAt=$verified,LastSuccessfulSendAt=$successful,
+              LastSendStatus=$status,LastErrorCode=$error
+            """, [
+                ("$recipient", normalized.RecipientId), ("$bot", normalized.BotProfileId),
+                ("$type", (int)normalized.TargetType), ("$openid", normalized.OpenId),
+                ("$created", Time(normalized.CreatedAt)), ("$updated", Time(normalized.UpdatedAt)),
+                ("$verified", normalized.LastVerifiedAt is null ? null : Time(normalized.LastVerifiedAt.Value)),
+                ("$successful", normalized.LastSuccessfulSendAt is null ? null : Time(normalized.LastSuccessfulSendAt.Value)),
+                ("$status", normalized.LastSendStatus), ("$error", normalized.LastErrorCode)
+            ], cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        return await GetNotificationRecipientBotBindingAsync(normalized.RecipientId, normalized.BotProfileId, cancellationToken)
+            ?? throw new InvalidOperationException("QQ Bot 绑定保存失败。");
+    }
+
+    public Task DeleteNotificationRecipientBotBindingAsync(long bindingId, CancellationToken cancellationToken) =>
+        ExecuteAsync("DELETE FROM NotificationRecipientBotBinding WHERE Id=$id", [("$id", bindingId)], cancellationToken);
+
+    public Task UpdateNotificationRecipientBotBindingStatusAsync(
+        long bindingId,
+        DateTimeOffset verifiedAt,
+        DateTimeOffset? successfulSendAt,
+        string status,
+        int? errorCode,
+        CancellationToken cancellationToken) =>
+        ExecuteAsync("UPDATE NotificationRecipientBotBinding SET LastVerifiedAt=$verified,LastSuccessfulSendAt=COALESCE($successful,LastSuccessfulSendAt),LastSendStatus=$status,LastErrorCode=$error,UpdatedAt=$verified WHERE Id=$id",
+            [
+                ("$verified", Time(verifiedAt)), ("$successful", successfulSendAt is null ? null : Time(successfulSendAt.Value)),
+                ("$status", status), ("$error", errorCode), ("$id", bindingId)
+            ], cancellationToken);
+
+    public Task TouchQqBotProfileLastUsedAsync(long botProfileId, DateTimeOffset usedAt, CancellationToken cancellationToken) =>
+        ExecuteAsync("UPDATE QqBotProfile SET LastUsedAt=$used,UpdatedAt=CASE WHEN UpdatedAt<$used THEN $used ELSE UpdatedAt END WHERE Id=$id",
+            [("$used", Time(usedAt)), ("$id", botProfileId)], cancellationToken);
 
     public async Task<IReadOnlyList<NotificationRecipient>> GetNotificationRuleRecipientsAsync(long ruleId, CancellationToken cancellationToken)
     {
@@ -1193,11 +1396,17 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
     {
         if (delivery.RuleId is not > 0 || delivery.SubjectId is not > 0 || string.IsNullOrWhiteSpace(delivery.EpisodeId)) throw new ArgumentException("通知投递信息不完整。", nameof(delivery));
         if (delivery.Channel != NotificationChannelType.QQ) throw new ArgumentOutOfRangeException(nameof(delivery), "当前只支持 QQ 通知。");
-        if (delivery.TargetType is not (NotificationTargetType.Private or NotificationTargetType.Group) || string.IsNullOrWhiteSpace(delivery.TargetId)) throw new ArgumentException("QQ 通知目标无效。", nameof(delivery));
+        if (delivery.TargetType is not (NotificationTargetType.Private or NotificationTargetType.Group)) throw new ArgumentException("QQ 通知目标无效。", nameof(delivery));
+        if (delivery.Status == NotificationDeliveryStatus.BindingRequired)
+        {
+            if (!string.IsNullOrEmpty(delivery.TargetId)) throw new ArgumentException("缺少绑定的投递不能保存目标 OpenID。", nameof(delivery));
+        }
+        else if (string.IsNullOrWhiteSpace(delivery.TargetId) || delivery.TargetId.Contains('*', StringComparison.Ordinal))
+            throw new ArgumentException("QQ 通知目标必须是完整 Raw OpenID。", nameof(delivery));
         await using var connection = await OpenAsync(cancellationToken);
         await using (var insert = connection.CreateCommand())
         {
-            insert.CommandText = "INSERT OR IGNORE INTO NotificationDelivery(RuleId,SubjectId,EpisodeId,CreatedAt,Status,DeliveredAt,Channel,TargetType,TargetId,RecipientId,Message,Error,SentParts,TotalParts,LastAttemptAt,NextAttemptAt) VALUES($rule,$subject,$episode,$created,$status,$delivered,$channel,$targetType,$target,$recipient,$message,$error,$sent,$total,$last,$next)";
+            insert.CommandText = "INSERT OR IGNORE INTO NotificationDelivery(RuleId,SubjectId,EpisodeId,CreatedAt,Status,DeliveredAt,Channel,TargetType,TargetId,RecipientId,BotProfileId,RecipientBindingId,Message,Error,SentParts,TotalParts,LastAttemptAt,NextAttemptAt) VALUES($rule,$subject,$episode,$created,$status,$delivered,$channel,$targetType,$target,$recipient,$bot,$binding,$message,$error,$sent,$total,$last,$next)";
             AddDeliveryParameters(insert, delivery); await insert.ExecuteNonQueryAsync(cancellationToken);
         }
         await using var select = connection.CreateCommand(); select.CommandText = "SELECT * FROM NotificationDelivery WHERE RuleId=$rule AND EpisodeId=$episode AND ((RecipientId=$recipient) OR ($recipient IS NULL AND RecipientId IS NULL)) ORDER BY Id"; Add(select, "$rule", delivery.RuleId); Add(select, "$episode", delivery.EpisodeId); Add(select, "$recipient", delivery.RecipientId);
@@ -1246,13 +1455,19 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
 
     public async Task<SystemNotificationDelivery> CreateSystemNotificationDeliveryAsync(SystemNotificationDelivery delivery, CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(delivery.EpisodeId) || string.IsNullOrWhiteSpace(delivery.TargetId)) throw new ArgumentException("系统通知投递信息不完整。", nameof(delivery));
+        if (string.IsNullOrWhiteSpace(delivery.EpisodeId)) throw new ArgumentException("系统通知投递信息不完整。", nameof(delivery));
         if (delivery.Kind is not (SystemNotificationKind.XiaomiConnectionFailure or SystemNotificationKind.XiaomiConnectionRecovery)) throw new ArgumentOutOfRangeException(nameof(delivery));
         if (delivery.Channel != NotificationChannelType.QQ || delivery.TargetType is not (NotificationTargetType.Private or NotificationTargetType.Group)) throw new ArgumentException("系统通知目标无效。", nameof(delivery));
+        if (delivery.Status == NotificationDeliveryStatus.BindingRequired)
+        {
+            if (!string.IsNullOrEmpty(delivery.TargetId)) throw new ArgumentException("缺少绑定的系统投递不能保存目标 OpenID。", nameof(delivery));
+        }
+        else if (string.IsNullOrWhiteSpace(delivery.TargetId) || delivery.TargetId.Contains('*', StringComparison.Ordinal))
+            throw new ArgumentException("系统通知目标必须是完整 Raw OpenID。", nameof(delivery));
         await using var connection = await OpenAsync(cancellationToken);
         await using (var insert = connection.CreateCommand())
         {
-            insert.CommandText = "INSERT OR IGNORE INTO SystemNotificationDelivery(Kind,EpisodeId,CreatedAt,Status,DeliveredAt,Channel,TargetType,TargetId,RecipientId,Message,Error,SentParts,TotalParts,LastAttemptAt,NextAttemptAt) VALUES($kind,$episode,$created,$status,$delivered,$channel,$targetType,$target,$recipient,$message,$error,$sent,$total,$last,$next)";
+            insert.CommandText = "INSERT OR IGNORE INTO SystemNotificationDelivery(Kind,EpisodeId,CreatedAt,Status,DeliveredAt,Channel,TargetType,TargetId,RecipientId,BotProfileId,RecipientBindingId,Message,Error,SentParts,TotalParts,LastAttemptAt,NextAttemptAt) VALUES($kind,$episode,$created,$status,$delivered,$channel,$targetType,$target,$recipient,$bot,$binding,$message,$error,$sent,$total,$last,$next)";
             AddSystemDeliveryParameters(insert, delivery); await insert.ExecuteNonQueryAsync(cancellationToken);
         }
         await using var select = connection.CreateCommand(); select.CommandText = "SELECT * FROM SystemNotificationDelivery WHERE Kind=$kind AND EpisodeId=$episode AND ((RecipientId=$recipient) OR ($recipient IS NULL AND RecipientId IS NULL)) ORDER BY Id"; Add(select, "$kind", (int)delivery.Kind); Add(select, "$episode", delivery.EpisodeId); Add(select, "$recipient", delivery.RecipientId);
@@ -1792,6 +2007,20 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         return await reader.ReadAsync(cancellationToken) ? ReadNotificationDelivery(reader) : null;
     }
 
+    private static async Task<NotificationRecipient?> ReadNotificationRecipientInTransactionAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        long recipientId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "SELECT * FROM NotificationRecipient WHERE Id=$id";
+        Add(command, "$id", recipientId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadNotificationRecipient(reader) : null;
+    }
+
     private static async Task<long?> GetLatestSubjectPresenceEventIdInTransactionAsync(
         SqliteConnection connection,
         SqliteTransaction transaction,
@@ -1920,8 +2149,286 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         await alter.ExecuteNonQueryAsync(cancellationToken);
     }
 
+    private static async Task<bool> HasUniqueIndexInTransactionAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string table,
+        IReadOnlyList<string> expectedColumns,
+        CancellationToken cancellationToken)
+    {
+        var indexes = new List<string>();
+        await using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = $"PRAGMA index_list(\"{table.Replace("\"", "\"\"", StringComparison.Ordinal)}\")";
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+                if (reader.GetInt32(2) != 0) indexes.Add(reader.GetString(1));
+        }
+
+        foreach (var index in indexes)
+        {
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = $"PRAGMA index_info(\"{index.Replace("\"", "\"\"", StringComparison.Ordinal)}\")";
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            var columns = new List<string>();
+            while (await reader.ReadAsync(cancellationToken)) columns.Add(reader.GetString(2));
+            if (columns.SequenceEqual(expectedColumns, StringComparer.OrdinalIgnoreCase)) return true;
+        }
+        return false;
+    }
+
+    private static async Task<bool> HasColumnInTransactionAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string table,
+        string column,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = $"PRAGMA table_info(\"{table.Replace("\"", "\"\"", StringComparison.Ordinal)}\")";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+            if (string.Equals(reader.GetString(1), column, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
+
+    private static async Task<bool> HasForeignKeyActionInTransactionAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string table,
+        string referencedTable,
+        string deleteAction,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = $"PRAGMA foreign_key_list(\"{table.Replace("\"", "\"\"", StringComparison.Ordinal)}\")";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+            if (string.Equals(reader.GetString(2), referencedTable, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(reader.GetString(6), deleteAction, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
+
+    private static async Task MigrateNotificationDeliveryBindingSchemaAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        var hasBotProfile = await HasColumnInTransactionAsync(connection, transaction, "NotificationDelivery", "BotProfileId", cancellationToken);
+        var hasBinding = await HasColumnInTransactionAsync(connection, transaction, "NotificationDelivery", "RecipientBindingId", cancellationToken);
+        var hasBotForeignKey = await HasForeignKeyActionInTransactionAsync(connection, transaction, "NotificationDelivery", "QqBotProfile", "SET NULL", cancellationToken);
+        var hasBindingForeignKey = await HasForeignKeyActionInTransactionAsync(connection, transaction, "NotificationDelivery", "NotificationRecipientBotBinding", "SET NULL", cancellationToken);
+        if (hasBotProfile && hasBinding && hasBotForeignKey && hasBindingForeignKey) return;
+
+        var botExpression = hasBotProfile ? "BotProfileId" : "NULL";
+        var bindingExpression = hasBinding ? "RecipientBindingId" : "NULL";
+        var rebuildSql = $"""
+            DROP INDEX IF EXISTS IX_NotificationDelivery_Pending;
+            DROP INDEX IF EXISTS IX_NotificationDelivery_Created;
+            DROP INDEX IF EXISTS UX_NotificationDelivery_LegacyTarget;
+            ALTER TABLE NotificationDelivery RENAME TO NotificationDelivery_Legacy;
+            CREATE TABLE NotificationDelivery_New (
+              Id INTEGER PRIMARY KEY AUTOINCREMENT, RuleId INTEGER NULL, SubjectId INTEGER NULL,
+              EpisodeId TEXT NOT NULL, CreatedAt TEXT NOT NULL, Status INTEGER NOT NULL,
+              DeliveredAt TEXT NULL, Channel INTEGER NOT NULL, TargetType INTEGER NOT NULL,
+              TargetId TEXT NOT NULL, RecipientId INTEGER NULL, BotProfileId INTEGER NULL,
+              RecipientBindingId INTEGER NULL, Message TEXT NOT NULL, Error TEXT NULL,
+              SentParts INTEGER NOT NULL DEFAULT 0, TotalParts INTEGER NOT NULL DEFAULT 0,
+              LastAttemptAt TEXT NULL, NextAttemptAt TEXT NULL,
+              FOREIGN KEY(RuleId) REFERENCES NotificationRule(Id) ON DELETE SET NULL,
+              FOREIGN KEY(SubjectId) REFERENCES PresenceSubject(Id) ON DELETE SET NULL,
+              FOREIGN KEY(RecipientId) REFERENCES NotificationRecipient(Id) ON DELETE SET NULL,
+              FOREIGN KEY(BotProfileId) REFERENCES QqBotProfile(Id) ON DELETE SET NULL,
+              FOREIGN KEY(RecipientBindingId) REFERENCES NotificationRecipientBotBinding(Id) ON DELETE SET NULL,
+              UNIQUE(RuleId,EpisodeId,RecipientId));
+            INSERT INTO NotificationDelivery_New(
+              Id,RuleId,SubjectId,EpisodeId,CreatedAt,Status,DeliveredAt,Channel,TargetType,
+              TargetId,RecipientId,BotProfileId,RecipientBindingId,Message,Error,SentParts,
+              TotalParts,LastAttemptAt,NextAttemptAt)
+            SELECT Id,RuleId,SubjectId,EpisodeId,CreatedAt,Status,DeliveredAt,Channel,TargetType,
+                   TargetId,RecipientId,{botExpression},{bindingExpression},Message,Error,SentParts,
+                   TotalParts,LastAttemptAt,NextAttemptAt FROM NotificationDelivery_Legacy;
+            DROP TABLE NotificationDelivery_Legacy;
+            ALTER TABLE NotificationDelivery_New RENAME TO NotificationDelivery;
+            CREATE UNIQUE INDEX UX_NotificationDelivery_LegacyTarget
+              ON NotificationDelivery(RuleId,EpisodeId,TargetType,TargetId)
+              WHERE RuleId IS NOT NULL AND RecipientId IS NULL;
+            CREATE INDEX IX_NotificationDelivery_Pending ON NotificationDelivery(Status,NextAttemptAt);
+            CREATE INDEX IX_NotificationDelivery_Created ON NotificationDelivery(CreatedAt DESC);
+            """;
+        await ExecuteInTransactionAsync(connection, transaction, rebuildSql, [], cancellationToken);
+    }
+
+    private static async Task MigrateSystemNotificationDeliveryBindingSchemaAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        var hasBotProfile = await HasColumnInTransactionAsync(connection, transaction, "SystemNotificationDelivery", "BotProfileId", cancellationToken);
+        var hasBinding = await HasColumnInTransactionAsync(connection, transaction, "SystemNotificationDelivery", "RecipientBindingId", cancellationToken);
+        var hasBotForeignKey = await HasForeignKeyActionInTransactionAsync(connection, transaction, "SystemNotificationDelivery", "QqBotProfile", "SET NULL", cancellationToken);
+        var hasBindingForeignKey = await HasForeignKeyActionInTransactionAsync(connection, transaction, "SystemNotificationDelivery", "NotificationRecipientBotBinding", "SET NULL", cancellationToken);
+        if (hasBotProfile && hasBinding && hasBotForeignKey && hasBindingForeignKey) return;
+
+        var botExpression = hasBotProfile ? "BotProfileId" : "NULL";
+        var bindingExpression = hasBinding ? "RecipientBindingId" : "NULL";
+        var rebuildSql = $"""
+            DROP INDEX IF EXISTS IX_SystemNotificationDelivery_Pending;
+            DROP INDEX IF EXISTS IX_SystemNotificationDelivery_Created;
+            ALTER TABLE SystemNotificationDelivery RENAME TO SystemNotificationDelivery_Legacy;
+            CREATE TABLE SystemNotificationDelivery_New (
+              Id INTEGER PRIMARY KEY AUTOINCREMENT, Kind INTEGER NOT NULL, EpisodeId TEXT NOT NULL,
+              CreatedAt TEXT NOT NULL, Status INTEGER NOT NULL, DeliveredAt TEXT NULL,
+              Channel INTEGER NOT NULL, TargetType INTEGER NOT NULL, TargetId TEXT NOT NULL,
+              RecipientId INTEGER NULL, BotProfileId INTEGER NULL, RecipientBindingId INTEGER NULL,
+              Message TEXT NOT NULL, Error TEXT NULL, SentParts INTEGER NOT NULL DEFAULT 0,
+              TotalParts INTEGER NOT NULL DEFAULT 0, LastAttemptAt TEXT NULL, NextAttemptAt TEXT NULL,
+              FOREIGN KEY(RecipientId) REFERENCES NotificationRecipient(Id) ON DELETE SET NULL,
+              FOREIGN KEY(BotProfileId) REFERENCES QqBotProfile(Id) ON DELETE SET NULL,
+              FOREIGN KEY(RecipientBindingId) REFERENCES NotificationRecipientBotBinding(Id) ON DELETE SET NULL,
+              UNIQUE(Kind,EpisodeId,RecipientId));
+            INSERT INTO SystemNotificationDelivery_New(
+              Id,Kind,EpisodeId,CreatedAt,Status,DeliveredAt,Channel,TargetType,TargetId,
+              RecipientId,BotProfileId,RecipientBindingId,Message,Error,SentParts,TotalParts,
+              LastAttemptAt,NextAttemptAt)
+            SELECT Id,Kind,EpisodeId,CreatedAt,Status,DeliveredAt,Channel,TargetType,TargetId,
+                   RecipientId,{botExpression},{bindingExpression},Message,Error,SentParts,TotalParts,
+                   LastAttemptAt,NextAttemptAt FROM SystemNotificationDelivery_Legacy;
+            DROP TABLE SystemNotificationDelivery_Legacy;
+            ALTER TABLE SystemNotificationDelivery_New RENAME TO SystemNotificationDelivery;
+            CREATE INDEX IX_SystemNotificationDelivery_Pending ON SystemNotificationDelivery(Status,NextAttemptAt);
+            CREATE INDEX IX_SystemNotificationDelivery_Created ON SystemNotificationDelivery(CreatedAt DESC);
+            """;
+        await ExecuteInTransactionAsync(connection, transaction, rebuildSql, [], cancellationToken);
+    }
+
+    private static async Task MigrateNotificationRecipientSchemaAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        // The 2.1.2 schema used UNIQUE(TargetType,OpenId) on the contact row.
+        // That constraint is an invalid identity model once OpenID is scoped by
+        // Bot/AppID. Rebuild the parent and all dependent tables together so
+        // foreign-key checks remain enabled and every row keeps its Id.
+        if (!await HasUniqueIndexInTransactionAsync(connection, transaction, "NotificationRecipient", ["TargetType", "OpenId"], cancellationToken))
+            return;
+
+        const string rebuildSql = """
+            DROP TABLE IF EXISTS NotificationRuleRecipient_Data;
+            DROP TABLE IF EXISTS NotificationDelivery_Data;
+            DROP TABLE IF EXISTS SystemNotificationDelivery_Data;
+            DROP TABLE IF EXISTS NotificationRecipientBotBinding_Data;
+            CREATE TABLE NotificationRuleRecipient_Data AS SELECT RuleId,RecipientId,CreatedAt FROM NotificationRuleRecipient;
+            CREATE TABLE NotificationDelivery_Data AS SELECT Id,RuleId,SubjectId,EpisodeId,CreatedAt,Status,DeliveredAt,Channel,TargetType,TargetId,RecipientId,BotProfileId,RecipientBindingId,Message,Error,SentParts,TotalParts,LastAttemptAt,NextAttemptAt FROM NotificationDelivery;
+            CREATE TABLE SystemNotificationDelivery_Data AS SELECT Id,Kind,EpisodeId,CreatedAt,Status,DeliveredAt,Channel,TargetType,TargetId,RecipientId,BotProfileId,RecipientBindingId,Message,Error,SentParts,TotalParts,LastAttemptAt,NextAttemptAt FROM SystemNotificationDelivery;
+            CREATE TABLE NotificationRecipientBotBinding_Data AS SELECT Id,RecipientId,BotProfileId,TargetType,OpenId,CreatedAt,UpdatedAt,LastVerifiedAt,LastSuccessfulSendAt,LastSendStatus,LastErrorCode FROM NotificationRecipientBotBinding;
+            DROP TABLE NotificationDelivery;
+            DROP TABLE SystemNotificationDelivery;
+            DROP TABLE NotificationRecipientBotBinding;
+            DROP TABLE NotificationRuleRecipient;
+            ALTER TABLE NotificationRecipient RENAME TO NotificationRecipient_Legacy;
+            CREATE TABLE NotificationRecipient (
+              Id INTEGER PRIMARY KEY AUTOINCREMENT, Note TEXT NOT NULL DEFAULT '',
+              OpenId TEXT NOT NULL DEFAULT '', TargetType INTEGER NOT NULL,
+              CreatedAt TEXT NOT NULL, UpdatedAt TEXT NOT NULL);
+            INSERT INTO NotificationRecipient(Id,Note,OpenId,TargetType,CreatedAt,UpdatedAt)
+              SELECT Id,Note,OpenId,TargetType,CreatedAt,UpdatedAt FROM NotificationRecipient_Legacy;
+            DROP TABLE NotificationRecipient_Legacy;
+            CREATE INDEX IX_NotificationRecipient_Updated ON NotificationRecipient(UpdatedAt DESC,Id DESC);
+            CREATE TABLE NotificationRecipientBotBinding (
+              Id INTEGER PRIMARY KEY AUTOINCREMENT, RecipientId INTEGER NOT NULL,
+              BotProfileId INTEGER NOT NULL, TargetType INTEGER NOT NULL,
+              OpenId TEXT NOT NULL, CreatedAt TEXT NOT NULL, UpdatedAt TEXT NOT NULL,
+              LastVerifiedAt TEXT NULL, LastSuccessfulSendAt TEXT NULL,
+              LastSendStatus TEXT NULL, LastErrorCode INTEGER NULL,
+              UNIQUE(RecipientId,BotProfileId),
+              UNIQUE(BotProfileId,TargetType,OpenId),
+              FOREIGN KEY(RecipientId) REFERENCES NotificationRecipient(Id) ON DELETE CASCADE,
+              FOREIGN KEY(BotProfileId) REFERENCES QqBotProfile(Id) ON DELETE CASCADE);
+            INSERT INTO NotificationRecipientBotBinding(
+              Id,RecipientId,BotProfileId,TargetType,OpenId,CreatedAt,UpdatedAt,
+              LastVerifiedAt,LastSuccessfulSendAt,LastSendStatus,LastErrorCode)
+              SELECT Id,RecipientId,BotProfileId,TargetType,OpenId,CreatedAt,UpdatedAt,
+                     LastVerifiedAt,LastSuccessfulSendAt,LastSendStatus,LastErrorCode
+              FROM NotificationRecipientBotBinding_Data;
+            DROP TABLE NotificationRecipientBotBinding_Data;
+            CREATE INDEX IX_NotificationRecipientBotBinding_Recipient ON NotificationRecipientBotBinding(RecipientId,UpdatedAt DESC);
+            CREATE INDEX IX_NotificationRecipientBotBinding_Bot ON NotificationRecipientBotBinding(BotProfileId,UpdatedAt DESC);
+            CREATE TABLE NotificationRuleRecipient (
+              RuleId INTEGER NOT NULL, RecipientId INTEGER NOT NULL, CreatedAt TEXT NOT NULL,
+              PRIMARY KEY(RuleId,RecipientId),
+              FOREIGN KEY(RuleId) REFERENCES NotificationRule(Id) ON DELETE CASCADE,
+              FOREIGN KEY(RecipientId) REFERENCES NotificationRecipient(Id) ON DELETE RESTRICT);
+            INSERT OR IGNORE INTO NotificationRuleRecipient(RuleId,RecipientId,CreatedAt)
+              SELECT RuleId,RecipientId,CreatedAt FROM NotificationRuleRecipient_Data;
+            DROP TABLE NotificationRuleRecipient_Data;
+            CREATE INDEX IX_NotificationRuleRecipient_Recipient ON NotificationRuleRecipient(RecipientId);
+            CREATE TABLE NotificationDelivery (
+              Id INTEGER PRIMARY KEY AUTOINCREMENT, RuleId INTEGER NULL, SubjectId INTEGER NULL,
+              EpisodeId TEXT NOT NULL, CreatedAt TEXT NOT NULL, Status INTEGER NOT NULL,
+              DeliveredAt TEXT NULL, Channel INTEGER NOT NULL, TargetType INTEGER NOT NULL,
+              TargetId TEXT NOT NULL, RecipientId INTEGER NULL, BotProfileId INTEGER NULL,
+              RecipientBindingId INTEGER NULL, Message TEXT NOT NULL, Error TEXT NULL,
+              SentParts INTEGER NOT NULL DEFAULT 0, TotalParts INTEGER NOT NULL DEFAULT 0,
+              LastAttemptAt TEXT NULL, NextAttemptAt TEXT NULL,
+              FOREIGN KEY(RuleId) REFERENCES NotificationRule(Id) ON DELETE SET NULL,
+              FOREIGN KEY(SubjectId) REFERENCES PresenceSubject(Id) ON DELETE SET NULL,
+              FOREIGN KEY(RecipientId) REFERENCES NotificationRecipient(Id) ON DELETE SET NULL,
+              FOREIGN KEY(BotProfileId) REFERENCES QqBotProfile(Id) ON DELETE SET NULL,
+              FOREIGN KEY(RecipientBindingId) REFERENCES NotificationRecipientBotBinding(Id) ON DELETE SET NULL,
+              UNIQUE(RuleId,EpisodeId,RecipientId));
+            INSERT INTO NotificationDelivery(
+              Id,RuleId,SubjectId,EpisodeId,CreatedAt,Status,DeliveredAt,Channel,TargetType,
+              TargetId,RecipientId,BotProfileId,RecipientBindingId,Message,Error,SentParts,
+              TotalParts,LastAttemptAt,NextAttemptAt)
+              SELECT Id,RuleId,SubjectId,EpisodeId,CreatedAt,Status,DeliveredAt,Channel,TargetType,
+                     TargetId,RecipientId,BotProfileId,RecipientBindingId,Message,Error,SentParts,
+                     TotalParts,LastAttemptAt,NextAttemptAt FROM NotificationDelivery_Data;
+            DROP TABLE NotificationDelivery_Data;
+            CREATE INDEX IX_NotificationDelivery_Pending ON NotificationDelivery(Status,NextAttemptAt);
+            CREATE INDEX IX_NotificationDelivery_Created ON NotificationDelivery(CreatedAt DESC);
+            CREATE TABLE SystemNotificationDelivery (
+              Id INTEGER PRIMARY KEY AUTOINCREMENT, Kind INTEGER NOT NULL, EpisodeId TEXT NOT NULL,
+              CreatedAt TEXT NOT NULL, Status INTEGER NOT NULL, DeliveredAt TEXT NULL,
+              Channel INTEGER NOT NULL, TargetType INTEGER NOT NULL, TargetId TEXT NOT NULL,
+              RecipientId INTEGER NULL, BotProfileId INTEGER NULL, RecipientBindingId INTEGER NULL,
+              Message TEXT NOT NULL, Error TEXT NULL, SentParts INTEGER NOT NULL DEFAULT 0,
+              TotalParts INTEGER NOT NULL DEFAULT 0, LastAttemptAt TEXT NULL, NextAttemptAt TEXT NULL,
+              FOREIGN KEY(RecipientId) REFERENCES NotificationRecipient(Id) ON DELETE SET NULL,
+              FOREIGN KEY(BotProfileId) REFERENCES QqBotProfile(Id) ON DELETE SET NULL,
+              FOREIGN KEY(RecipientBindingId) REFERENCES NotificationRecipientBotBinding(Id) ON DELETE SET NULL,
+              UNIQUE(Kind,EpisodeId,RecipientId));
+            INSERT INTO SystemNotificationDelivery(
+              Id,Kind,EpisodeId,CreatedAt,Status,DeliveredAt,Channel,TargetType,TargetId,
+              RecipientId,BotProfileId,RecipientBindingId,Message,Error,SentParts,TotalParts,
+              LastAttemptAt,NextAttemptAt)
+              SELECT Id,Kind,EpisodeId,CreatedAt,Status,DeliveredAt,Channel,TargetType,TargetId,
+                     RecipientId,BotProfileId,RecipientBindingId,Message,Error,SentParts,TotalParts,
+                     LastAttemptAt,NextAttemptAt FROM SystemNotificationDelivery_Data;
+            DROP TABLE SystemNotificationDelivery_Data;
+            CREATE INDEX IX_SystemNotificationDelivery_Pending ON SystemNotificationDelivery(Status,NextAttemptAt);
+            CREATE INDEX IX_SystemNotificationDelivery_Created ON SystemNotificationDelivery(CreatedAt DESC);
+            """;
+        await ExecuteInTransactionAsync(connection, transaction, rebuildSql, [], cancellationToken);
+    }
+
     private static async Task MigrateNotificationRecipientsAsync(SqliteConnection connection, SqliteTransaction sqliteTransaction, CancellationToken cancellationToken)
     {
+        var legacyRecipients = new List<(long Id, int TargetType, string OpenId)>();
+        await using (var recipients = connection.CreateCommand())
+        {
+            recipients.Transaction = sqliteTransaction;
+            recipients.CommandText = "SELECT Id,TargetType,OpenId FROM NotificationRecipient WHERE OpenId<>''";
+            await using var reader = await recipients.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+                legacyRecipients.Add((reader.GetInt64(0), reader.GetInt32(1), reader.GetString(2)));
+        }
+
         var legacyRules = new List<(long RuleId, int TargetType, string TargetId)>();
         await using (var command = connection.CreateCommand())
         {
@@ -1932,19 +2439,88 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
                 legacyRules.Add((reader.GetInt64(0), reader.GetInt32(1), reader.GetString(2)));
         }
 
+        // A new database, and rules already linked through
+        // NotificationRuleRecipient, do not need a synthetic profile. Only
+        // rows that still carry the pre-binding shape are migrated here.
+        if (legacyRecipients.Count == 0)
+        {
+            var hasUnlinkedRule = false;
+            foreach (var (ruleId, _, _) in legacyRules)
+            {
+                if (await ScalarLongInTransactionAsync(connection, sqliteTransaction,
+                        "SELECT EXISTS(SELECT 1 FROM NotificationRuleRecipient WHERE RuleId=$rule)",
+                        [("$rule", ruleId)], cancellationToken) == 0)
+                {
+                    hasUnlinkedRule = true;
+                    break;
+                }
+            }
+            if (!hasUnlinkedRule) return;
+        }
+        var legacyProfileId = await EnsureLegacyUnknownBotProfileInTransactionAsync(connection, sqliteTransaction, cancellationToken);
+
+        foreach (var (recipientId, targetType, openId) in legacyRecipients)
+        {
+            // A historical masked value is retained in the legacy column for
+            // audit, but never promoted into a sendable raw binding.
+            if (openId.Contains('*', StringComparison.Ordinal)) continue;
+            await ExecuteInTransactionAsync(connection, sqliteTransaction,
+                "INSERT OR IGNORE INTO NotificationRecipientBotBinding(RecipientId,BotProfileId,TargetType,OpenId,CreatedAt,UpdatedAt) VALUES($recipient,$bot,$type,$openid,$now,$now)",
+                [
+                    ("$recipient", recipientId), ("$bot", legacyProfileId), ("$type", targetType),
+                    ("$openid", openId), ("$now", Time(DateTimeOffset.UtcNow))
+                ], cancellationToken);
+        }
+
         foreach (var (ruleId, targetType, targetId) in legacyRules)
         {
-            await ExecuteInTransactionAsync(connection, sqliteTransaction,
-                "INSERT OR IGNORE INTO NotificationRecipient(Note,OpenId,TargetType,CreatedAt,UpdatedAt) VALUES($note,$openid,$type,$now,$now)",
-                [("$note", "已有接收人"), ("$openid", targetId.Trim()), ("$type", targetType), ("$now", Time(DateTimeOffset.UtcNow))], cancellationToken);
+            var hasRelationship = await ScalarLongInTransactionAsync(connection, sqliteTransaction,
+                "SELECT EXISTS(SELECT 1 FROM NotificationRuleRecipient WHERE RuleId=$rule)",
+                [("$rule", ruleId)], cancellationToken);
+            if (hasRelationship != 0) continue;
+
+            // Keep the legacy target byte-for-byte. Migration must never
+            // mask, trim, or reinterpret a target while moving it into the
+            // recipient table.
             var recipientId = await ScalarLongInTransactionAsync(connection, sqliteTransaction,
                 "SELECT Id FROM NotificationRecipient WHERE TargetType=$type AND OpenId=$openid LIMIT 1",
-                [("$type", targetType), ("$openid", targetId.Trim())], cancellationToken);
+                [("$type", targetType), ("$openid", targetId)], cancellationToken);
+            if (recipientId == 0)
+            {
+                await ExecuteInTransactionAsync(connection, sqliteTransaction,
+                    "INSERT INTO NotificationRecipient(Note,OpenId,TargetType,CreatedAt,UpdatedAt) VALUES($note,$openid,$type,$now,$now)",
+                    [("$note", "已有接收人"), ("$openid", targetId), ("$type", targetType), ("$now", Time(DateTimeOffset.UtcNow))], cancellationToken);
+                recipientId = await ScalarLongInTransactionAsync(connection, sqliteTransaction,
+                    "SELECT Id FROM NotificationRecipient WHERE TargetType=$type AND OpenId=$openid ORDER BY Id LIMIT 1",
+                    [("$type", targetType), ("$openid", targetId)], cancellationToken);
+            }
             if (recipientId == 0) continue;
+            if (!targetId.Contains('*', StringComparison.Ordinal))
+                await ExecuteInTransactionAsync(connection, sqliteTransaction,
+                    "INSERT OR IGNORE INTO NotificationRecipientBotBinding(RecipientId,BotProfileId,TargetType,OpenId,CreatedAt,UpdatedAt) VALUES($recipient,$bot,$type,$openid,$now,$now)",
+                    [("$recipient", recipientId), ("$bot", legacyProfileId), ("$type", targetType), ("$openid", targetId), ("$now", Time(DateTimeOffset.UtcNow))], cancellationToken);
             await ExecuteInTransactionAsync(connection, sqliteTransaction,
                 "INSERT OR IGNORE INTO NotificationRuleRecipient(RuleId,RecipientId,CreatedAt) VALUES($rule,$recipient,$now)",
                 [("$rule", ruleId), ("$recipient", recipientId), ("$now", Time(DateTimeOffset.UtcNow))], cancellationToken);
         }
+    }
+
+    private static async Task<long> EnsureLegacyUnknownBotProfileInTransactionAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await ExecuteInTransactionAsync(connection, transaction,
+            "INSERT OR IGNORE INTO QqBotProfile(AppId,DisplayName,ScopeKind,CreatedAt,UpdatedAt,LastUsedAt) VALUES($app,$name,$scope,$now,$now,NULL)",
+            [
+                ("$app", QqBotProfile.LegacyUnknownAppId),
+                ("$name", "旧 QQ Bot（AppID 未记录）"),
+                ("$scope", (int)QqBotProfileScopeKind.LegacyUnknown),
+                ("$now", Time(DateTimeOffset.UtcNow))
+            ], cancellationToken);
+        return await ScalarLongInTransactionAsync(connection, transaction,
+            "SELECT Id FROM QqBotProfile WHERE AppId=$app LIMIT 1",
+            [("$app", QqBotProfile.LegacyUnknownAppId)], cancellationToken);
     }
 
     private static async Task BackfillNotificationDeliveryRecipientsAsync(SqliteConnection connection, SqliteTransaction transaction, CancellationToken cancellationToken)
@@ -2268,12 +2844,35 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
     {
         if (value.TargetType is not (NotificationTargetType.Private or NotificationTargetType.Group))
             throw new ArgumentOutOfRangeException(nameof(value), "QQ 接收人类型无效。");
-        var openId = value.OpenId.Trim();
-        if (openId.Length is 0 or > 256 || openId.Any(char.IsWhiteSpace))
-            throw new ArgumentException("QQ OpenID 无效。", nameof(value));
+        var openId = value.LegacyOpenId?.Trim();
+        if (openId is { Length: 0 }) openId = null;
+        if (openId is not null && (openId.Length is 0 or > 256 || openId.Any(char.IsWhiteSpace) || openId.Contains('*', StringComparison.Ordinal)))
+            throw new ArgumentException("QQ OpenID 无效，不能保存脱敏占位符。", nameof(value));
         var note = value.Note?.Trim() ?? string.Empty;
         if (note.Length > 120) throw new ArgumentException("接收人备注不能超过 120 个字符。", nameof(value));
-        return value with { OpenId = openId, Note = note };
+        return value with { LegacyOpenId = openId, Note = note };
+    }
+
+    private static NotificationRecipientBotBinding NormalizeBotBinding(NotificationRecipientBotBinding value)
+    {
+        if (value.RecipientId <= 0) throw new ArgumentException("QQ 接收人编号无效。", nameof(value));
+        if (value.BotProfileId <= 0) throw new ArgumentException("QQ Bot Profile 编号无效。", nameof(value));
+        if (value.TargetType is not (NotificationTargetType.Private or NotificationTargetType.Group))
+            throw new ArgumentOutOfRangeException(nameof(value), "QQ 绑定目标类型无效。");
+        var openId = value.OpenId?.Trim() ?? string.Empty;
+        if (openId.Length is 0 or > 256 || openId.Any(char.IsWhiteSpace) || openId.Contains('*', StringComparison.Ordinal))
+            throw new ArgumentException("QQ OpenID 无效，不能保存脱敏占位符。", nameof(value));
+        var status = value.LastSendStatus?.Trim();
+        if (status is { Length: > 80 }) throw new ArgumentException("QQ 绑定状态过长。", nameof(value));
+        return value with { OpenId = openId, LastSendStatus = status };
+    }
+
+    private static string NormalizeActualAppId(string appId)
+    {
+        var normalized = appId?.Trim() ?? string.Empty;
+        if (normalized.Length is 0 or > 128 || normalized.Any(char.IsWhiteSpace) || string.Equals(normalized, QqBotProfile.LegacyUnknownAppId, StringComparison.Ordinal))
+            throw new ArgumentException("QQ AppID 无效。", nameof(appId));
+        return normalized;
     }
 
     private async Task<SqliteConnection> OpenAsync(CancellationToken cancellationToken)
@@ -2319,8 +2918,10 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         if (isDurationCondition && (value.ThresholdSeconds < 60 || value.ThresholdSeconds > 365 * 24 * 60 * 60)) throw new ArgumentOutOfRangeException(nameof(value), "通知时长必须在 1 分钟到 365 天之间。");
         if (value.Channel != NotificationChannelType.QQ) throw new ArgumentOutOfRangeException(nameof(value), "当前只支持 QQ 通知。");
         if (value.TargetType is not (NotificationTargetType.Private or NotificationTargetType.Group)) throw new ArgumentOutOfRangeException(nameof(value), "QQ 通知目标类型无效。");
-        var target = value.TargetId.Trim();
-        if (target.Length is 0 or > 256 || target.Any(char.IsWhiteSpace)) throw new ArgumentException("QQ 目标 OpenID 无效。", nameof(value));
+        var target = value.TargetId?.Trim() ?? string.Empty;
+        if (value.RecipientIds.Count == 0 && (target.Length is 0 or > 256 || target.Any(char.IsWhiteSpace)))
+            throw new ArgumentException("QQ 目标 OpenID 无效。", nameof(value));
+        if (target.Contains('*', StringComparison.Ordinal)) throw new ArgumentException("QQ 目标 OpenID 不能使用脱敏占位符。", nameof(value));
         var template = value.MessageTemplate?.Trim() ?? string.Empty;
         if (template.Length > 10_000) throw new ArgumentException("通知内容过长。", nameof(value));
         return value with { TargetId = target, MessageTemplate = template, ThresholdSeconds = isDurationCondition ? value.ThresholdSeconds : 0 };
@@ -2340,7 +2941,7 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         Add(command, "$rule", value.RuleId); Add(command, "$subject", value.SubjectId); Add(command, "$episode", value.EpisodeId);
         Add(command, "$created", Time(value.CreatedAt)); Add(command, "$status", (int)value.Status);
         Add(command, "$delivered", value.DeliveredAt is null ? null : Time(value.DeliveredAt.Value)); Add(command, "$channel", (int)value.Channel);
-        Add(command, "$targetType", (int)value.TargetType); Add(command, "$target", value.TargetId); Add(command, "$recipient", value.RecipientId); Add(command, "$message", value.Message);
+        Add(command, "$targetType", (int)value.TargetType); Add(command, "$target", value.TargetId); Add(command, "$recipient", value.RecipientId); Add(command, "$bot", value.BotProfileId); Add(command, "$binding", value.RecipientBindingId); Add(command, "$message", value.Message);
         Add(command, "$error", value.Error); Add(command, "$sent", value.SentParts); Add(command, "$total", value.TotalParts);
         Add(command, "$last", value.LastAttemptAt is null ? null : Time(value.LastAttemptAt.Value)); Add(command, "$next", value.NextAttemptAt is null ? null : Time(value.NextAttemptAt.Value));
     }
@@ -2348,7 +2949,7 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
     private static void AddSystemDeliveryParameters(SqliteCommand command, SystemNotificationDelivery value)
     {
         Add(command, "$kind", (int)value.Kind); Add(command, "$episode", value.EpisodeId); Add(command, "$created", Time(value.CreatedAt)); Add(command, "$status", (int)value.Status);
-        Add(command, "$delivered", value.DeliveredAt is null ? null : Time(value.DeliveredAt.Value)); Add(command, "$channel", (int)value.Channel); Add(command, "$targetType", (int)value.TargetType); Add(command, "$target", value.TargetId); Add(command, "$recipient", value.RecipientId); Add(command, "$message", value.Message); Add(command, "$error", value.Error); Add(command, "$sent", value.SentParts); Add(command, "$total", value.TotalParts);
+        Add(command, "$delivered", value.DeliveredAt is null ? null : Time(value.DeliveredAt.Value)); Add(command, "$channel", (int)value.Channel); Add(command, "$targetType", (int)value.TargetType); Add(command, "$target", value.TargetId); Add(command, "$recipient", value.RecipientId); Add(command, "$bot", value.BotProfileId); Add(command, "$binding", value.RecipientBindingId); Add(command, "$message", value.Message); Add(command, "$error", value.Error); Add(command, "$sent", value.SentParts); Add(command, "$total", value.TotalParts);
         Add(command, "$last", value.LastAttemptAt is null ? null : Time(value.LastAttemptAt.Value)); Add(command, "$next", value.NextAttemptAt is null ? null : Time(value.NextAttemptAt.Value));
     }
 
@@ -2387,10 +2988,30 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
     private static NotificationRecipient ReadNotificationRecipient(SqliteDataReader reader) => new(
         reader.GetInt64(reader.GetOrdinal("Id")),
         reader.GetString(reader.GetOrdinal("Note")),
-        reader.GetString(reader.GetOrdinal("OpenId")),
         (NotificationTargetType)reader.GetInt32(reader.GetOrdinal("TargetType")),
         ParseTime(reader.GetString(reader.GetOrdinal("CreatedAt"))),
-        ParseTime(reader.GetString(reader.GetOrdinal("UpdatedAt"))));
+        ParseTime(reader.GetString(reader.GetOrdinal("UpdatedAt"))),
+        Text(reader, "OpenId") is { Length: > 0 } legacyOpenId ? legacyOpenId : null);
+    private static QqBotProfile ReadQqBotProfile(SqliteDataReader reader) => new(
+        reader.GetInt64(reader.GetOrdinal("Id")),
+        reader.GetString(reader.GetOrdinal("AppId")),
+        reader.GetString(reader.GetOrdinal("DisplayName")),
+        ParseTime(reader.GetString(reader.GetOrdinal("CreatedAt"))),
+        ParseTime(reader.GetString(reader.GetOrdinal("UpdatedAt"))),
+        Text(reader, "LastUsedAt") is { } used ? ParseTime(used) : null,
+        (QqBotProfileScopeKind)reader.GetInt32(reader.GetOrdinal("ScopeKind")));
+    private static NotificationRecipientBotBinding ReadNotificationRecipientBotBinding(SqliteDataReader reader) => new(
+        reader.GetInt64(reader.GetOrdinal("Id")),
+        reader.GetInt64(reader.GetOrdinal("RecipientId")),
+        reader.GetInt64(reader.GetOrdinal("BotProfileId")),
+        (NotificationTargetType)reader.GetInt32(reader.GetOrdinal("TargetType")),
+        reader.GetString(reader.GetOrdinal("OpenId")),
+        ParseTime(reader.GetString(reader.GetOrdinal("CreatedAt"))),
+        ParseTime(reader.GetString(reader.GetOrdinal("UpdatedAt"))),
+        Text(reader, "LastVerifiedAt") is { } verified ? ParseTime(verified) : null,
+        Text(reader, "LastSuccessfulSendAt") is { } successful ? ParseTime(successful) : null,
+        Text(reader, "LastSendStatus"),
+        reader.IsDBNull(reader.GetOrdinal("LastErrorCode")) ? null : reader.GetInt32(reader.GetOrdinal("LastErrorCode")));
     private static SubjectPresenceEvent ReadSubjectPresenceEvent(SqliteDataReader reader) => new(
         reader.GetInt64(reader.GetOrdinal("Id")),
         reader.GetInt64(reader.GetOrdinal("SubjectId")),
@@ -2409,8 +3030,8 @@ public sealed class SqlitePresenceRepository(IAppDataPaths paths) : IPresenceRep
         Text(reader, "LastDeliveryError"),
         ParseTime(reader.GetString(reader.GetOrdinal("UpdatedAt"))),
         reader.IsDBNull(reader.GetOrdinal("LastProcessedSubjectEventId")) ? null : reader.GetInt64(reader.GetOrdinal("LastProcessedSubjectEventId")));
-    private static NotificationDelivery ReadNotificationDelivery(SqliteDataReader reader) => new(reader.GetInt64(reader.GetOrdinal("Id")), reader.IsDBNull(reader.GetOrdinal("RuleId")) ? null : reader.GetInt64(reader.GetOrdinal("RuleId")), reader.IsDBNull(reader.GetOrdinal("SubjectId")) ? null : reader.GetInt64(reader.GetOrdinal("SubjectId")), reader.GetString(reader.GetOrdinal("EpisodeId")), ParseTime(reader.GetString(reader.GetOrdinal("CreatedAt"))), (NotificationDeliveryStatus)reader.GetInt32(reader.GetOrdinal("Status")), Text(reader, "DeliveredAt") is { } delivered ? ParseTime(delivered) : null, (NotificationChannelType)reader.GetInt32(reader.GetOrdinal("Channel")), (NotificationTargetType)reader.GetInt32(reader.GetOrdinal("TargetType")), reader.GetString(reader.GetOrdinal("TargetId")), reader.GetString(reader.GetOrdinal("Message")), Text(reader, "Error"), reader.GetInt32(reader.GetOrdinal("SentParts")), reader.GetInt32(reader.GetOrdinal("TotalParts")), Text(reader, "LastAttemptAt") is { } attempted ? ParseTime(attempted) : null, Text(reader, "NextAttemptAt") is { } next ? ParseTime(next) : null, reader.IsDBNull(reader.GetOrdinal("RecipientId")) ? null : reader.GetInt64(reader.GetOrdinal("RecipientId")));
-    private static SystemNotificationDelivery ReadSystemNotificationDelivery(SqliteDataReader reader) => new(reader.GetInt64(reader.GetOrdinal("Id")), (SystemNotificationKind)reader.GetInt32(reader.GetOrdinal("Kind")), reader.GetString(reader.GetOrdinal("EpisodeId")), ParseTime(reader.GetString(reader.GetOrdinal("CreatedAt"))), (NotificationDeliveryStatus)reader.GetInt32(reader.GetOrdinal("Status")), Text(reader, "DeliveredAt") is { } delivered ? ParseTime(delivered) : null, (NotificationChannelType)reader.GetInt32(reader.GetOrdinal("Channel")), (NotificationTargetType)reader.GetInt32(reader.GetOrdinal("TargetType")), reader.GetString(reader.GetOrdinal("TargetId")), reader.GetString(reader.GetOrdinal("Message")), Text(reader, "Error"), reader.GetInt32(reader.GetOrdinal("SentParts")), reader.GetInt32(reader.GetOrdinal("TotalParts")), Text(reader, "LastAttemptAt") is { } attempted ? ParseTime(attempted) : null, Text(reader, "NextAttemptAt") is { } next ? ParseTime(next) : null, reader.IsDBNull(reader.GetOrdinal("RecipientId")) ? null : reader.GetInt64(reader.GetOrdinal("RecipientId")));
+    private static NotificationDelivery ReadNotificationDelivery(SqliteDataReader reader) => new(reader.GetInt64(reader.GetOrdinal("Id")), reader.IsDBNull(reader.GetOrdinal("RuleId")) ? null : reader.GetInt64(reader.GetOrdinal("RuleId")), reader.IsDBNull(reader.GetOrdinal("SubjectId")) ? null : reader.GetInt64(reader.GetOrdinal("SubjectId")), reader.GetString(reader.GetOrdinal("EpisodeId")), ParseTime(reader.GetString(reader.GetOrdinal("CreatedAt"))), (NotificationDeliveryStatus)reader.GetInt32(reader.GetOrdinal("Status")), Text(reader, "DeliveredAt") is { } delivered ? ParseTime(delivered) : null, (NotificationChannelType)reader.GetInt32(reader.GetOrdinal("Channel")), (NotificationTargetType)reader.GetInt32(reader.GetOrdinal("TargetType")), reader.GetString(reader.GetOrdinal("TargetId")), reader.GetString(reader.GetOrdinal("Message")), Text(reader, "Error"), reader.GetInt32(reader.GetOrdinal("SentParts")), reader.GetInt32(reader.GetOrdinal("TotalParts")), Text(reader, "LastAttemptAt") is { } attempted ? ParseTime(attempted) : null, Text(reader, "NextAttemptAt") is { } next ? ParseTime(next) : null, reader.IsDBNull(reader.GetOrdinal("RecipientId")) ? null : reader.GetInt64(reader.GetOrdinal("RecipientId")), reader.IsDBNull(reader.GetOrdinal("BotProfileId")) ? null : reader.GetInt64(reader.GetOrdinal("BotProfileId")), reader.IsDBNull(reader.GetOrdinal("RecipientBindingId")) ? null : reader.GetInt64(reader.GetOrdinal("RecipientBindingId")));
+    private static SystemNotificationDelivery ReadSystemNotificationDelivery(SqliteDataReader reader) => new(reader.GetInt64(reader.GetOrdinal("Id")), (SystemNotificationKind)reader.GetInt32(reader.GetOrdinal("Kind")), reader.GetString(reader.GetOrdinal("EpisodeId")), ParseTime(reader.GetString(reader.GetOrdinal("CreatedAt"))), (NotificationDeliveryStatus)reader.GetInt32(reader.GetOrdinal("Status")), Text(reader, "DeliveredAt") is { } delivered ? ParseTime(delivered) : null, (NotificationChannelType)reader.GetInt32(reader.GetOrdinal("Channel")), (NotificationTargetType)reader.GetInt32(reader.GetOrdinal("TargetType")), reader.GetString(reader.GetOrdinal("TargetId")), reader.GetString(reader.GetOrdinal("Message")), Text(reader, "Error"), reader.GetInt32(reader.GetOrdinal("SentParts")), reader.GetInt32(reader.GetOrdinal("TotalParts")), Text(reader, "LastAttemptAt") is { } attempted ? ParseTime(attempted) : null, Text(reader, "NextAttemptAt") is { } next ? ParseTime(next) : null, reader.IsDBNull(reader.GetOrdinal("RecipientId")) ? null : reader.GetInt64(reader.GetOrdinal("RecipientId")), reader.IsDBNull(reader.GetOrdinal("BotProfileId")) ? null : reader.GetInt64(reader.GetOrdinal("BotProfileId")), reader.IsDBNull(reader.GetOrdinal("RecipientBindingId")) ? null : reader.GetInt64(reader.GetOrdinal("RecipientBindingId")));
     private static string? Text(SqliteDataReader reader, string name) { var i = reader.GetOrdinal(name); return reader.IsDBNull(i) ? null : reader.GetString(i); }
     private static int? Integer(SqliteDataReader reader, string name) { var i = reader.GetOrdinal(name); return reader.IsDBNull(i) ? null : reader.GetInt32(i); }
     private static void Add(SqliteCommand command, string name, object? value) => command.Parameters.AddWithValue(name, value ?? DBNull.Value);

@@ -78,10 +78,10 @@ public sealed class LegacyPresenceSchemaMigrationTests
                     CREATE TABLE PresenceSubject (Id INTEGER PRIMARY KEY, ExportId TEXT NOT NULL UNIQUE, DisplayName TEXT NOT NULL, Note TEXT NULL, CreatedAt TEXT NOT NULL, UpdatedAt TEXT NOT NULL);
                     INSERT INTO PresenceSubject(Id,ExportId,DisplayName,CreatedAt,UpdatedAt) VALUES(1,'00000000-0000-0000-0000-000000000011','历史主体','2026-08-29T00:00:00.0000000+00:00','2026-08-29T00:00:00.0000000+00:00');
                     CREATE TABLE NotificationRule (Id INTEGER PRIMARY KEY, SubjectId INTEGER NOT NULL, Enabled INTEGER NOT NULL, RuleCondition INTEGER NOT NULL, ThresholdSeconds INTEGER NOT NULL, Channel INTEGER NOT NULL, TargetType INTEGER NOT NULL, TargetId TEXT NOT NULL, MessageTemplate TEXT NOT NULL, CreatedAt TEXT NOT NULL, UpdatedAt TEXT NOT NULL);
-                    INSERT INTO NotificationRule(Id,SubjectId,Enabled,RuleCondition,ThresholdSeconds,Channel,TargetType,TargetId,MessageTemplate,CreatedAt,UpdatedAt) VALUES(1,1,1,3,0,1,1,'target','历史','2026-08-29T00:00:00.0000000+00:00','2026-08-29T00:00:00.0000000+00:00');
+                    INSERT INTO NotificationRule(Id,SubjectId,Enabled,RuleCondition,ThresholdSeconds,Channel,TargetType,TargetId,MessageTemplate,CreatedAt,UpdatedAt) VALUES(1,1,1,3,0,1,1,' target ','历史','2026-08-29T00:00:00.0000000+00:00','2026-08-29T00:00:00.0000000+00:00');
                     CREATE TABLE NotificationDelivery (Id INTEGER PRIMARY KEY, RuleId INTEGER NOT NULL, SubjectId INTEGER NOT NULL, EpisodeId TEXT NOT NULL, CreatedAt TEXT NOT NULL, Status INTEGER NOT NULL, DeliveredAt TEXT NULL, Channel INTEGER NOT NULL, TargetType INTEGER NOT NULL, TargetId TEXT NOT NULL, Message TEXT NOT NULL, Error TEXT NULL, SentParts INTEGER NOT NULL DEFAULT 0, TotalParts INTEGER NOT NULL DEFAULT 0, LastAttemptAt TEXT NULL, NextAttemptAt TEXT NULL);
-                    INSERT INTO NotificationDelivery(Id,RuleId,SubjectId,EpisodeId,CreatedAt,Status,Channel,TargetType,TargetId,Message) VALUES(1,1,1,'event:7','2026-08-29T01:00:00.0000000+00:00',2,1,1,'target','第一条');
-                    INSERT INTO NotificationDelivery(Id,RuleId,SubjectId,EpisodeId,CreatedAt,Status,Channel,TargetType,TargetId,Message) VALUES(2,1,1,'event:7','2026-08-29T01:01:00.0000000+00:00',2,1,1,'target','第二条');
+                    INSERT INTO NotificationDelivery(Id,RuleId,SubjectId,EpisodeId,CreatedAt,Status,Channel,TargetType,TargetId,Message) VALUES(1,1,1,'event:7','2026-08-29T01:00:00.0000000+00:00',2,1,1,' target ','第一条');
+                    INSERT INTO NotificationDelivery(Id,RuleId,SubjectId,EpisodeId,CreatedAt,Status,Channel,TargetType,TargetId,Message) VALUES(2,1,1,'event:7','2026-08-29T01:01:00.0000000+00:00',2,1,1,' target ','第二条');
                     """;
                 await command.ExecuteNonQueryAsync();
             }
@@ -89,6 +89,12 @@ public sealed class LegacyPresenceSchemaMigrationTests
             var repository = new SqlitePresenceRepository(paths);
             await repository.InitializeAsync(CancellationToken.None);
             var history = await repository.GetRecentNotificationDeliveriesAsync(10, CancellationToken.None);
+            var recipient = Assert.Single(await repository.GetNotificationRecipientsAsync(CancellationToken.None));
+            Assert.Equal(" target ", recipient.OpenId);
+            Assert.Equal(NotificationTargetType.Private, recipient.TargetType);
+            Assert.DoesNotContain('*', recipient.OpenId);
+            Assert.Contains(await repository.GetNotificationRuleRecipientsAsync(1, CancellationToken.None), value => value.Id == recipient.Id);
+            Assert.Contains(history, value => value.TargetId == " target " && value.RecipientId == recipient.Id);
 
             Assert.Equal(2, history.Count);
             Assert.Equal(1, history.Count(value => value.RuleId == 1));

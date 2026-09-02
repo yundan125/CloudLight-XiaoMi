@@ -30,7 +30,9 @@ public enum NotificationCondition
 }
 public enum NotificationChannelType { QQ = 1 }
 public enum NotificationTargetType { Private = 1, Group = 2 }
-public enum NotificationDeliveryStatus { Pending = 1, Delivered = 2, Failed = 3, Canceled = 4 }
+public enum NotificationDeliveryStatus { Pending = 1, Delivered = 2, Failed = 3, Canceled = 4, PermanentFailed = 5, BindingRequired = 6 }
+public enum NotificationFailureKind { Unknown = 0, Transient = 1, Authentication = 2, PermanentTarget = 3, InvalidRequest = 4 }
+public enum QqBotProfileScopeKind { Actual = 0, LegacyUnknown = 1 }
 public enum SystemNotificationKind { XiaomiConnectionFailure = 1, XiaomiConnectionRecovery = 2 }
 public enum NotificationConnectionState
 {
@@ -56,26 +58,66 @@ public enum RuleEvaluationDiagnosticStatus
     Disabled,
     SubjectUnavailable,
     RecipientUnavailable,
+    RecipientBindingMissing,
     PendingDelivery,
     DeliveryFailed,
     Delivered
 }
 
 /// <summary>
-/// A saved QQ OpenID.  OpenIDs remain ordinary local data so they can be
-/// edited and reused; presentation code is responsible for masking them.
+/// A logical QQ contact.  The legacy OpenID column is retained only so old
+/// SQLite rows can be migrated and audited; current send paths resolve an
+/// OpenID from <see cref="NotificationRecipientBotBinding"/>.
 /// </summary>
 public sealed record NotificationRecipient(
     long Id,
     string Note,
-    string OpenId,
     NotificationTargetType TargetType,
     DateTimeOffset CreatedAt,
-    DateTimeOffset UpdatedAt)
+    DateTimeOffset UpdatedAt,
+    string? LegacyOpenId = null)
 {
+    // Source compatibility for callers from the pre-binding model.  New
+    // application code must not use this constructor or property for sending.
+    public NotificationRecipient(
+        long id,
+        string note,
+        string openId,
+        NotificationTargetType targetType,
+        DateTimeOffset createdAt,
+        DateTimeOffset updatedAt)
+        : this(id, note, targetType, createdAt, updatedAt, openId) { }
+
+    public string OpenId => LegacyOpenId ?? string.Empty;
     public string DisplayName => string.IsNullOrWhiteSpace(Note) ? $"QQ {TargetTypeText}" : Note;
     public string TargetTypeText => TargetType == NotificationTargetType.Group ? "群聊" : "私聊";
 }
+
+public sealed record QqBotProfile(
+    long Id,
+    string AppId,
+    string DisplayName,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset UpdatedAt,
+    DateTimeOffset? LastUsedAt = null,
+    QqBotProfileScopeKind ScopeKind = QqBotProfileScopeKind.Actual)
+{
+    public const string LegacyUnknownAppId = "__legacy_unknown__";
+    public bool IsLegacyUnknown => ScopeKind == QqBotProfileScopeKind.LegacyUnknown;
+}
+
+public sealed record NotificationRecipientBotBinding(
+    long Id,
+    long RecipientId,
+    long BotProfileId,
+    NotificationTargetType TargetType,
+    string OpenId,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset UpdatedAt,
+    DateTimeOffset? LastVerifiedAt = null,
+    DateTimeOffset? LastSuccessfulSendAt = null,
+    string? LastSendStatus = null,
+    int? LastErrorCode = null);
 
 /// <summary>
 /// A resolved notification target used by system notifications and legacy
@@ -85,7 +127,12 @@ public sealed record NotificationRecipientTarget(
     long? RecipientId,
     NotificationTargetType TargetType,
     string TargetId,
-    string? DisplayName = null);
+    string? DisplayName = null,
+    long? BotProfileId = null,
+    long? BindingId = null,
+    bool BindingMissing = false,
+    string? BotAppIdFingerprint = null,
+    string? MaskedTargetId = null);
 
 public sealed record Router(
     long Id,
@@ -329,7 +376,9 @@ public sealed record NotificationDelivery(
     int TotalParts,
     DateTimeOffset? LastAttemptAt,
     DateTimeOffset? NextAttemptAt,
-    long? RecipientId = null);
+    long? RecipientId = null,
+    long? BotProfileId = null,
+    long? RecipientBindingId = null);
 
 public sealed record SystemNotificationDelivery(
     long Id,
@@ -347,7 +396,9 @@ public sealed record SystemNotificationDelivery(
     int TotalParts,
     DateTimeOffset? LastAttemptAt,
     DateTimeOffset? NextAttemptAt,
-    long? RecipientId = null);
+    long? RecipientId = null,
+    long? BotProfileId = null,
+    long? RecipientBindingId = null);
 
 public sealed record ConnectionAlertState(
     string? FailureEpisodeId,
@@ -371,7 +422,9 @@ public sealed record ConnectionAlertConfiguration(
     ConnectionAlertSettings Settings,
     NotificationTargetType DefaultTargetType,
     string DefaultTargetId,
-    IReadOnlyList<NotificationRecipientTarget>? DefaultTargets = null);
+    IReadOnlyList<NotificationRecipientTarget>? DefaultTargets = null,
+    string? CurrentBotAppId = null,
+    long? CurrentBotProfileId = null);
 
 public sealed record NotificationRequest(
     long DeliveryId,
@@ -389,7 +442,12 @@ public sealed record NotificationSendResult(
     int SentParts,
     int TotalParts,
     string? Error = null,
-    IReadOnlyList<string>? MessageIds = null);
+    IReadOnlyList<string>? MessageIds = null,
+    NotificationFailureKind FailureKind = NotificationFailureKind.Unknown,
+    int? HttpStatusCode = null,
+    int? QqErrorCode = null,
+    string? TraceId = null,
+    string? EndpointCategory = null);
 
 public sealed record NotificationChannelStatus(
     NotificationChannelType Channel,

@@ -20,7 +20,9 @@ public sealed class PresenceDataTransferService(IAppDataPaths paths)
     {
         var model = new ExportDocument(
             new ExportManifest(Format, 2, DateTimeOffset.UtcNow, Assembly.GetEntryAssembly()?.GetName().Version?.ToString() ?? "development", false),
-            [], [], [], [], [], [], [], [], [], [], []);
+            [], [], [], [], [],
+            Subjects: [], SubjectDeviceMemberships: [], NotificationRules: [], SubjectPresenceEvents: [],
+            SubjectCurrentStates: [], NotificationRecipients: [], QqBotProfiles: [], NotificationRecipientBindings: []);
         await using var connection = new SqliteConnection(ConnectionString); await connection.OpenAsync(cancellationToken);
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
         await ReadAsync(connection, "SELECT MiotDid,MiotModel,PartnerId,Name,HomeId,RoomId,CreatedAt,LastSeenAt FROM Router", reader =>
@@ -39,13 +41,17 @@ public sealed class PresenceDataTransferService(IAppDataPaths paths)
             model.SubjectDeviceMemberships!.Add(new ExportSubjectDeviceMembership(Guid.Parse(reader.GetString(0)), reader.GetString(1), reader.GetString(2), Time(reader, 3))), cancellationToken);
         await ReadAsync(connection, "SELECT s.ExportId,c.CurrentState,c.StateSince,c.LastObservedAt,c.PendingOfflineSince FROM SubjectCurrentState c JOIN PresenceSubject s ON s.Id=c.SubjectId", reader =>
             model.SubjectCurrentStates!.Add(new ExportSubjectCurrentState(Guid.Parse(reader.GetString(0)), reader.GetInt32(1), Time(reader, 2), Time(reader, 3), NullableTime(reader, 4))), cancellationToken);
-        await ReadAsync(connection, "SELECT Note,OpenId,TargetType,CreatedAt,UpdatedAt FROM NotificationRecipient", reader =>
-            model.NotificationRecipients!.Add(new ExportNotificationRecipient(reader.GetString(0), reader.GetString(1), reader.GetInt32(2), Time(reader, 3), Time(reader, 4))), cancellationToken);
+        await ReadAsync(connection, "SELECT Id,Note,OpenId,TargetType,CreatedAt,UpdatedAt FROM NotificationRecipient", reader =>
+            model.NotificationRecipients!.Add(new ExportNotificationRecipient(reader.GetString(1), reader.GetString(2), reader.GetInt32(3), Time(reader, 4), Time(reader, 5), reader.GetInt64(0))), cancellationToken);
+        await ReadAsync(connection, "SELECT Id,AppId,DisplayName,CreatedAt,UpdatedAt,LastUsedAt,ScopeKind FROM QqBotProfile", reader =>
+            model.QqBotProfiles!.Add(new ExportQqBotProfile(reader.GetInt64(0), reader.GetString(1), reader.GetString(2), Time(reader, 3), Time(reader, 4), NullableTime(reader, 5), reader.GetInt32(6))), cancellationToken);
+        await ReadAsync(connection, "SELECT Id,RecipientId,BotProfileId,TargetType,OpenId,CreatedAt,UpdatedAt,LastVerifiedAt,LastSuccessfulSendAt,LastSendStatus,LastErrorCode FROM NotificationRecipientBotBinding", reader =>
+            model.NotificationRecipientBindings!.Add(new ExportNotificationRecipientBotBinding(reader.GetInt64(0), reader.GetInt64(1), reader.GetInt64(2), reader.GetInt32(3), reader.GetString(4), Time(reader, 5), Time(reader, 6), NullableTime(reader, 7), NullableTime(reader, 8), Text(reader, 9), reader.IsDBNull(10) ? null : reader.GetInt32(10))), cancellationToken);
         var ruleTargets = new Dictionary<long, List<ExportNotificationRecipientTarget>>();
-        await ReadAsync(connection, "SELECT rr.RuleId,n.TargetType,n.OpenId FROM NotificationRuleRecipient rr JOIN NotificationRecipient n ON n.Id=rr.RecipientId", reader =>
+        await ReadAsync(connection, "SELECT rr.RuleId,rr.RecipientId,n.TargetType,n.OpenId FROM NotificationRuleRecipient rr JOIN NotificationRecipient n ON n.Id=rr.RecipientId", reader =>
         {
             if (!ruleTargets.TryGetValue(reader.GetInt64(0), out var values)) ruleTargets[reader.GetInt64(0)] = values = [];
-            values.Add(new ExportNotificationRecipientTarget(reader.GetInt32(1), reader.GetString(2)));
+            values.Add(new ExportNotificationRecipientTarget(reader.GetInt32(2), reader.GetString(3), reader.GetInt64(1)));
         }, cancellationToken);
         await ReadAsync(connection, "SELECT r.Id,s.ExportId,r.Enabled,r.RuleCondition,r.ThresholdSeconds,r.Channel,r.TargetType,r.TargetId,r.MessageTemplate,r.CreatedAt,r.UpdatedAt FROM NotificationRule r JOIN PresenceSubject s ON s.Id=r.SubjectId", reader =>
             model.NotificationRules!.Add(new ExportNotificationRule(Guid.Parse(reader.GetString(1)), reader.GetInt32(2) != 0, reader.GetInt32(3), reader.GetInt64(4), reader.GetInt32(5), reader.GetInt32(6), reader.GetString(7), reader.GetString(8), Time(reader, 9), Time(reader, 10), reader.GetInt64(0), ruleTargets.GetValueOrDefault(reader.GetInt64(0)))), cancellationToken);
@@ -166,13 +172,94 @@ public sealed class PresenceDataTransferService(IAppDataPaths paths)
                 [("$subject", subjectId), ("$type", value.EventType), ("$at", Iso(value.ObservedAt)), ("$gap", gapId), ("$since", value.StateSince is null ? null : Iso(value.StateSince.Value))], cancellationToken);
             if (changed == 1) addedEvents++; else skipped++;
         }
+        var importedProfiles = new Dictionary<long, long>();
+        foreach (var profile in document.QqBotProfiles ?? [])
+        {
+            await ExecuteAsync(connection,
+                "INSERT INTO QqBotProfile(AppId,DisplayName,ScopeKind,CreatedAt,UpdatedAt,LastUsedAt) VALUES($app,$name,$scope,$created,$updated,$used) ON CONFLICT(AppId) DO UPDATE SET DisplayName=$name,ScopeKind=$scope,UpdatedAt=$updated,LastUsedAt=CASE WHEN excluded.LastUsedAt IS NULL THEN QqBotProfile.LastUsedAt WHEN QqBotProfile.LastUsedAt IS NULL OR excluded.LastUsedAt>QqBotProfile.LastUsedAt THEN excluded.LastUsedAt ELSE QqBotProfile.LastUsedAt END",
+                [("$app", profile.AppId), ("$name", profile.DisplayName), ("$scope", profile.ScopeKind), ("$created", Iso(profile.CreatedAt)), ("$updated", Iso(profile.UpdatedAt)), ("$used", profile.LastUsedAt is null ? null : Iso(profile.LastUsedAt.Value))], cancellationToken);
+            var profileId = await ScalarLongAsync(connection, "SELECT Id FROM QqBotProfile WHERE AppId=$app LIMIT 1", [("$app", profile.AppId)], cancellationToken);
+            if (profile.SourceProfileId > 0) importedProfiles[profile.SourceProfileId] = profileId;
+        }
+
         var importedRecipients = new Dictionary<(int TargetType, string TargetId), long>();
+        var importedRecipientIds = new Dictionary<long, long>();
+        var sourceBindings = (document.NotificationRecipientBindings ?? [])
+            .GroupBy(value => value.SourceRecipientId)
+            .ToDictionary(value => value.Key, value => value.ToList());
         foreach (var value in document.NotificationRecipients ?? [])
         {
-            await ExecuteAsync(connection, "INSERT OR IGNORE INTO NotificationRecipient(Note,OpenId,TargetType,CreatedAt,UpdatedAt) VALUES($note,$openid,$type,$created,$updated)",
-                [("$note", value.Note), ("$openid", value.OpenId), ("$type", value.TargetType), ("$created", Iso(value.CreatedAt)), ("$updated", Iso(value.UpdatedAt))], cancellationToken);
-            var recipientId = await ScalarLongAsync(connection, "SELECT Id FROM NotificationRecipient WHERE TargetType=$type AND OpenId=$openid LIMIT 1", [ ("$type", value.TargetType), ("$openid", value.OpenId) ], cancellationToken);
-            importedRecipients[(value.TargetType, value.OpenId)] = recipientId;
+            var recipientId = 0L;
+            if (!string.IsNullOrWhiteSpace(value.OpenId))
+            {
+                recipientId = await ScalarLongAsync(connection,
+                    "SELECT Id FROM NotificationRecipient WHERE TargetType=$type AND OpenId=$openid LIMIT 1",
+                    [("$type", value.TargetType), ("$openid", value.OpenId)], cancellationToken);
+            }
+
+            if (recipientId == 0 && value.SourceRecipientId > 0 && sourceBindings.TryGetValue(value.SourceRecipientId, out var bindings))
+            {
+                foreach (var binding in bindings)
+                {
+                    if (!importedProfiles.TryGetValue(binding.SourceBotProfileId, out var profileId)) continue;
+                    recipientId = await ScalarLongAsync(connection,
+                        "SELECT RecipientId FROM NotificationRecipientBotBinding WHERE BotProfileId=$bot AND TargetType=$type AND OpenId=$openid LIMIT 1",
+                        [("$bot", profileId), ("$type", binding.TargetType), ("$openid", binding.OpenId)], cancellationToken);
+                    if (recipientId != 0) break;
+                }
+            }
+
+            // A logical contact has no stable cross-database identity.  The
+            // binding match above is preferred; note/type is only the safe
+            // fallback for a binding-less contact and keeps repeated imports
+            // idempotent without reintroducing a global OpenID key.
+            if (recipientId == 0 && string.IsNullOrWhiteSpace(value.OpenId))
+                recipientId = await ScalarLongAsync(connection,
+                    "SELECT Id FROM NotificationRecipient WHERE TargetType=$type AND Note=$note ORDER BY Id LIMIT 1",
+                    [("$type", value.TargetType), ("$note", value.Note)], cancellationToken);
+
+            if (recipientId == 0)
+            {
+                recipientId = await InsertIdAsync(connection,
+                    "INSERT INTO NotificationRecipient(Note,OpenId,TargetType,CreatedAt,UpdatedAt) VALUES($note,$openid,$type,$created,$updated)",
+                    [("$note", value.Note), ("$openid", value.OpenId), ("$type", value.TargetType), ("$created", Iso(value.CreatedAt)), ("$updated", Iso(value.UpdatedAt))], cancellationToken);
+            }
+
+            if (value.SourceRecipientId > 0) importedRecipientIds[value.SourceRecipientId] = recipientId;
+            if (!string.IsNullOrWhiteSpace(value.OpenId)) importedRecipients[(value.TargetType, value.OpenId)] = recipientId;
+        }
+
+        foreach (var binding in document.NotificationRecipientBindings ?? [])
+        {
+            if (!importedRecipientIds.TryGetValue(binding.SourceRecipientId, out var recipientId) ||
+                !importedProfiles.TryGetValue(binding.SourceBotProfileId, out var profileId))
+                throw new InvalidDataException("QQ 接收人绑定引用了不存在的接收人或 Bot。 ");
+            await ExecuteAsync(connection,
+                "INSERT INTO NotificationRecipientBotBinding(RecipientId,BotProfileId,TargetType,OpenId,CreatedAt,UpdatedAt,LastVerifiedAt,LastSuccessfulSendAt,LastSendStatus,LastErrorCode) VALUES($recipient,$bot,$type,$openid,$created,$updated,$verified,$successful,$status,$error) ON CONFLICT(RecipientId,BotProfileId) DO UPDATE SET TargetType=$type,OpenId=$openid,UpdatedAt=$updated,LastVerifiedAt=$verified,LastSuccessfulSendAt=$successful,LastSendStatus=$status,LastErrorCode=$error",
+                [("$recipient", recipientId), ("$bot", profileId), ("$type", binding.TargetType), ("$openid", binding.OpenId), ("$created", Iso(binding.CreatedAt)), ("$updated", Iso(binding.UpdatedAt)), ("$verified", binding.LastVerifiedAt is null ? null : Iso(binding.LastVerifiedAt.Value)), ("$successful", binding.LastSuccessfulSendAt is null ? null : Iso(binding.LastSuccessfulSendAt.Value)), ("$status", binding.LastSendStatus), ("$error", binding.LastErrorCode)], cancellationToken);
+        }
+
+        // Version 1/2 exports created before Bot Profiles existed contain a
+        // raw parent OpenID only.  Preserve that data in the explicit
+        // Legacy/Unknown scope instead of pretending it belongs to the
+        // currently configured Bot.
+        var legacyProfileId = 0L;
+        foreach (var value in document.NotificationRecipients ?? [])
+        {
+            if (string.IsNullOrWhiteSpace(value.OpenId) || value.SourceRecipientId > 0 && sourceBindings.ContainsKey(value.SourceRecipientId)) continue;
+            var recipientId = importedRecipientIds.GetValueOrDefault(value.SourceRecipientId);
+            if (recipientId == 0) recipientId = importedRecipients.GetValueOrDefault((value.TargetType, value.OpenId));
+            if (recipientId == 0) continue;
+            if (legacyProfileId == 0)
+            {
+                await ExecuteAsync(connection,
+                    "INSERT INTO QqBotProfile(AppId,DisplayName,ScopeKind,CreatedAt,UpdatedAt,LastUsedAt) VALUES($app,$name,$scope,$now,$now,NULL) ON CONFLICT(AppId) DO NOTHING",
+                    [("$app", QqBotProfile.LegacyUnknownAppId), ("$name", "旧 QQ Bot（AppID 未记录）"), ("$scope", (int)QqBotProfileScopeKind.LegacyUnknown), ("$now", Iso(DateTimeOffset.UtcNow))], cancellationToken);
+                legacyProfileId = await ScalarLongAsync(connection, "SELECT Id FROM QqBotProfile WHERE AppId=$app", [("$app", QqBotProfile.LegacyUnknownAppId)], cancellationToken);
+            }
+            await ExecuteAsync(connection,
+                "INSERT OR IGNORE INTO NotificationRecipientBotBinding(RecipientId,BotProfileId,TargetType,OpenId,CreatedAt,UpdatedAt) VALUES($recipient,$bot,$type,$openid,$now,$now)",
+                [("$recipient", recipientId), ("$bot", legacyProfileId), ("$type", value.TargetType), ("$openid", value.OpenId), ("$now", Iso(DateTimeOffset.UtcNow))], cancellationToken);
         }
         foreach (var value in document.NotificationRules ?? [])
         {
@@ -191,12 +278,23 @@ public sealed class PresenceDataTransferService(IAppDataPaths paths)
                 : [new ExportNotificationRecipientTarget(value.TargetType, value.TargetId)];
             foreach (var target in targets)
             {
-                if (!importedRecipients.TryGetValue((target.TargetType, target.TargetId), out var recipientId))
+                var recipientId = 0L;
+                var hasRecipient = target.SourceRecipientId is > 0 && importedRecipientIds.TryGetValue(target.SourceRecipientId.Value, out recipientId);
+                if (!hasRecipient && !importedRecipients.TryGetValue((target.TargetType, target.TargetId), out recipientId))
                 {
-                    await ExecuteAsync(connection, "INSERT OR IGNORE INTO NotificationRecipient(Note,OpenId,TargetType,CreatedAt,UpdatedAt) VALUES($note,$openid,$type,$now,$now)",
+                    if (string.IsNullOrWhiteSpace(target.TargetId)) throw new InvalidDataException("通知规则的接收人引用无效。 ");
+                    await ExecuteAsync(connection, "INSERT INTO NotificationRecipient(Note,OpenId,TargetType,CreatedAt,UpdatedAt) VALUES($note,$openid,$type,$now,$now)",
                         [("$note", "已有接收人"), ("$openid", target.TargetId), ("$type", target.TargetType), ("$now", Iso(DateTimeOffset.UtcNow))], cancellationToken);
                     recipientId = await ScalarLongAsync(connection, "SELECT Id FROM NotificationRecipient WHERE TargetType=$type AND OpenId=$openid LIMIT 1", [("$type", target.TargetType), ("$openid", target.TargetId)], cancellationToken);
                     importedRecipients[(target.TargetType, target.TargetId)] = recipientId;
+                    var legacyNow = Iso(DateTimeOffset.UtcNow);
+                    await ExecuteAsync(connection,
+                        "INSERT INTO QqBotProfile(AppId,DisplayName,ScopeKind,CreatedAt,UpdatedAt,LastUsedAt) VALUES($app,$name,$scope,$now,$now,NULL) ON CONFLICT(AppId) DO NOTHING",
+                        [("$app", QqBotProfile.LegacyUnknownAppId), ("$name", "旧 QQ Bot（AppID 未记录）"), ("$scope", (int)QqBotProfileScopeKind.LegacyUnknown), ("$now", legacyNow)], cancellationToken);
+                    var unknownId = await ScalarLongAsync(connection, "SELECT Id FROM QqBotProfile WHERE AppId=$app", [("$app", QqBotProfile.LegacyUnknownAppId)], cancellationToken);
+                    await ExecuteAsync(connection,
+                        "INSERT OR IGNORE INTO NotificationRecipientBotBinding(RecipientId,BotProfileId,TargetType,OpenId,CreatedAt,UpdatedAt) VALUES($recipient,$bot,$type,$openid,$now,$now)",
+                        [("$recipient", recipientId), ("$bot", unknownId), ("$type", target.TargetType), ("$openid", target.TargetId), ("$now", legacyNow)], cancellationToken);
                 }
                 await ExecuteAsync(connection, "INSERT OR IGNORE INTO NotificationRuleRecipient(RuleId,RecipientId,CreatedAt) VALUES($rule,$recipient,$now)",
                     [("$rule", existing), ("$recipient", recipientId), ("$now", Iso(DateTimeOffset.UtcNow))], cancellationToken);
@@ -224,18 +322,46 @@ public sealed class PresenceDataTransferService(IAppDataPaths paths)
         if ((document.SubjectDeviceMemberships ?? []).Any(value => !subjectIds.Contains(value.SubjectExportId) || !deviceKeys.Contains(Key(value.RouterMiotDid, PresenceStateMachine.NormalizeMac(value.MacAddress))))) throw new InvalidDataException("主体关联引用了不存在的主体或设备。 ");
         if ((document.SubjectCurrentStates ?? []).Any(value => !subjectIds.Contains(value.SubjectExportId) || value.CurrentState is not (1 or 2) || value.StateSince > value.LastObservedAt || (value.PendingOfflineSince is { } pending && (pending < value.StateSince || pending > value.LastObservedAt)))) throw new InvalidDataException("主体当前状态数据不完整或无效。 ");
         if ((document.SubjectPresenceEvents ?? []).Any(value => !subjectIds.Contains(value.SubjectExportId) || value.EventType is < 1 or > 6 || ((value.EventType is 1 or 2) && (value.MonitoringGapStartedAt is null || string.IsNullOrWhiteSpace(value.MonitoringGapReason))) || (value.EventType is >= 3 and <= 6 && value.MonitoringGapStartedAt is not null))) throw new InvalidDataException("主体活动记录不完整或无效。 ");
-        if ((document.NotificationRecipients ?? []).Any(value => value.TargetType is not (1 or 2) || string.IsNullOrWhiteSpace(value.OpenId) || value.OpenId.Any(char.IsWhiteSpace) || value.OpenId.Length > 256 || value.Note is null || value.Note.Length > 120)) throw new InvalidDataException("QQ 接收人数据不完整或超出允许范围。 ");
+        if ((document.QqBotProfiles ?? []).Any(value =>
+            value.SourceProfileId <= 0 ||
+            string.IsNullOrWhiteSpace(value.AppId) || value.AppId.Length > 128 || value.AppId.Any(char.IsWhiteSpace) ||
+            value.ScopeKind is not (0 or 1) || value.DisplayName is null || value.DisplayName.Length > 120))
+            throw new InvalidDataException("QQ Bot Profile 数据不完整或超出允许范围。 ");
+        if ((document.NotificationRecipients ?? []).Any(value =>
+            value.SourceRecipientId < 0 || value.TargetType is not (1 or 2) ||
+            (!string.IsNullOrWhiteSpace(value.OpenId) && (value.OpenId.Any(char.IsWhiteSpace) || value.OpenId.Contains('*', StringComparison.Ordinal) || value.OpenId.Length > 256)) ||
+            value.Note is null || value.Note.Length > 120))
+            throw new InvalidDataException("QQ 接收人数据不完整或超出允许范围。 ");
+        if ((document.NotificationRecipientBindings ?? []).Any(value =>
+            value.SourceBindingId <= 0 || value.SourceRecipientId <= 0 || value.SourceBotProfileId <= 0 || value.TargetType is not (1 or 2) ||
+            string.IsNullOrWhiteSpace(value.OpenId) || value.OpenId.Any(char.IsWhiteSpace) || value.OpenId.Contains('*', StringComparison.Ordinal) || value.OpenId.Length > 256 ||
+            value.LastSendStatus is { Length: > 80 }))
+            throw new InvalidDataException("QQ 接收人绑定数据不完整或超出允许范围。 ");
         if ((document.NotificationRules ?? []).Any(value =>
-            !subjectIds.Contains(value.SubjectExportId) ||
+            IsInvalidNotificationRule(value, subjectIds)))
+            throw new InvalidDataException("通知规则数据不完整或超出允许范围。 ");
+    }
+
+    private static bool IsInvalidNotificationRule(ExportNotificationRule value, IReadOnlySet<Guid> subjectIds)
+    {
+        var targets = value.Recipients ?? [];
+        var invalidRuleTarget = string.IsNullOrWhiteSpace(value.TargetId)
+            ? targets.Count == 0
+            : value.TargetId.Length > 256 || value.TargetId.Any(char.IsWhiteSpace) || value.TargetId.Contains('*', StringComparison.Ordinal);
+        var invalidRecipientTarget = targets.Any(target =>
+            target.TargetType is not (1 or 2) ||
+            (target.SourceRecipientId is <= 0 && string.IsNullOrWhiteSpace(target.TargetId)) ||
+            (!string.IsNullOrWhiteSpace(target.TargetId) &&
+                (target.TargetId.Any(char.IsWhiteSpace) || target.TargetId.Contains('*', StringComparison.Ordinal) || target.TargetId.Length > 256)));
+        return !subjectIds.Contains(value.SubjectExportId) ||
             value.Condition is < 1 or > 4 ||
             (value.Condition is 1 or 2
                 ? value.ThresholdSeconds is < 60 or > 365L * 24 * 60 * 60
                 : value.ThresholdSeconds != 0) ||
             value.Channel != 1 || value.TargetType is not (1 or 2) ||
-            string.IsNullOrWhiteSpace(value.TargetId) || value.TargetId.Any(char.IsWhiteSpace) ||
-            value.TargetId.Length > 256 || value.MessageTemplate is null || value.MessageTemplate.Length > 10_000 ||
-            (value.Recipients ?? []).Any(target => target.TargetType is not (1 or 2) || string.IsNullOrWhiteSpace(target.TargetId) || target.TargetId.Any(char.IsWhiteSpace) || target.TargetId.Length > 256)))
-            throw new InvalidDataException("通知规则数据不完整或超出允许范围。 ");
+            invalidRuleTarget ||
+            string.IsNullOrWhiteSpace(value.MessageTemplate) || value.MessageTemplate.Length > 10_000 ||
+            invalidRecipientTarget;
     }
 
     private static List<(string, object?)> DeviceParameters(ExportDevice value, long routerId, string mac) => [("$router", routerId), ("$mac", mac), ("$original", value.OriginalName), ("$origin", value.OriginName), ("$custom", value.CustomName), ("$note", value.Note), ("$ip", value.LastIp), ("$connection", value.ConnectionType), ("$signal", value.Signal), ("$state", value.CurrentState), ("$first", Iso(value.FirstSeenAt)), ("$last", Iso(value.LastSeenAt)), ("$changed", value.LastStateChangedAt is null ? null : Iso(value.LastStateChangedAt.Value)), ("$historical", value.LastKnownHistoricalState ?? value.CurrentState)];
@@ -288,7 +414,7 @@ public sealed class PresenceDataTransferService(IAppDataPaths paths)
     private static DateTimeOffset ParseTime(string value) => DateTimeOffset.Parse(value, CultureInfo.InvariantCulture);
     private static string Iso(DateTimeOffset value) => value.ToUniversalTime().ToString("O");
 
-    public sealed record ExportDocument(ExportManifest Manifest, List<ExportRouter> Routers, List<ExportDevice> Devices, List<ExportEvent> Events, List<ExportSession> Sessions, List<ExportGap> MonitoringGaps, List<ExportSubject>? Subjects = null, List<ExportSubjectDeviceMembership>? SubjectDeviceMemberships = null, List<ExportNotificationRule>? NotificationRules = null, List<ExportSubjectPresenceEvent>? SubjectPresenceEvents = null, List<ExportSubjectCurrentState>? SubjectCurrentStates = null, List<ExportNotificationRecipient>? NotificationRecipients = null);
+    public sealed record ExportDocument(ExportManifest Manifest, List<ExportRouter> Routers, List<ExportDevice> Devices, List<ExportEvent> Events, List<ExportSession> Sessions, List<ExportGap> MonitoringGaps, List<ExportSubject>? Subjects = null, List<ExportSubjectDeviceMembership>? SubjectDeviceMemberships = null, List<ExportNotificationRule>? NotificationRules = null, List<ExportSubjectPresenceEvent>? SubjectPresenceEvents = null, List<ExportSubjectCurrentState>? SubjectCurrentStates = null, List<ExportNotificationRecipient>? NotificationRecipients = null, List<ExportQqBotProfile>? QqBotProfiles = null, List<ExportNotificationRecipientBotBinding>? NotificationRecipientBindings = null);
     public sealed record ExportManifest(string Format, int Version, DateTimeOffset CreatedAtUtc, string AppVersion, bool ContainsAuthentication);
     public sealed record ExportRouter(string MiotDid, string MiotModel, string PartnerId, string Name, string? HomeId, string? RoomId, DateTimeOffset CreatedAt, DateTimeOffset LastSeenAt);
     public sealed record ExportDevice(string RouterMiotDid, string MacAddress, string? OriginalName, string? OriginName, string? CustomName, string? Note, string? LastIp, string? ConnectionType, int? Signal, int CurrentState, DateTimeOffset FirstSeenAt, DateTimeOffset LastSeenAt, DateTimeOffset? LastStateChangedAt, int? LastKnownHistoricalState = null);
@@ -298,8 +424,10 @@ public sealed class PresenceDataTransferService(IAppDataPaths paths)
     public sealed record ExportSubject(Guid ExportId, string DisplayName, string? Note, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
     public sealed record ExportSubjectDeviceMembership(Guid SubjectExportId, string RouterMiotDid, string MacAddress, DateTimeOffset CreatedAt);
     public sealed record ExportNotificationRule(Guid SubjectExportId, bool Enabled, int Condition, long ThresholdSeconds, int Channel, int TargetType, string TargetId, string? MessageTemplate, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, long SourceRuleId = 0, List<ExportNotificationRecipientTarget>? Recipients = null);
-    public sealed record ExportNotificationRecipient(string Note, string OpenId, int TargetType, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
-    public sealed record ExportNotificationRecipientTarget(int TargetType, string TargetId);
+    public sealed record ExportNotificationRecipient(string Note, string OpenId, int TargetType, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, long SourceRecipientId = 0);
+    public sealed record ExportQqBotProfile(long SourceProfileId, string AppId, string DisplayName, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, DateTimeOffset? LastUsedAt, int ScopeKind);
+    public sealed record ExportNotificationRecipientBotBinding(long SourceBindingId, long SourceRecipientId, long SourceBotProfileId, int TargetType, string OpenId, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, DateTimeOffset? LastVerifiedAt = null, DateTimeOffset? LastSuccessfulSendAt = null, string? LastSendStatus = null, int? LastErrorCode = null);
+    public sealed record ExportNotificationRecipientTarget(int TargetType, string TargetId, long? SourceRecipientId = null);
     public sealed record ExportSubjectPresenceEvent(Guid SubjectExportId, int EventType, DateTimeOffset ObservedAt, DateTimeOffset? MonitoringGapStartedAt, string? MonitoringGapReason, DateTimeOffset? StateSince = null, string? MonitoringGapRouterMiotDid = null);
     public sealed record ExportSubjectCurrentState(Guid SubjectExportId, int CurrentState, DateTimeOffset StateSince, DateTimeOffset LastObservedAt, DateTimeOffset? PendingOfflineSince = null);
 }

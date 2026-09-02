@@ -54,8 +54,12 @@ public sealed class XiaomiConnectionAlertService : IDisposable
                     foreach (var target in await ResolveTargetsAsync(configuration, cancellationToken))
                     {
                         deliveries.Add(await _repository.CreateSystemNotificationDeliveryAsync(new SystemNotificationDelivery(
-                            0, SystemNotificationKind.XiaomiConnectionFailure, episode, now, NotificationDeliveryStatus.Pending, null,
-                            NotificationChannelType.QQ, target.TargetType, target.TargetId, FailureMessage(status.RouterName, state.LastSuccessfulCloudUpdateAt, now), null, 0, 0, null, now, target.RecipientId), cancellationToken));
+                            0, SystemNotificationKind.XiaomiConnectionFailure, episode, now,
+                            target.BindingMissing ? NotificationDeliveryStatus.BindingRequired : NotificationDeliveryStatus.Pending,
+                            null, NotificationChannelType.QQ, target.TargetType, target.TargetId,
+                            FailureMessage(status.RouterName, state.LastSuccessfulCloudUpdateAt, now),
+                            target.BindingMissing ? "当前 QQ Bot 尚未绑定此联系人。" : null, 0, 0, null,
+                            target.BindingMissing ? null : now, target.RecipientId, target.BotProfileId, target.BindingId), cancellationToken));
                     }
                     if (deliveries.Count > 0) state = state with { FailureAlertSent = true, UpdatedAt = now };
                 }
@@ -73,8 +77,12 @@ public sealed class XiaomiConnectionAlertService : IDisposable
                 foreach (var target in await ResolveTargetsAsync(recoveryConfiguration, cancellationToken))
                 {
                     recoveries.Add(await _repository.CreateSystemNotificationDeliveryAsync(new SystemNotificationDelivery(
-                        0, SystemNotificationKind.XiaomiConnectionRecovery, episodeId, connectedAt, NotificationDeliveryStatus.Pending, null,
-                        NotificationChannelType.QQ, target.TargetType, target.TargetId, RecoveryMessage(status.RouterName, connectedAt), null, 0, 0, null, connectedAt, target.RecipientId), cancellationToken));
+                        0, SystemNotificationKind.XiaomiConnectionRecovery, episodeId, connectedAt,
+                        target.BindingMissing ? NotificationDeliveryStatus.BindingRequired : NotificationDeliveryStatus.Pending,
+                        null, NotificationChannelType.QQ, target.TargetType, target.TargetId,
+                        RecoveryMessage(status.RouterName, connectedAt),
+                        target.BindingMissing ? "当前 QQ Bot 尚未绑定此联系人。" : null, 0, 0, null,
+                        target.BindingMissing ? null : connectedAt, target.RecipientId, target.BotProfileId, target.BindingId), cancellationToken));
                 }
                 if (recoveries.Count > 0) state = state with { RecoveryAlertSent = true };
             }
@@ -109,6 +117,7 @@ public sealed class XiaomiConnectionAlertService : IDisposable
         if (configuration.Settings.UseDefaultTarget)
         {
             if (configuration.DefaultTargets is { Count: > 0 }) return configuration.DefaultTargets;
+            if (configuration.CurrentBotAppId is not null) return [];
             return IsValidTarget(configuration.DefaultTargetId)
                 ? [new(null, configuration.DefaultTargetType, configuration.DefaultTargetId.Trim())]
                 : [];
@@ -119,16 +128,28 @@ public sealed class XiaomiConnectionAlertService : IDisposable
             var result = new List<NotificationRecipientTarget>();
             foreach (var recipientId in configuration.Settings.RecipientIds.Distinct())
                 if (await _repository.GetNotificationRecipientAsync(recipientId, cancellationToken) is { } recipient)
-                    result.Add(new(recipient.Id, recipient.TargetType, recipient.OpenId, recipient.DisplayName));
+                {
+                    var binding = configuration.CurrentBotProfileId is { } profileId
+                        ? await _repository.GetNotificationRecipientBotBindingAsync(recipient.Id, profileId, cancellationToken)
+                        : null;
+                    result.Add(binding is null
+                        ? new(recipient.Id, recipient.TargetType, string.Empty, recipient.DisplayName,
+                            configuration.CurrentBotProfileId, BindingMissing: configuration.CurrentBotAppId is not null)
+                        : new(recipient.Id, binding.TargetType, binding.OpenId, recipient.DisplayName,
+                            configuration.CurrentBotProfileId, binding.Id, MaskedTargetId: MaskTarget(binding.OpenId)));
+                }
             if (result.Count > 0) return result;
         }
 
+        if (configuration.CurrentBotAppId is not null) return [];
         return IsValidTarget(configuration.Settings.TargetId)
             ? [new(null, configuration.Settings.TargetType, configuration.Settings.TargetId.Trim())]
             : [];
     }
 
     private static bool IsValidTarget(string value) => value.Trim() is { Length: > 0 and <= 256 } target && !target.Any(char.IsWhiteSpace);
+
+    private static string MaskTarget(string value) => value.Length <= 6 ? value : $"{value[..3]}****{value[^3..]}";
 
     private static string FailureMessage(string? routerName, DateTimeOffset? lastSuccessfulUpdate, DateTimeOffset now) =>
         $"CloudLight XiaoMi 无法连接 Xiaomi 服务。\n\n路由器：{Value(routerName, "当前路由器")}\n最后成功更新：{NotificationTemplateRenderer.FormatTime(lastSuccessfulUpdate)}\n异常时间：{NotificationTemplateRenderer.FormatTime(now)}\n\n设备在线状态可能暂时无法更新。";

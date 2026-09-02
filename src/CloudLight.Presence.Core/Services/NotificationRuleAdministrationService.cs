@@ -62,7 +62,7 @@ public sealed class NotificationRuleAdministrationService(IPresenceRepository re
         var state = await repository.GetNotificationRuleStateAsync(ruleId, cancellationToken);
         foreach (var delivery in await repository.GetNotificationDeliveriesForRuleAsync(ruleId, cancellationToken))
         {
-            if (delivery.Status is NotificationDeliveryStatus.Delivered or NotificationDeliveryStatus.Canceled) continue;
+            if (delivery.Status is NotificationDeliveryStatus.Delivered or NotificationDeliveryStatus.Canceled or NotificationDeliveryStatus.PermanentFailed) continue;
             await repository.UpdateNotificationDeliveryAsync(delivery with
             {
                 Status = NotificationDeliveryStatus.Canceled,
@@ -79,7 +79,7 @@ public sealed class NotificationRuleAdministrationService(IPresenceRepository re
     {
         var state = await repository.GetNotificationRuleStateAsync(ruleId, cancellationToken);
         var deliveries = await repository.GetNotificationDeliveriesForRuleAsync(ruleId, cancellationToken);
-        var pending = deliveries.Where(delivery => delivery.Status is not (NotificationDeliveryStatus.Delivered or NotificationDeliveryStatus.Canceled)).ToArray();
+        var pending = deliveries.Where(delivery => delivery.Status is NotificationDeliveryStatus.Pending or NotificationDeliveryStatus.Failed).ToArray();
         foreach (var delivery in pending)
         {
             await repository.UpdateNotificationDeliveryAsync(delivery with

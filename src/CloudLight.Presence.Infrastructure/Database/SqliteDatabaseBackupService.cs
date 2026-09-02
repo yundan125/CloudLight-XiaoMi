@@ -25,7 +25,7 @@ public sealed record DatabaseBackupStatus(
 /// </summary>
 public sealed class SqliteDatabaseBackupService(IAppDataPaths paths)
 {
-    public const int CurrentSchemaVersion = 14;
+    public const int CurrentSchemaVersion = 15;
     private const int MigrationBackupRetention = 10;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { WriteIndented = true };
     private readonly SemaphoreSlim _gate = new(1, 1);
@@ -46,7 +46,7 @@ public sealed class SqliteDatabaseBackupService(IAppDataPaths paths)
         {
             "Router", "NetworkDevice", "PresenceEvent", "PresenceSession", "MonitoringGap", "MonitoringGapSubjectBaseline", "ApplicationRun",
             "PresenceSubject", "SubjectCurrentState", "SubjectPresenceEvent", "SubjectDeviceMembership",
-            "NotificationRule", "NotificationRecipient", "NotificationRuleRecipient", "NotificationRuleState",
+            "NotificationRule", "NotificationRecipient", "QqBotProfile", "NotificationRecipientBotBinding", "NotificationRuleRecipient", "NotificationRuleState",
             "NotificationDelivery", "ConnectionAlertState", "SystemNotificationDelivery",
             "RouterCapabilityDiagnostic"
         };
@@ -58,7 +58,13 @@ public sealed class SqliteDatabaseBackupService(IAppDataPaths paths)
             !await HasColumnAsync(connection, "MonitoringGap", "RouterId", cancellationToken) ||
             !await HasColumnAsync(connection, "NotificationRuleState", "LastProcessedSubjectEventId", cancellationToken) ||
             !await HasColumnAsync(connection, "NotificationDelivery", "RecipientId", cancellationToken) ||
-            !await HasColumnAsync(connection, "SystemNotificationDelivery", "RecipientId", cancellationToken);
+            !await HasColumnAsync(connection, "SystemNotificationDelivery", "RecipientId", cancellationToken) ||
+            !await HasColumnAsync(connection, "QqBotProfile", "ScopeKind", cancellationToken) ||
+            !await HasColumnAsync(connection, "NotificationRecipientBotBinding", "LastSuccessfulSendAt", cancellationToken) ||
+            !await HasColumnAsync(connection, "NotificationDelivery", "BotProfileId", cancellationToken) ||
+            !await HasColumnAsync(connection, "NotificationDelivery", "RecipientBindingId", cancellationToken) ||
+            !await HasColumnAsync(connection, "SystemNotificationDelivery", "BotProfileId", cancellationToken) ||
+            !await HasColumnAsync(connection, "SystemNotificationDelivery", "RecipientBindingId", cancellationToken);
 
         var needsStructuralMigration = missingColumn;
         if (!needsStructuralMigration)
@@ -78,7 +84,14 @@ public sealed class SqliteDatabaseBackupService(IAppDataPaths paths)
                 !await HasForeignKeyActionAsync(connection, "NotificationDelivery", "NotificationRule", "SET NULL", cancellationToken) ||
                 !await HasForeignKeyActionAsync(connection, "NotificationDelivery", "PresenceSubject", "SET NULL", cancellationToken) ||
                 !await HasForeignKeyActionAsync(connection, "NotificationDelivery", "NotificationRecipient", "SET NULL", cancellationToken) ||
-                !await HasUniqueIndexAsync(connection, "NotificationDelivery", ["RuleId", "EpisodeId", "TargetType", "TargetId"], cancellationToken);
+                !await HasForeignKeyActionAsync(connection, "NotificationDelivery", "QqBotProfile", "SET NULL", cancellationToken) ||
+                !await HasForeignKeyActionAsync(connection, "NotificationDelivery", "NotificationRecipientBotBinding", "SET NULL", cancellationToken) ||
+                !await HasForeignKeyActionAsync(connection, "SystemNotificationDelivery", "QqBotProfile", "SET NULL", cancellationToken) ||
+                !await HasForeignKeyActionAsync(connection, "SystemNotificationDelivery", "NotificationRecipientBotBinding", "SET NULL", cancellationToken) ||
+                !await HasUniqueIndexAsync(connection, "NotificationDelivery", ["RuleId", "EpisodeId", "TargetType", "TargetId"], cancellationToken) ||
+                !await HasUniqueIndexAsync(connection, "NotificationRecipientBotBinding", ["RecipientId", "BotProfileId"], cancellationToken) ||
+                !await HasUniqueIndexAsync(connection, "NotificationRecipientBotBinding", ["BotProfileId", "TargetType", "OpenId"], cancellationToken) ||
+                await HasUniqueIndexAsync(connection, "NotificationRecipient", ["TargetType", "OpenId"], cancellationToken);
         }
 
         return new(version, CurrentSchemaVersion, true, version < CurrentSchemaVersion || needsStructuralMigration);

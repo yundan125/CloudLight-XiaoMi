@@ -76,7 +76,9 @@ public partial class App : System.Windows.Application
             catch (Exception fallbackException) { await notificationDiagnostics.RecordAsync("qq_configuration_fallback", fallbackException, null, null, CancellationToken.None); }
         }
         if (qqInitializationError is not null) qqChannel.ReportConfigurationError(qqInitializationError.Message);
-        var ruleService = new NotificationRuleService(repository, subjectPresence, notificationDiagnostics);
+        if (!string.IsNullOrWhiteSpace(qqChannel.CurrentAppId))
+            await repository.EnsureQqBotProfileAsync(qqChannel.CurrentAppId, "当前 QQ Bot", DateTimeOffset.UtcNow, CancellationToken.None);
+        var ruleService = new NotificationRuleService(repository, subjectPresence, notificationDiagnostics, () => qqChannel.CurrentAppId);
         var updateService = new GitHubReleaseUpdateService(currentVersion: typeof(App).Assembly.GetName().Version?.ToString(3));
         var dispatcher = new NotificationDispatcher(repository, [qqChannel], notificationDiagnostics);
         var notificationRuntime = new NotificationRuntime(monitor, ruleService, dispatcher, notificationDiagnostics);
@@ -86,10 +88,24 @@ public partial class App : System.Windows.Application
             var alerts = current.ConnectionAlerts ?? new ConnectionAlertSettings();
             var qq = current.Qq ?? new QqNotificationSettings();
             var defaultTargets = new List<NotificationRecipientTarget>();
+            var currentAppId = qqChannel.CurrentAppId.Trim();
+            var currentProfile = string.IsNullOrWhiteSpace(currentAppId)
+                ? null
+                : await repository.EnsureQqBotProfileAsync(currentAppId, "当前 QQ Bot", DateTimeOffset.UtcNow, token);
             foreach (var recipientId in qq.DefaultRecipientIds.Distinct())
                 if (await repository.GetNotificationRecipientAsync(recipientId, token) is { } recipient)
-                    defaultTargets.Add(new(recipient.Id, recipient.TargetType, recipient.OpenId, recipient.DisplayName));
-            return new ConnectionAlertConfiguration(alerts, qq.DefaultTargetType, qq.DefaultTargetId, defaultTargets);
+                {
+                    var binding = currentProfile is null
+                        ? null
+                        : await repository.GetNotificationRecipientBotBindingAsync(recipient.Id, currentProfile.Id, token);
+                    defaultTargets.Add(binding is null
+                        ? new(recipient.Id, recipient.TargetType, string.Empty, recipient.DisplayName, currentProfile?.Id, BindingMissing: true)
+                        : new(recipient.Id, binding.TargetType, binding.OpenId, recipient.DisplayName, currentProfile!.Id, binding.Id,
+                            MaskedTargetId: DiagnosticsRedaction.MaskOpenId(binding.OpenId)));
+                }
+            return new ConnectionAlertConfiguration(alerts, qq.DefaultTargetType, qq.DefaultTargetId, defaultTargets,
+                string.IsNullOrWhiteSpace(currentAppId) ? null : currentAppId,
+                currentProfile?.Id);
         }, diagnostics: notificationDiagnostics);
         var notificationSettings = new NotificationSettingsViewModel(repository, settings, qqSecretStore, qqChannel, ruleService);
         notificationRuntime.EvaluationCompleted += (_, _) => _ = notificationSettings.RefreshRuleDiagnosticsAsync(CancellationToken.None);
